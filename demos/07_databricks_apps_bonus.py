@@ -377,6 +377,7 @@ requests>=2.31
 EOF
 
 # 4. Deploy via Databricks CLI
+# Replace 'your-profile' with the Databricks CLI profile name from your ~/.databrickscfg
 databricks apps create actuarial-risk-dashboard \\
   --description "SARIMA forecasts + Monte Carlo risk dashboard for actuaries" \\
   --profile your-profile

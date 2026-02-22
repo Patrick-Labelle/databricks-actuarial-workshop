@@ -23,40 +23,35 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 
 ## Quick Start — Deploy to Your Workspace
 
-### 1. Configure variables
+### 1. Create your local config
 
-Edit `databricks.yml` — set the `catalog` default (or add a named target):
-
-```yaml
-variables:
-  catalog:
-    default: your_catalog   # ← change this
-  schema:
-    default: actuarial_workshop
-  # ... (endpoint_name, warehouse_id, pg_host, pg_database — see file)
+```bash
+cp databricks.local.yml.example databricks.local.yml
 ```
 
-Or add a named target under `targets:` with workspace-specific overrides.
+Edit `databricks.local.yml` — fill in your workspace host, CLI profile, catalog,
+and warehouse ID. This file is gitignored and auto-merged by the bundle, so your
+sensitive values never touch version control.
 
 ### 2. Validate
 
 ```bash
-databricks bundle validate
+databricks bundle validate --target my-workspace
 ```
 
 ### 3. Deploy
 
 ```bash
-databricks bundle deploy
+databricks bundle deploy --target my-workspace
 ```
 
 This uploads the notebooks, creates the DLT pipeline, orchestration jobs, and
-updates the Databricks App.
+the Databricks App.
 
 ### 4. Run the setup job
 
 ```bash
-databricks bundle run actuarial_workshop_setup
+databricks bundle run actuarial_workshop_setup --target my-workspace
 ```
 
 This runs all modules in sequence:
@@ -81,15 +76,10 @@ databricks apps start actuarial-workshop
 | Target | Workspace | Notes |
 |--------|-----------|-------|
 | `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
-| _(add your own)_ | your-workspace | See `databricks.local.yml.example` |
+| _(your target)_ | Defined in `databricks.local.yml` | gitignored; auto-merged by bundle |
 
-Example for a custom workspace:
-```bash
-databricks bundle deploy --target dev \
-  --var catalog=my_catalog \
-  --var schema=actuarial_workshop \
-  --var warehouse_id=abc123
-```
+The bundle's `include:` glob (`databricks.local*.yml`) automatically merges your
+local target definitions when present, and silently skips if the file is absent.
 
 ---
 

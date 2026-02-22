@@ -32,6 +32,7 @@ variables:
 
 include:
   - resources/*.yml
+  - databricks.local*.yml   # gitignored local overrides; silently skipped if absent
 
 targets:
 

@@ -1,69 +1,22 @@
 # ─── LOCAL CONFIG TEMPLATE ────────────────────────────────────────────────────
-# Copy this file to databricks.local.yml, fill in your workspace values, then
-# rename to databricks.yml when deploying to your target workspace.
-# databricks.local.yml is gitignored to keep sensitive IDs/URLs out of git.
+# 1. Copy this file:  cp databricks.local.yml.example databricks.local.yml
+# 2. Fill in your workspace-specific values below
+# 3. Deploy:          databricks bundle deploy --target my-workspace
 #
-# TO USE:
-#   cp databricks.local.yml.example databricks.local.yml
-#   # Edit databricks.local.yml with your workspace values
-#   cp databricks.local.yml databricks.yml
-#   databricks bundle deploy --target my-workspace
-#   git checkout databricks.yml   # restore the generic version
-
-bundle:
-  name: actuarial-workshop
-
-variables:
-  catalog:
-    description: "Unity Catalog catalog name — must already exist"
-    default: my_catalog
-
-  schema:
-    description: "UC schema name — will be created if it does not exist"
-    default: actuarial_workshop
-
-  endpoint_name:
-    description: "Name for the SARIMA Model Serving endpoint"
-    default: actuarial-workshop-sarima-forecaster
-
-  warehouse_id:
-    description: "SQL Warehouse ID for the Statement Execution API (used by the app)"
-    default: ""
-
-  pg_host:
-    description: "Lakebase (managed Postgres) hostname. Leave empty to disable Lakebase."
-    default: ""
-
-  pg_database:
-    description: "Lakebase database name"
-    default: actuarial_workshop_db
-
-  notification_email:
-    description: "Email address for job failure notifications (optional)"
-    default: ""
-
-include:
-  - resources/*.yml
+# This file is auto-merged by the bundle (via the include glob in databricks.yml)
+# and is gitignored to keep sensitive IDs/URLs out of version control.
+# No need to copy it over databricks.yml — just use --target <your-target>.
 
 targets:
-
-  dev:
-    default: true
-    mode: development
-    variables:
-      catalog: my_catalog          # ← replace with your catalog
-      schema: actuarial_workshop
-
-  # ── Your production/named workspace target ───────────────────────────────────
-  my-workspace:
+  my-workspace:                                                   # ← rename this
     workspace:
-      host: https://your-workspace.cloud.databricks.com   # ← replace
-      profile: your-profile                               # ← replace (from ~/.databrickscfg)
+      host: https://your-workspace.cloud.databricks.com          # ← replace
+      profile: your-profile                                       # ← replace (from ~/.databrickscfg)
     variables:
-      catalog: your_catalog                               # ← replace
+      catalog: your_catalog                                       # ← replace (UC catalog, must exist)
       schema: actuarial_workshop
       endpoint_name: actuarial-workshop-sarima-forecaster
-      warehouse_id: "your_warehouse_id"                   # ← replace (from workspace SQL settings)
-      pg_host: "your-lakebase-host.database.cloud.databricks.com"  # ← optional
+      warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
+      pg_host: "your-lakebase-host.database.cloud.databricks.com"  # ← optional (leave empty to disable)
       pg_database: actuarial_workshop_db
-      notification_email: your.email@example.com         # ← optional
+      notification_email: your.email@example.com                 # ← optional

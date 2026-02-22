@@ -151,7 +151,7 @@ After running all modules, the following assets will exist in your workspace:
 
 | Asset | Details |
 |-------|---------|
-| Databricks App `actuarial-workshop` | Live at [actuarial-workshop-1444828305810485.aws.databricksapps.com](https://actuarial-workshop-1444828305810485.aws.databricksapps.com) |
+| Databricks App `actuarial-workshop` | Available at your workspace Apps URL after deployment |
 | Lakebase instance `actuarial-workshop-db` | Managed PostgreSQL, database `actuarial_workshop_db`, table `annotations` |
 
 ---
@@ -326,6 +326,6 @@ A cleanup notebook (`00_cleanup.py`) is provided to remove all workshop assets. 
 - Model Serving: `WorkspaceClient.serving_endpoints.query()` — same SDK, same token
 - Lakebase: direct `psycopg2` connection with `PGPASSWORD` set from the forwarded `X-Forwarded-Access-Token` header; `PGUSER` extracted from the JWT `sub` claim (user email)
 
-**Live URL:** [actuarial-workshop-1444828305810485.aws.databricksapps.com](https://actuarial-workshop-1444828305810485.aws.databricksapps.com)
+**URL:** Available at your workspace Apps URL after deployment (`databricks apps get actuarial-workshop`).
 
 **Key actuarial concept:** Actuarial review workflows — annotating forecasts, overriding assumptions, approving model outputs — benefit from interactive applications that sit inside the same governance boundary as the data and models. Databricks Apps inherits UC permissions and SSO automatically; no separate auth layer needed.

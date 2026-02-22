@@ -408,59 +408,58 @@
 
 # COMMAND ----------
 
-import subprocess, json
+import json
 
-def run_cmd(cmd: str) -> str:
-    """Run a shell command and return output."""
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return result.stdout + result.stderr
+# Resolve workspace context at runtime so the example output reflects the
+# actual workspace and user running the notebook.
+_ws_host     = "https://" + spark.conf.get("spark.databricks.workspaceUrl")
+_me          = spark.sql("SELECT current_user()").collect()[0][0]
+_user_short  = _me.split("@")[0]          # e.g. "first.last"
+_bundle_root = f"/Users/{_me}/.bundle/actuarial-workshop/dev"
 
-# Show current bundle project (if it existed on this cluster)
 print("Typical `databricks bundle validate` output:")
-print("""
-{
-  "bundle": {
-    "name": "actuarial-workshop",
-    "target": "development"
-  },
-  "workspace": {
-    "host": "https://your-workspace.cloud.databricks.com",
-    "current_user": {
-      "user_name": "user@company.com"
+print(json.dumps({
+    "bundle": {
+        "name": "actuarial-workshop",
+        "target": "development"
     },
-    "root_path": "/Users/user@company.com/.bundle/actuarial-workshop/dev",
-    "file_path": "/Users/user@company.com/.bundle/actuarial-workshop/dev/files"
-  },
-  "resources": {
-    "jobs": {
-      "actuarial_model_pipeline": {
-        "id": "123456789",
-        "name": "[dev user] Actuarial Model Pipeline"
-      }
+    "workspace": {
+        "host": _ws_host,
+        "current_user": {
+            "user_name": _me
+        },
+        "root_path": _bundle_root,
+        "file_path": f"{_bundle_root}/files"
     },
-    "model_serving_endpoints": {
-      "sarima_forecaster_endpoint": {
-        "name": "[dev user] actuarial-sarima-forecaster"
-      }
+    "resources": {
+        "jobs": {
+            "actuarial_model_pipeline": {
+                "id": "123456789",
+                "name": f"[dev {_user_short}] Actuarial Model Pipeline"
+            }
+        },
+        "model_serving_endpoints": {
+            "sarima_forecaster_endpoint": {
+                "name": f"[dev {_user_short}] actuarial-sarima-forecaster"
+            }
+        }
     }
-  }
-}
-""")
+}, indent=2))
 
-print("Typical `databricks bundle deploy` output:")
-print("""
-Uploading bundle files to /Users/user@company.com/.bundle/actuarial-workshop/dev/files...
+print("\nTypical `databricks bundle deploy` output:")
+print(f"""
+Uploading bundle files to {_bundle_root}/files...
   ./notebooks/04_classical_stats_at_scale.py (5.2 KB)
   ./notebooks/05_mlflow_uc_serving.py (4.8 KB)
   ./notebooks/06_dabs_cicd.py (3.1 KB)
   ./src/monte_carlo.py (1.2 KB)
 
 Deploying resources...
-  Updating job [dev user] Actuarial Model Pipeline...
-  Updating model serving endpoint [dev user] actuarial-sarima-forecaster...
+  Updating job [dev {_user_short}] Actuarial Model Pipeline...
+  Updating model serving endpoint [dev {_user_short}] actuarial-sarima-forecaster...
 
 Deployment complete!
-  Job URL: https://your-workspace.cloud.databricks.com/jobs/123456789
+  Job URL: {_ws_host}/jobs/123456789
 """)
 
 # COMMAND ----------
