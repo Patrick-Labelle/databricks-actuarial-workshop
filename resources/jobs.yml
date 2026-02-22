@@ -1,0 +1,153 @@
+# ─── Jobs: Actuarial Workshop ─────────────────────────────────────────────────
+# Two jobs:
+#   1. actuarial_workshop_setup     — one-time full setup (Modules 1–5)
+#   2. actuarial_workshop_refresh   — monthly model refresh (DLT + Module 4)
+
+resources:
+  jobs:
+
+    # ── Full Setup Job ─────────────────────────────────────────────────────────
+    # Run once to build all assets: source data, DLT pipeline, features,
+    # statistical models, and the serving endpoint.
+    actuarial_workshop_setup:
+      name: "Actuarial Workshop — Full Setup"
+      description: >-
+        One-time setup: generates synthetic data, runs the DLT pipeline,
+        builds the Feature Store, fits SARIMA/GARCH models, registers the
+        model to UC, and creates the serving endpoint.
+
+      tasks:
+
+        # Task 1 — Generate synthetic source data (policy CDC records)
+        # Runs notebook 01 in standalone (non-DLT) mode to write policy_cdc_raw
+        - task_key: generate_source_data
+          description: "Generate synthetic policy CDC data → policy_cdc_raw"
+          notebook_task:
+            notebook_path: ../demos/01_dlt_pipeline_and_jobs.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              notification_email: "${var.notification_email}"
+          environment_key: default_env
+
+        # Task 2 — Run the DLT pipeline (Bronze → Silver → Gold)
+        # full_refresh: true because generate_source_data recreates policy_cdc_raw via
+        # CREATE OR REPLACE TABLE, which invalidates any existing streaming checkpoint.
+        # A full refresh clears DLT checkpoints and re-reads the source from scratch.
+        - task_key: run_dlt_pipeline
+          description: "DLT: Bronze → Silver (SCD Type 2) → Gold aggregates"
+          depends_on:
+            - task_key: generate_source_data
+          pipeline_task:
+            pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
+            full_refresh: true
+
+        # Task 3 — Build rolling features (Module 2)
+        - task_key: build_rolling_features
+          description: "Compute rolling means and volatility features per segment"
+          depends_on:
+            - task_key: run_dlt_pipeline
+          notebook_task:
+            notebook_path: ../demos/02_spark_vs_ray.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              run_ray: "skip"   # Ray on Spark not supported on serverless; interactive demo only
+          environment_key: default_env
+
+        # Task 4 — Register Feature Store table and Online Table (Module 3)
+        # job_mode=true: writes feature table as plain Delta, skips display() calls,
+        # FeatureEngineeringClient, training set assembly, and Online Table creation.
+        # These interactive demo sections are preserved for human learners running interactively.
+        - task_key: build_feature_store
+          description: "UC Feature Store registration + Online Table for low-latency serving"
+          depends_on:
+            - task_key: build_rolling_features
+          notebook_task:
+            notebook_path: ../demos/03_feature_store.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              warehouse_id: "${var.warehouse_id}"
+              job_mode: "true"
+          environment_key: default_env
+
+        # Task 5 — Fit SARIMA / GARCH / Monte Carlo (Module 4)
+        - task_key: fit_statistical_models
+          description: "SARIMA per segment, GARCH volatility, Monte Carlo simulation"
+          depends_on:
+            - task_key: build_feature_store
+          notebook_task:
+            notebook_path: ../demos/04_classical_stats_at_scale.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+          environment_key: ml_env
+
+        # Task 6 — Register model + create serving endpoint (Module 5)
+        - task_key: register_and_serve_model
+          description: "MLflow PyFunc, UC Model Registry @Champion, Model Serving endpoint"
+          depends_on:
+            - task_key: fit_statistical_models
+          notebook_task:
+            notebook_path: ../demos/05_mlflow_uc_serving.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              endpoint_name: "${var.endpoint_name}"
+          environment_key: ml_env
+
+      environments:
+        - environment_key: default_env
+          spec:
+            client: "4"
+            dependencies:
+              - databricks-feature-engineering
+        - environment_key: ml_env
+          spec:
+            client: "4"
+            dependencies:
+              - statsmodels>=0.14
+              - arch>=7.0
+              - mlflow>=2.14
+
+    # ── Monthly Model Refresh Job ──────────────────────────────────────────────
+    # Scheduled job: refreshes data via DLT then re-fits the SARIMA models.
+    actuarial_workshop_refresh:
+      name: "Actuarial Workshop — Monthly Model Refresh"
+      description: >-
+        Monthly scheduled job: refreshes Bronze→Silver→Gold via DLT,
+        then re-fits SARIMA/GARCH models and logs to MLflow.
+
+      schedule:
+        quartz_cron_expression: "0 0 3 1 * ?"
+        timezone_id: "America/Toronto"
+        pause_status: PAUSED
+
+      tasks:
+
+        - task_key: refresh_dlt_pipeline
+          description: "Refresh Bronze→Silver→Gold via DLT Apply Changes"
+          pipeline_task:
+            pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
+            full_refresh: false
+
+        - task_key: refit_statistical_models
+          description: "Re-fit SARIMA/GARCH models on refreshed data"
+          depends_on:
+            - task_key: refresh_dlt_pipeline
+          notebook_task:
+            notebook_path: ../demos/04_classical_stats_at_scale.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+          environment_key: ml_env
+
+      environments:
+        - environment_key: ml_env
+          spec:
+            client: "4"
+            dependencies:
+              - statsmodels>=0.14
+              - arch>=7.0
+              - mlflow>=2.14

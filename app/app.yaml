@@ -1,4 +1,19 @@
 # app.yaml — Databricks App configuration for Actuarial Workshop
+#
+# DEPLOYMENT OPTIONS
+# ──────────────────
+# 1. Via Databricks Asset Bundle (recommended):
+#      databricks bundle deploy --target <target>
+#    Bundle variables (${var.*}) are substituted from databricks.yml at deploy time.
+#
+# 2. Direct CLI deployment (standalone):
+#      databricks apps deploy actuarial-workshop --source-code-path ./app
+#    Replace ${var.*} placeholders with actual values before deploying.
+#
+# 3. Local development:
+#      export DATABRICKS_HOST=https://...  CATALOG=...  SCHEMA=...  etc.
+#      streamlit run app.py
+
 command:
   - "streamlit"
   - "run"
@@ -7,15 +22,35 @@ command:
   - "--server.address=0.0.0.0"
 
 env:
+  # Streamlit
   - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
     value: "false"
+
+  # Databricks connection — injected by the bundle; set manually for standalone
   - name: DATABRICKS_HOST
-    value: "https://e2-demo-field-eng.cloud.databricks.com"
+    value: "${workspace.host}"
+
+  # Data layer — set in databricks.yml variables
+  - name: CATALOG
+    value: "${var.catalog}"
+  - name: SCHEMA
+    value: "${var.schema}"
+
+  # Model serving
+  - name: ENDPOINT_NAME
+    value: "${var.endpoint_name}"
+
+  # SQL execution (Statement Execution API)
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "${var.warehouse_id}"
+
+  # Lakebase (Postgres) — annotation persistence
+  # Leave PGHOST empty to disable Lakebase features gracefully
   - name: PGHOST
-    value: "instance-57a2aeba-243b-43a5-a17f-98b78910be06.database.cloud.databricks.com"
+    value: "${var.pg_host}"
   - name: PGPORT
     value: "5432"
   - name: PGDATABASE
-    value: "actuarial_workshop_db"
+    value: "${var.pg_database}"
   - name: PGSSLMODE
     value: "require"

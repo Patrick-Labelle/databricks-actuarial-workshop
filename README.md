@@ -1,39 +1,146 @@
 # Databricks Actuarial Workshop
 
-Actuarial workshop materials: a Databricks App (Streamlit dashboard) and demo content for workshops.
+A complete 1-day actuarial workshop — demo notebooks, DLT pipeline, statistical
+models, model serving, and a Streamlit dashboard — packaged as a single
+**Databricks Asset Bundle** for one-command deployment to any workspace.
 
 ## Repository structure
 
 ```
 .
-├── app/                 # Databricks App (Streamlit)
-│   ├── app.py           # Main application
-│   ├── app.yaml         # App configuration
-│   └── requirements.txt # App dependencies
-├── demos/               # Workshop demo content
-│   └── README.md        # Notebooks, scripts, sample data
+├── databricks.yml       # Bundle config — all variables here
+├── resources/
+│   ├── pipeline.yml     # DLT pipeline (Bronze → Silver → Gold)
+│   ├── jobs.yml         # Orchestration jobs (setup + monthly refresh)
+│   └── app.yml          # Databricks App resource
+├── demos/               # Workshop notebooks (Modules 1–7)
+├── app/
+│   ├── app.py           # Streamlit application
+│   ├── app.yaml         # App config (env vars substituted from bundle)
+│   └── requirements.txt
 └── README.md
 ```
 
-## App (`app/`)
+## Quick Start — Deploy to Your Workspace
 
-Run the Actuarial Risk Dashboard as a Databricks App. From the `app/` directory:
+### 1. Configure variables
 
-- **Local:** `streamlit run app.py`
-- **Databricks:** Deploy via the Apps UI or CLI using `app.yaml`.
+Edit `databricks.yml` — set the `catalog` default (or add a named target):
 
-See `app/requirements.txt` for Python dependencies.
+```yaml
+variables:
+  catalog:
+    default: your_catalog   # ← change this
+  schema:
+    default: actuarial_workshop
+  # ... (endpoint_name, warehouse_id, pg_host, pg_database — see file)
+```
 
-## Demos (`demos/`)
+Or add a named target under `targets:` with workspace-specific overrides.
 
-Workshop demos, notebooks, and sample scripts live in `demos/`. Use this folder for:
+### 2. Validate
 
-- Jupyter/Databricks notebooks
-- Sample SQL or Python scripts
-- Small reference datasets or links to data
+```bash
+databricks bundle validate
+```
 
-## Development
+### 3. Deploy
 
-- App code: `app/`
-- Demo content: `demos/`
-- Root-level config (e.g. `.gitignore`) applies to the whole repo.
+```bash
+databricks bundle deploy
+```
+
+This uploads the notebooks, creates the DLT pipeline, orchestration jobs, and
+updates the Databricks App.
+
+### 4. Run the setup job
+
+```bash
+databricks bundle run actuarial_workshop_setup
+```
+
+This runs all modules in sequence:
+1. Generate synthetic policy CDC data
+2. Run the DLT pipeline (Bronze → Silver → Gold)
+3. Build rolling features (Module 2)
+4. Register the Feature Store + Online Table (Module 3)
+5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
+6. Register model to UC Registry + create Model Serving endpoint (Module 5)
+
+### 5. Start the app
+
+Start the Databricks App from the Apps UI or:
+```bash
+databricks apps start actuarial-workshop
+```
+
+---
+
+## Targets
+
+| Target | Workspace | Notes |
+|--------|-----------|-------|
+| `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
+| `e2-demo` | e2-demo-field-eng | Databricks FE demo workspace |
+
+Example for a custom workspace:
+```bash
+databricks bundle deploy --target dev \
+  --var catalog=my_catalog \
+  --var schema=actuarial_workshop \
+  --var warehouse_id=abc123
+```
+
+---
+
+## Configuration Reference
+
+All configurable values live in `databricks.yml` under `variables:`.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `catalog` | UC catalog name (must exist) | `my_catalog` |
+| `schema` | UC schema (created if missing) | `actuarial_workshop` |
+| `endpoint_name` | Model Serving endpoint name | `actuarial-workshop-sarima-forecaster` |
+| `warehouse_id` | SQL Warehouse ID for the app | _(empty)_ |
+| `pg_host` | Lakebase hostname (empty = disable annotations) | _(empty)_ |
+| `pg_database` | Lakebase database name | `actuarial_workshop_db` |
+| `notification_email` | Email for job failure alerts | _(empty)_ |
+
+---
+
+## Workshop Modules
+
+| Module | Notebook | Key Concepts |
+|--------|----------|-------------|
+| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API |
+| 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
+| 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
+| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, Monte Carlo, MLflow |
+| 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
+| 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
+| Bonus | `07_databricks_apps_bonus.py` | Databricks Apps, Lakebase |
+
+All notebooks accept `catalog`, `schema`, and `endpoint_name` as widget
+parameters (passed automatically by the bundle jobs).
+
+---
+
+## Running Modules Interactively
+
+Notebooks can also be run interactively in the workspace. Clone or upload the
+`demos/` directory, then run each notebook in order. The widget defaults at
+the top of each notebook allow standalone execution without the bundle.
+
+---
+
+## Live Demo Resources (e2-demo-field-eng)
+
+| Resource | Link |
+|----------|------|
+| Workspace | [e2-demo-field-eng](https://e2-demo-field-eng.cloud.databricks.com) |
+| UC Schema | [patrick_labelle.actuarial_workshop](https://e2-demo-field-eng.cloud.databricks.com/explore/data/patrick_labelle/actuarial_workshop) |
+| DLT Pipeline | [actuarial-workshop-medallion](https://e2-demo-field-eng.cloud.databricks.com/pipelines/c903d5ed-c42c-4491-82f7-615d7a087f37) |
+| Setup Job | [Actuarial Workshop — Full Setup](https://e2-demo-field-eng.cloud.databricks.com/jobs/554471461734476) |
+| Model Serving | [actuarial-workshop-sarima-forecaster](https://e2-demo-field-eng.cloud.databricks.com/serving-endpoints/actuarial-workshop-sarima-forecaster/invocations) |
+| App | [actuarial-workshop](https://actuarial-workshop-1444828305810485.aws.databricksapps.com) |

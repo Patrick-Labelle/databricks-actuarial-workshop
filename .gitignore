@@ -45,3 +45,10 @@ Thumbs.db
 # Jupyter / notebooks
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+
+# Databricks Asset Bundle state
+.databricks/
+
+# Local bundle config with workspace-specific values (sensitive IDs/URLs)
+# Use databricks.local.yml.example as a template
+databricks.local.yml

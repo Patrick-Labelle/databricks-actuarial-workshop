@@ -1,0 +1,10 @@
+# ─── Databricks App: Actuarial Risk Dashboard ────────────────────────────────
+# Streamlit application served via Databricks Apps (serverless, UC-integrated).
+# Runtime configuration (env vars, command) lives in app/app.yaml and has
+# bundle variables substituted at deploy time.
+
+resources:
+  apps:
+    actuarial_workshop_app:
+      name: "actuarial-workshop"
+      source_code_path: ../app

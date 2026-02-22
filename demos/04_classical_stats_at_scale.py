@@ -1,0 +1,724 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Module 4: Classical Statistical Models at Scale
+# MAGIC ## SARIMA/GARCH per Segment + Monte Carlo with Ray
+# MAGIC
+# MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
+# MAGIC *Audience: Actuaries, Data Scientists, Financial Analysts*
+# MAGIC
+# MAGIC ---
+# MAGIC ### What We'll Cover
+# MAGIC 1. **Data Setup** — Synthetic monthly claims time series (20 product × region segments)
+# MAGIC 2. **SARIMA at Scale** — Per-segment forecasting with `applyInPandas` + statsmodels
+# MAGIC 3. **GARCH at Scale** — Per-segment volatility modeling with the `arch` library
+# MAGIC 4. **Monte Carlo with Ray** — Task-parallel portfolio loss simulation (100k+ paths)
+# MAGIC 5. **MLflow Integration** — Experiment tracking, metrics, artifacts
+# MAGIC
+# MAGIC ---
+# MAGIC ### Why `applyInPandas`?
+# MAGIC
+# MAGIC We have **20 segments**, each needing its own ARIMA/GARCH fit. These are **independent** per-group operations.
+# MAGIC `applyInPandas` lets Spark distribute this work: each executor receives a pandas DataFrame for one segment,
+# MAGIC runs standard Python/statsmodels code, and returns results. No Spark ML required — just familiar Python libraries.
+# MAGIC
+# MAGIC ```
+# MAGIC df.groupby("segment_id").applyInPandas(fit_sarima_fn, schema=output_schema)
+# MAGIC ```
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 0. Install Required Libraries
+# MAGIC
+# MAGIC These libraries are available in Databricks Runtime ML. On standard DBR, install via the cluster library UI
+# MAGIC or with `%pip install` below.
+
+# COMMAND ----------
+
+# %pip install statsmodels arch mlflow pmdarima --quiet
+# dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1. Generate Synthetic Insurance Claims Time Series
+# MAGIC
+# MAGIC We simulate **60 months** (5 years) of monthly claims for **20 segments** (4 product lines × 5 regions).
+# MAGIC Each segment has its own:
+# MAGIC - **Level** (expected monthly claims)
+# MAGIC - **Seasonality** (winter peak — higher claims in Q1)
+# MAGIC - **Trend** (slow upward drift in loss ratios)
+# MAGIC - **Volatility** (GARCH-style clustering)
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+from itertools import product as iterproduct
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+# Passed as base_parameters by the bundle job; defaults used when interactive.
+dbutils.widgets.text("catalog", "my_catalog",         "UC Catalog")
+dbutils.widgets.text("schema",  "actuarial_workshop", "UC Schema")
+CATALOG = dbutils.widgets.get("catalog")
+SCHEMA  = dbutils.widgets.get("schema")
+
+np.random.seed(42)
+
+# ─── Segment definitions ─────────────────────────────────────────────────────
+PRODUCT_LINES = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
+REGIONS       = ["Ontario", "Quebec", "British_Columbia", "Alberta", "Atlantic"]
+MONTHS        = pd.date_range("2019-01-01", periods=60, freq="MS")
+
+# Base claim levels (expected monthly claims per segment)
+BASE_CLAIMS = {
+    "Personal_Auto":         450,
+    "Commercial_Auto":       180,
+    "Homeowners":            320,
+    "Commercial_Property":   90,
+}
+
+REGION_MULTIPLIER = {
+    "Ontario":           1.4,
+    "Quebec":            1.1,
+    "British_Columbia":  1.2,
+    "Alberta":           1.0,
+    "Atlantic":          0.7,
+}
+
+# Winter seasonality factors by month (1=Jan, 12=Dec)
+SEASONALITY = {1: 1.25, 2: 1.20, 3: 1.10, 4: 0.95, 5: 0.90, 6: 0.88,
+               7: 0.85, 8: 0.87, 9: 0.92, 10: 1.00, 11: 1.10, 12: 1.20}
+
+rows = []
+for (prod, region), seg_idx in zip(
+    iterproduct(PRODUCT_LINES, REGIONS),
+    range(len(PRODUCT_LINES) * len(REGIONS))
+):
+    segment_id = f"{prod}__{region}"
+    base = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
+
+    # Simulate GARCH-like volatility clustering
+    vol = 0.08  # base volatility
+    innovations = []
+    h = vol ** 2
+    for _ in range(60):
+        e = np.random.normal(0, np.sqrt(h))
+        innovations.append(e)
+        h = 0.02 + 0.15 * e**2 + 0.80 * h  # GARCH(1,1) parameters
+
+    for i, (month, innov) in enumerate(zip(MONTHS, innovations)):
+        trend    = 1.0 + 0.003 * i            # 0.3% monthly upward trend in loss ratio
+        seasonal = SEASONALITY[month.month]
+        claims   = max(0, base * trend * seasonal * (1 + innov))
+
+        rows.append({
+            "segment_id":   segment_id,
+            "product_line": prod,
+            "region":       region,
+            "month":        month.date(),
+            "claims_count": int(round(claims)),
+            "earned_premium": round(base * trend * seasonal * np.random.uniform(3.2, 3.8), 2),
+        })
+
+pdf = pd.DataFrame(rows)
+pdf["loss_ratio"] = pdf["claims_count"] / pdf["earned_premium"]
+
+# Convert to Spark DataFrame
+schema = StructType([
+    StructField("segment_id",     StringType(),  False),
+    StructField("product_line",   StringType(),  False),
+    StructField("region",         StringType(),  False),
+    StructField("month",          DateType(),    False),
+    StructField("claims_count",   IntegerType(), False),
+    StructField("earned_premium", DoubleType(),  False),
+    StructField("loss_ratio",     DoubleType(),  False),
+])
+
+claims_df = spark.createDataFrame(pdf, schema=schema)
+claims_df.createOrReplaceTempView("claims_ts")
+
+print(f"Segments: {claims_df.select('segment_id').distinct().count()}")
+print(f"Rows:     {claims_df.count()}")
+display(claims_df.orderBy("segment_id", "month").limit(30))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Persist to Unity Catalog (Silver Layer)
+
+# COMMAND ----------
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+
+(claims_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{CATALOG}.{SCHEMA}.claims_time_series"))
+
+print(f"Saved to {CATALOG}.{SCHEMA}.claims_time_series")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. SARIMA at Scale — Per-Segment Forecasting
+# MAGIC
+# MAGIC ### Strategy
+# MAGIC We use `df.groupby("segment_id").applyInPandas(fit_fn, schema)`.
+# MAGIC
+# MAGIC Each Spark task receives **one segment's pandas DataFrame** and:
+# MAGIC 1. Fits `statsmodels.SARIMAX` with seasonal order `(1,0,1)(1,1,0,12)` — monthly seasonality
+# MAGIC 2. Produces a 12-month forecast with confidence intervals
+# MAGIC 3. Returns a standardized pandas DataFrame
+# MAGIC
+# MAGIC The output schema must be declared upfront so Spark can parallelize safely.
+
+# COMMAND ----------
+
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DateType, DoubleType, IntegerType, LongType
+)
+import pyspark.sql.functions as F
+
+# Output schema for SARIMA results
+SARIMA_SCHEMA = StructType([
+    StructField("segment_id",   StringType(),  False),
+    StructField("month",        DateType(),    False),
+    StructField("record_type",  StringType(),  False),   # "actual" or "forecast"
+    StructField("claims_count", DoubleType(),  True),
+    StructField("forecast_mean",DoubleType(),  True),
+    StructField("forecast_lo95",DoubleType(),  True),
+    StructField("forecast_hi95",DoubleType(),  True),
+    StructField("aic",          DoubleType(),  True),
+    StructField("mape",         DoubleType(),  True),
+])
+
+def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit SARIMAX(1,0,1)(1,1,0,12) for one segment.
+    Called by Spark for each group — standard pandas/statsmodels code inside.
+    """
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    segment_id = pdf["segment_id"].iloc[0]
+    pdf = pdf.sort_values("month").reset_index(drop=True)
+
+    y = pdf["claims_count"].astype(float).values
+    months = pd.to_datetime(pdf["month"])
+
+    # ── Fit SARIMAX ──────────────────────────────────────────────────────────
+    try:
+        model = SARIMAX(
+            y,
+            order=(1, 0, 1),
+            seasonal_order=(1, 1, 0, 12),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        fit = model.fit(disp=False, maxiter=100)
+        aic = fit.aic
+
+        # In-sample MAPE (exclude first 12 months for seasonal differencing warmup)
+        fitted_vals = fit.fittedvalues[12:]
+        actual_vals = y[12:]
+        mape = np.mean(np.abs((actual_vals - fitted_vals) / np.clip(actual_vals, 1, None))) * 100
+
+        # 12-month forecast
+        forecast = fit.get_forecast(steps=12)
+        fcast_mean = forecast.predicted_mean
+        fcast_ci_raw = forecast.conf_int(alpha=0.05)
+        # Normalize to DataFrame regardless of statsmodels version
+        if hasattr(fcast_ci_raw, 'iloc'):
+            fcast_ci = fcast_ci_raw
+        else:
+            fcast_ci = pd.DataFrame(fcast_ci_raw, columns=["lower", "upper"])
+
+    except Exception as e:
+        # On failure, return NaN forecasts — allows the pipeline to continue
+        fcast_mean = np.full(12, np.nan)
+        fcast_ci   = pd.DataFrame({"lower claims_count": np.full(12, np.nan),
+                                   "upper claims_count": np.full(12, np.nan)})
+        aic, mape = np.nan, np.nan
+
+    # ── Build output DataFrame ────────────────────────────────────────────────
+    last_month = months.max()
+    forecast_months = pd.date_range(last_month + pd.offsets.MonthBegin(1), periods=12, freq="MS")
+
+    actuals_rows = pd.DataFrame({
+        "segment_id":    segment_id,
+        "month":         months.dt.date,
+        "record_type":   "actual",
+        "claims_count":  y.tolist(),
+        "forecast_mean": [None] * len(y),
+        "forecast_lo95": [None] * len(y),
+        "forecast_hi95": [None] * len(y),
+        "aic":           [None] * len(y),
+        "mape":          [None] * len(y),
+    })
+
+    forecast_rows = pd.DataFrame({
+        "segment_id":    segment_id,
+        "month":         forecast_months.date,
+        "record_type":   "forecast",
+        "claims_count":  [None] * 12,
+        "forecast_mean": list(fcast_mean),
+        "forecast_lo95": list(np.asarray(fcast_ci)[:, 0]),
+        "forecast_hi95": list(np.asarray(fcast_ci)[:, 1]),
+        "aic":           [aic] * 12,
+        "mape":          [mape] * 12,
+    })
+
+    return pd.concat([actuals_rows, forecast_rows], ignore_index=True)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Run SARIMA Across All 20 Segments
+# MAGIC
+# MAGIC Spark distributes one segment per task. Each task runs pure Python/statsmodels independently.
+
+# COMMAND ----------
+
+import mlflow
+_current_user = spark.sql("SELECT current_user()").collect()[0][0]
+mlflow.set_experiment(f"/Users/{_current_user}/actuarial-workshop/sarima-per-segment")
+
+with mlflow.start_run(run_name="sarima_all_segments") as run:
+    mlflow.set_tags({
+        "workshop_module": "4",
+        "model_type":      "SARIMAX(1,0,1)(1,1,0,12)",
+        "segments":        "20",
+        "horizon_months":  "12",
+        "audience":        "actuarial-workshop",
+    })
+
+    sarima_results_df = (
+        claims_df
+        .groupby("segment_id")
+        .applyInPandas(fit_sarima_per_segment, schema=SARIMA_SCHEMA)
+    )
+
+    # Cache and count to trigger execution
+    # sarima_results_df.cache()  # Not supported on serverless
+    total_rows = sarima_results_df.count()
+
+    # Compute average MAPE across segments
+    avg_mape = (
+        sarima_results_df
+        .filter(F.col("record_type") == "forecast")
+        .agg(F.mean("mape").alias("avg_mape"))
+        .collect()[0]["avg_mape"]
+    )
+
+    mlflow.log_metric("avg_mape_pct", round(avg_mape, 2))
+    mlflow.log_metric("total_output_rows", total_rows)
+    mlflow.log_metric("segments_fitted", 20)
+
+    print(f"SARIMA complete | Total rows: {total_rows} | Avg MAPE: {avg_mape:.1f}%")
+    print(f"MLflow run: {run.info.run_id}")
+
+display(sarima_results_df.filter(F.col("record_type") == "forecast").orderBy("segment_id", "month").limit(30))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Save SARIMA Results
+
+# COMMAND ----------
+
+(sarima_results_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{CATALOG}.{SCHEMA}.sarima_forecasts"))
+
+print(f"Saved to {CATALOG}.{SCHEMA}.sarima_forecasts")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. GARCH at Scale — Volatility Modeling
+# MAGIC
+# MAGIC GARCH (Generalized AutoRegressive Conditional Heteroskedasticity) models **variance clustering** in loss ratios —
+# MAGIC the tendency for volatile periods to cluster together. This is critical for:
+# MAGIC - **Risk capital** calculations (Solvency II internal models)
+# MAGIC - **Reinsurance pricing** (tail risk quantification)
+# MAGIC - **Premium rate adequacy** stress testing
+# MAGIC
+# MAGIC We fit a **GARCH(1,1)** to the loss ratio of each segment and extract conditional volatility forecasts.
+
+# COMMAND ----------
+
+GARCH_SCHEMA = StructType([
+    StructField("segment_id",          StringType(), False),
+    StructField("month",               DateType(),   False),
+    StructField("record_type",         StringType(), False),
+    StructField("loss_ratio",          DoubleType(), True),
+    StructField("cond_volatility",     DoubleType(), True),
+    StructField("forecast_vol_1m",     DoubleType(), True),
+    StructField("forecast_vol_12m",    DoubleType(), True),
+    StructField("omega",               DoubleType(), True),
+    StructField("alpha",               DoubleType(), True),
+    StructField("beta",                DoubleType(), True),
+    StructField("log_likelihood",      DoubleType(), True),
+])
+
+def fit_garch_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit GARCH(1,1) to loss ratio returns for one segment.
+    Uses the `arch` library — standard actuarial Python tooling.
+    """
+    from arch import arch_model
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    segment_id = pdf["segment_id"].iloc[0]
+    pdf = pdf.sort_values("month").reset_index(drop=True)
+
+    lr = pdf["loss_ratio"].astype(float).values
+    months = pd.to_datetime(pdf["month"])
+
+    # Work on log-returns of loss ratio (stationarity)
+    lr_returns = np.diff(np.log(np.clip(lr, 0.01, None))) * 100  # in pct
+
+    result_rows = []
+    omega_val = alpha_val = beta_val = ll_val = np.nan
+    cond_vols = [np.nan] + [np.nan] * len(lr_returns)
+
+    try:
+        am = arch_model(lr_returns, vol="Garch", p=1, q=1, dist="normal")
+        res = am.fit(disp="off", show_warning=False)
+
+        omega_val = float(res.params["omega"])
+        alpha_val = float(res.params["alpha[1]"])
+        beta_val  = float(res.params["beta[1]"])
+        ll_val    = float(res.loglikelihood)
+
+        # Conditional volatility (annualized, scaled to loss ratio units)
+        cond_vols = [np.nan] + list(res.conditional_volatility)
+
+        # Forecast: 1-month and 12-month ahead volatility
+        fc = res.forecast(horizon=12, reindex=False)
+        # Handle both DataFrame and ndarray variance output across arch versions
+        var_arr = np.asarray(fc.variance)
+        vol_1m  = float(np.sqrt(var_arr.flat[0]))
+        vol_12m = float(np.sqrt(var_arr.flat[11] if var_arr.size > 11 else var_arr.flat[-1]))
+
+    except Exception:
+        vol_1m = vol_12m = np.nan
+
+    for i, (m, lr_val, cv) in enumerate(zip(months, lr, cond_vols)):
+        result_rows.append({
+            "segment_id":       segment_id,
+            "month":            m.date(),
+            "record_type":      "actual",
+            "loss_ratio":       float(lr_val),
+            "cond_volatility":  float(cv) if not np.isnan(cv) else None,
+            "forecast_vol_1m":  vol_1m if i == len(months) - 1 else None,
+            "forecast_vol_12m": vol_12m if i == len(months) - 1 else None,
+            "omega":            omega_val,
+            "alpha":            alpha_val,
+            "beta":             beta_val,
+            "log_likelihood":   ll_val,
+        })
+
+    return pd.DataFrame(result_rows)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Run GARCH Across All Segments
+
+# COMMAND ----------
+
+with mlflow.start_run(run_name="garch_all_segments") as run:
+    mlflow.set_tags({
+        "workshop_module": "4",
+        "model_type":      "GARCH(1,1)",
+        "segments":        "20",
+        "audience":        "actuarial-workshop",
+    })
+
+    garch_results_df = (
+        claims_df
+        .groupby("segment_id")
+        .applyInPandas(fit_garch_per_segment, schema=GARCH_SCHEMA)
+    )
+
+    # garch_results_df.cache()  # Not supported on serverless
+    garch_count = garch_results_df.count()
+
+    # Average persistence (alpha + beta) — key GARCH risk metric; close to 1 = long memory
+    avg_persistence = (
+        garch_results_df
+        .filter(F.col("record_type") == "actual")
+        .agg(F.mean((F.col("alpha") + F.col("beta"))).alias("avg_persistence"))
+        .collect()[0]["avg_persistence"]
+    )
+
+    mlflow.log_metric("avg_garch_persistence", round(avg_persistence, 4))
+    mlflow.log_metric("segments_fitted", 20)
+    print(f"GARCH complete | Rows: {garch_count} | Avg persistence (α+β): {avg_persistence:.4f}")
+
+display(garch_results_df.orderBy("segment_id", "month").limit(30))
+
+# COMMAND ----------
+
+(garch_results_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{CATALOG}.{SCHEMA}.garch_volatility"))
+
+print(f"Saved to {CATALOG}.{SCHEMA}.garch_volatility")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Monte Carlo Portfolio Simulation with Ray
+# MAGIC
+# MAGIC ### Why Ray (Not Spark) for This?
+# MAGIC
+# MAGIC Each Monte Carlo trial is an **independent Python computation** — no data-parallel transformation over rows.
+# MAGIC This is the textbook case for **task parallelism**:
+# MAGIC
+# MAGIC | Characteristic | Spark | Ray |
+# MAGIC |---|---|---|
+# MAGIC | Parallelism model | Data-parallel | Task-parallel |
+# MAGIC | Scheduling unit | Partition of rows | Arbitrary Python function |
+# MAGIC | Best for | Same op over large dataset | Many independent computations |
+# MAGIC | Monte Carlo fit | Poor | **Excellent** |
+# MAGIC
+# MAGIC We simulate a **3-segment correlated portfolio** (Property, Auto, Liability):
+# MAGIC - **100,000 annual loss scenarios** using correlated lognormal draws
+# MAGIC - Each Ray task handles **1,000 scenarios** → 100 tasks run in parallel
+# MAGIC - Aggregate: VaR(99.5%), CVaR, Expected Loss — standard Solvency II / IFRS 17 metrics
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Initialize Ray on Spark
+# MAGIC
+# MAGIC `ray.util.spark.setup_ray_cluster` launches Ray workers on top of the existing Spark cluster.
+# MAGIC Ray and Spark share the same compute but operate independently.
+
+# COMMAND ----------
+
+try:
+    import ray
+    from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
+    import ray.util.spark
+
+    # Shut down any existing Ray cluster before starting fresh
+    try:
+        shutdown_ray_cluster()
+    except Exception:
+        pass
+
+    setup_ray_cluster(
+        max_worker_nodes=4,
+        num_cpus_worker_node=4,
+        collect_log_to_path="/tmp/ray_logs",
+    )
+
+    ray.init(ignore_reinit_error=True)
+    print(f"Ray initialized | Resources: {ray.cluster_resources()}")
+    RAY_AVAILABLE = True
+
+except ImportError:
+    print("Ray not available on this cluster. Using threading simulation for demonstration.")
+    RAY_AVAILABLE = False
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Define Monte Carlo Task
+# MAGIC
+# MAGIC Each `@ray.remote` function simulates **1,000 correlated loss scenarios** for the 3-segment portfolio.
+# MAGIC The correlation matrix reflects typical reinsurance treaty assumptions:
+# MAGIC - Property ↔ Auto: 0.40 (shared weather events)
+# MAGIC - Property ↔ Liability: 0.20
+# MAGIC - Auto ↔ Liability: 0.30
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+
+# Portfolio parameters (in $M expected annual losses)
+PORTFOLIO = {
+    "segments":   ["Property", "Auto", "Liability"],
+    "means":      [12.5, 8.3, 5.7],          # Expected annual loss per segment ($M)
+    "cv":         [0.35, 0.28, 0.42],         # Coefficients of variation
+    "corr_matrix": np.array([                 # Pearson correlations
+        [1.00, 0.40, 0.20],
+        [0.40, 1.00, 0.30],
+        [0.20, 0.30, 1.00],
+    ]),
+}
+
+# Cholesky decomposition for correlated draws (done once, shared)
+def get_cholesky():
+    sigma = np.diag(PORTFOLIO["cv"]) @ PORTFOLIO["corr_matrix"] @ np.diag(PORTFOLIO["cv"])
+    return np.linalg.cholesky(sigma)
+
+CHOL = get_cholesky()
+
+# Define the Ray task function (only if Ray is available)
+if RAY_AVAILABLE:
+    @ray.remote
+    def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        means = np.array([12.5, 8.3, 5.7])
+        cv    = np.array([0.35, 0.28, 0.42])
+        corr  = np.array([[1.00, 0.40, 0.20],
+                          [0.40, 1.00, 0.30],
+                          [0.20, 0.30, 1.00]])
+        sigma2 = np.log(1 + cv**2)
+        mu_ln  = np.log(means) - sigma2 / 2
+        cov_ln = np.diag(np.sqrt(sigma2)) @ corr @ np.diag(np.sqrt(sigma2))
+        chol   = np.linalg.cholesky(cov_ln)
+        z = rng.standard_normal((n_scenarios, 3))
+        x = z @ chol.T
+        losses = np.exp(mu_ln + x)
+        total  = losses.sum(axis=1)
+        return {
+            'seed':          seed,
+            'n_scenarios':   n_scenarios,
+            'total_loss_mean': float(total.mean()),
+            'var_95':        float(np.percentile(total, 95)),
+            'var_99':        float(np.percentile(total, 99)),
+            'var_995':       float(np.percentile(total, 99.5)),
+            'cvar_99':       float(total[total >= np.percentile(total, 99)].mean()),
+            'max_loss':      float(total.max()),
+            'raw_percentiles': list(np.percentile(total, [90, 95, 99, 99.5, 99.9]).tolist()),
+        }
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Launch 100 Ray Tasks - 100,000 Scenarios
+
+# COMMAND ----------
+
+N_TASKS     = 100
+N_PER_TASK  = 1_000
+TOTAL_PATHS = N_TASKS * N_PER_TASK
+
+if RAY_AVAILABLE:
+    print(f'Launching {N_TASKS} Ray tasks x {N_PER_TASK:,} scenarios = {TOTAL_PATHS:,} total paths')
+
+    with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
+        mlflow.set_tags({
+            'workshop_module': '4',
+            'model_type':      'Monte Carlo - Correlated Lognormal',
+            'n_scenarios':     str(TOTAL_PATHS),
+            'n_segments':      '3',
+            'framework':       'Ray',
+            'audience':        'actuarial-workshop',
+        })
+        mlflow.log_params({
+            'n_tasks':        N_TASKS,
+            'scenarios_per_task': N_PER_TASK,
+            'total_scenarios': TOTAL_PATHS,
+            'correlation_P_A': 0.40,
+            'correlation_P_L': 0.20,
+            'correlation_A_L': 0.30,
+        })
+        futures = [
+            simulate_portfolio_losses.remote(N_PER_TASK, seed=42 + i)
+            for i in range(N_TASKS)
+        ]
+        results = ray.get(futures)
+        aggregate_var99  = float(sum(r['var_99']  for r in results) / len(results))
+        aggregate_var995 = float(sum(r['var_995'] for r in results) / len(results))
+        aggregate_cvar99 = float(sum(r['cvar_99'] for r in results) / len(results))
+        aggregate_mean   = float(sum(r['total_loss_mean'] for r in results) / len(results))
+
+        mlflow.log_metrics({
+            'expected_annual_loss_M':  round(aggregate_mean, 2),
+            'VaR_99_pct_M':            round(aggregate_var99, 2),
+            'VaR_99_5_pct_M':          round(aggregate_var995, 2),
+            'CVaR_99_pct_M':           round(aggregate_cvar99, 2),
+            'implied_risk_margin_pct': round((aggregate_cvar99 / aggregate_mean - 1) * 100, 1),
+        })
+
+        print(f'\n' + '='*55)
+        print(f'  PORTFOLIO RISK SUMMARY ({TOTAL_PATHS:,} scenarios)')
+        print('='*55)
+        print(f'  Expected Annual Loss:   ${aggregate_mean:.1f}M')
+        print(f'  VaR(99%):              ${aggregate_var99:.1f}M')
+        print(f'  VaR(99.5%):            ${aggregate_var995:.1f}M <- Solvency II SCR')
+        print(f'  CVaR(99%):             ${aggregate_cvar99:.1f}M')
+        print(f'  Risk Margin (CVaR/EL): {(aggregate_cvar99/aggregate_mean - 1)*100:.0f}%')
+        print('='*55)
+        print(f'\nMLflow run: {run.info.run_id}')
+
+        results_pdf = pd.DataFrame([{
+            'task_id':        r['seed'] - 42,
+            'n_scenarios':    r['n_scenarios'],
+            'mean_loss_M':    r['total_loss_mean'],
+            'var_95_M':       r['var_95'],
+            'var_99_M':       r['var_99'],
+            'var_995_M':      r['var_995'],
+            'cvar_99_M':      r['cvar_99'],
+            'max_loss_M':     r['max_loss'],
+            'mlflow_run_id':  run.info.run_id,
+        } for r in results])
+
+        mc_df = spark.createDataFrame(results_pdf)
+        (mc_df.write
+            .format('delta')
+            .mode('overwrite')
+            .option('overwriteSchema', 'true')
+            .saveAsTable(f'{CATALOG}.{SCHEMA}.monte_carlo_results'))
+        print(f'\nResults saved to {CATALOG}.{SCHEMA}.monte_carlo_results')
+
+else:
+    # Fallback: single-node simulation without Ray
+    print('\nRunning single-node Monte Carlo (Ray not available on this cluster)\n')
+    N_SCENARIOS = 100_000
+    rng = np.random.default_rng(42)
+    means = np.array([12.5, 8.3, 5.7])
+    cv    = np.array([0.35, 0.28, 0.42])
+    corr  = np.array([[1.00, 0.40, 0.20], [0.40, 1.00, 0.30], [0.20, 0.30, 1.00]])
+    sigma2 = np.log(1 + cv**2)
+    mu_ln  = np.log(means) - sigma2 / 2
+    cov_ln = np.diag(np.sqrt(sigma2)) @ corr @ np.diag(np.sqrt(sigma2))
+    chol   = np.linalg.cholesky(cov_ln)
+    z = rng.standard_normal((N_SCENARIOS, 3))
+    losses = np.exp(mu_ln + (z @ chol.T))
+    total  = losses.sum(axis=1)
+
+    with mlflow.start_run(run_name='monte_carlo_portfolio_singlenode') as run:
+        mlflow.log_params({'n_scenarios': N_SCENARIOS, 'framework': 'numpy'})
+        mlflow.log_metrics({
+            'expected_annual_loss_M': round(float(total.mean()), 2),
+            'VaR_99_pct_M':           round(float(np.percentile(total, 99)), 2),
+            'VaR_99_5_pct_M':         round(float(np.percentile(total, 99.5)), 2),
+        })
+
+    print(f'Portfolio Risk Summary ({N_SCENARIOS:,} scenarios)')
+    print(f'  Expected Annual Loss: ${total.mean():.1f}M')
+    print(f'  VaR(99%):            ${np.percentile(total, 99):.1f}M')
+    print(f'  VaR(99.5%):          ${np.percentile(total, 99.5):.1f}M <- Solvency II SCR')
+    print(f'  CVaR(99%):           ${total[total >= np.percentile(total, 99)].mean():.1f}M')
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+# MAGIC
+# MAGIC | Technique | Framework | Scale | Use Case |
+# MAGIC |---|---|---|---|
+# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 20 segments × 60 months | Claim volume forecasting |
+# MAGIC | GARCH(1,1) | arch + applyInPandas | 20 segments | Loss ratio volatility, risk capital |
+# MAGIC | Monte Carlo (Correlated Lognormal) | Ray tasks | 100k scenarios | VaR, CVaR, SCR calculation |
+# MAGIC
+# MAGIC **Next:** Module 5 — Log the best SARIMA model to MLflow, register in UC, and deploy a Model Serving endpoint.

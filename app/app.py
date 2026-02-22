@@ -75,10 +75,10 @@ WORKSPACE_HOST = os.environ.get("DATABRICKS_HOST", "")
 if WORKSPACE_HOST and not WORKSPACE_HOST.startswith("http"):
     WORKSPACE_HOST = f"https://{WORKSPACE_HOST}"
 
-ENDPOINT_NAME = "actuarial-workshop-sarima-forecaster"
-WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "862f1d757f0424f7")
-CATALOG = "patrick_labelle"
-SCHEMA  = "actuarial_workshop"
+ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "actuarial-workshop-sarima-forecaster")
+WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+CATALOG       = os.environ.get("CATALOG", "my_catalog")
+SCHEMA        = os.environ.get("SCHEMA", "actuarial_workshop")
 
 if _auth_init_error is not None:
     st.warning(

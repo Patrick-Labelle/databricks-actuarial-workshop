@@ -1,0 +1,26 @@
+# ─── DLT Pipeline: Medallion Architecture ────────────────────────────────────
+# Bronze → Silver (SCD Type 2) → Gold (segment monthly stats)
+# Source notebook: demos/01_dlt_pipeline_and_jobs.py
+
+resources:
+  pipelines:
+    actuarial_workshop_dlt:
+      name: "actuarial-workshop-medallion"
+      # Unity Catalog target — tables are created in ${var.catalog}.${var.schema}
+      catalog: "${var.catalog}"
+      target: "${var.schema}"
+
+      # Serverless preferred; falls back gracefully to classic compute
+      serverless: true
+      channel: CURRENT
+      continuous: false
+
+      # These key-value pairs are accessible in the notebook via spark.conf.get()
+      configuration:
+        catalog: "${var.catalog}"
+        schema: "${var.schema}"
+        notification_email: "${var.notification_email}"
+
+      libraries:
+        - notebook:
+            path: ../demos/01_dlt_pipeline_and_jobs.py
