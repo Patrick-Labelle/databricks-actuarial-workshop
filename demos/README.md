@@ -18,37 +18,26 @@ A complete 1-day workshop for actuaries and data scientists, demonstrating how t
 
 ---
 
-## Live Deployed Resources
+## Deployed Resources
 
-These resources are deployed in the **e2-demo-field-eng** workspace and are ready to use for demos.
+After running the bundle and Full Setup job, the following resources will exist in your workspace:
 
-### Workspace
-| Resource | Link |
+### Data & Models
+| Resource | Name |
 |----------|------|
-| Databricks Workspace | [e2-demo-field-eng.cloud.databricks.com](https://e2-demo-field-eng.cloud.databricks.com) |
-| Unity Catalog Schema | [patrick_labelle.actuarial_workshop](https://e2-demo-field-eng.cloud.databricks.com/explore/data/patrick_labelle/actuarial_workshop) |
-| Workshop Notebooks | [/Users/patrick.labelle@databricks.com/actuarial-workshop/](https://e2-demo-field-eng.cloud.databricks.com/browse/folders/1444828305810485) |
+| Unity Catalog Schema | `{catalog}.{schema}` (configured via bundle variables) |
+| DLT Pipeline | `actuarial-workshop-medallion` |
+| UC Model Registry | `{catalog}.{schema}.sarima_claims_forecaster` |
+| Model Serving Endpoint | value of `endpoint_name` variable |
+| Feature Table | `{catalog}.{schema}.segment_monthly_features` |
+| Online Table | `{catalog}.{schema}.segment_features_online` |
 
-### Models & Serving
-| Resource | Link |
+### Jobs & App
+| Resource | Name |
 |----------|------|
-| UC Model Registry | [patrick_labelle.actuarial_workshop.sarima_claims_forecaster](https://e2-demo-field-eng.cloud.databricks.com/explore/data/patrick_labelle/actuarial_workshop/sarima_claims_forecaster) |
-| Model Serving Endpoint | [actuarial-workshop-sarima-forecaster](https://e2-demo-field-eng.cloud.databricks.com/serving-endpoints/actuarial-workshop-sarima-forecaster/invocations) |
-| MLflow Experiments | [ML Experiments](https://e2-demo-field-eng.cloud.databricks.com/ml/experiments) (search `actuarial_workshop`) |
-
-### Pipelines & Jobs
-| Resource | Link |
-|----------|------|
-| DLT Pipeline | [Pipelines UI](https://e2-demo-field-eng.cloud.databricks.com/pipelines) (search `Actuarial Workshop`) |
-| Databricks Job | [Jobs UI](https://e2-demo-field-eng.cloud.databricks.com/jobs) (search `Actuarial Workshop`) |
-| Online Table | [patrick_labelle.actuarial_workshop.segment_features_online](https://e2-demo-field-eng.cloud.databricks.com/explore/data/patrick_labelle/actuarial_workshop/segment_features_online) |
-
-### Databricks App
-| Resource | Details |
-|----------|---------|
-| Live App URL | [actuarial-workshop-1444828305810485.aws.databricksapps.com](https://actuarial-workshop-1444828305810485.aws.databricksapps.com) |
-| App Source | `/Users/patrick.labelle/actuarial-workshop-app/` |
-| Lakebase Instance | `actuarial-workshop-db` (PostgreSQL, database `actuarial_workshop_db`) |
+| Setup Job | `Actuarial Workshop — Full Setup` |
+| Monthly Refresh Job | `Actuarial Workshop — Monthly Model Refresh` |
+| Databricks App | `actuarial-workshop` |
 
 ---
 
@@ -76,7 +65,7 @@ The following libraries are used. On serverless, install via notebook-scoped lib
 
 ### Unity Catalog Permissions
 
-The notebooks write to `<CATALOG>.<SCHEMA>` (default: `patrick_labelle.actuarial_workshop`). The running user needs:
+The notebooks write to `<CATALOG>.<SCHEMA>` (default: `my_catalog.actuarial_workshop`). The running user needs:
 
 - `USE CATALOG` on the target catalog
 - `CREATE SCHEMA` on the target catalog (to create `actuarial_workshop`)

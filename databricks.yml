@@ -1,18 +1,3 @@
-# ─── LOCAL ONLY — DO NOT COMMIT ───────────────────────────────────────────────
-# This file contains workspace-specific values for the e2-demo-field-eng
-# environment. It is gitignored to prevent sensitive IDs and URLs from being
-# committed to the repository.
-#
-# TO DEPLOY TO E2-DEMO:
-#   cp databricks.local.yml databricks.yml
-#   databricks bundle deploy --target e2-demo
-#   git checkout databricks.yml   # restore the generic version
-#
-# Or set environment variables before running `databricks bundle deploy`:
-#   export DATABRICKS_CONFIG_PROFILE=e2-demo-west
-#   export BUNDLE_VAR_catalog=patrick_labelle
-#   ... (see configs/e2-demo.env for all variables)
-
 bundle:
   name: actuarial-workshop
 
@@ -57,16 +42,5 @@ targets:
       catalog: my_catalog
       schema: actuarial_workshop
 
-  # ── Databricks Field Engineering demo workspace ──────────────────────────────
-  e2-demo:
-    workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
-      profile: e2-demo-west
-    variables:
-      catalog: patrick_labelle
-      schema: actuarial_workshop
-      endpoint_name: actuarial-workshop-sarima-forecaster
-      warehouse_id: "862f1d757f0424f7"
-      pg_host: "instance-57a2aeba-243b-43a5-a17f-98b78910be06.database.cloud.databricks.com"
-      pg_database: actuarial_workshop_db
-      notification_email: patrick.labelle@databricks.com
+  # ── Add your workspace target in databricks.local.yml (gitignored) ───────────
+  # See databricks.local.yml.example for a template.

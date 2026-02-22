@@ -81,7 +81,7 @@ databricks apps start actuarial-workshop
 | Target | Workspace | Notes |
 |--------|-----------|-------|
 | `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
-| `e2-demo` | e2-demo-field-eng | Databricks FE demo workspace |
+| _(add your own)_ | your-workspace | See `databricks.local.yml.example` |
 
 Example for a custom workspace:
 ```bash
@@ -134,13 +134,16 @@ the top of each notebook allow standalone execution without the bundle.
 
 ---
 
-## Live Demo Resources (e2-demo-field-eng)
+## Deployed Resources
 
-| Resource | Link |
+After running the Full Setup job, the following resources will be created in your workspace:
+
+| Resource | Name |
 |----------|------|
-| Workspace | [e2-demo-field-eng](https://e2-demo-field-eng.cloud.databricks.com) |
-| UC Schema | [patrick_labelle.actuarial_workshop](https://e2-demo-field-eng.cloud.databricks.com/explore/data/patrick_labelle/actuarial_workshop) |
-| DLT Pipeline | [actuarial-workshop-medallion](https://e2-demo-field-eng.cloud.databricks.com/pipelines/c903d5ed-c42c-4491-82f7-615d7a087f37) |
-| Setup Job | [Actuarial Workshop — Full Setup](https://e2-demo-field-eng.cloud.databricks.com/jobs/554471461734476) |
-| Model Serving | [actuarial-workshop-sarima-forecaster](https://e2-demo-field-eng.cloud.databricks.com/serving-endpoints/actuarial-workshop-sarima-forecaster/invocations) |
-| App | [actuarial-workshop](https://actuarial-workshop-1444828305810485.aws.databricksapps.com) |
+| DLT Pipeline | `actuarial-workshop-medallion` |
+| Setup Job | `Actuarial Workshop — Full Setup` |
+| Monthly Refresh Job | `Actuarial Workshop — Monthly Model Refresh` |
+| Model Serving Endpoint | value of `endpoint_name` variable (default: `actuarial-workshop-sarima-forecaster`) |
+| Databricks App | `actuarial-workshop` |
+| Feature Table | `{catalog}.{schema}.segment_monthly_features` |
+| UC Model | `{catalog}.{schema}.sarima_claims_forecaster` |

@@ -26,7 +26,7 @@
 # MAGIC ```
 # MAGIC Silver rolling features (Module 2)
 # MAGIC         ↓ register
-# MAGIC UC Feature Table (patrick_labelle.actuarial_workshop.segment_features)
+# MAGIC UC Feature Table ({catalog}.{schema}.segment_features)
 # MAGIC         ↓ point-in-time join
 # MAGIC Training set (no leakage guaranteed)
 # MAGIC         ↓ publish

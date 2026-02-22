@@ -379,15 +379,15 @@ EOF
 # 4. Deploy via Databricks CLI
 databricks apps create actuarial-risk-dashboard \\
   --description "SARIMA forecasts + Monte Carlo risk dashboard for actuaries" \\
-  --profile e2-demo-west
+  --profile your-profile
 
 # 5. Deploy code
 databricks apps deploy actuarial-risk-dashboard \\
   --source-code-path ~/actuarial-workshop-app \\
-  --profile e2-demo-west
+  --profile your-profile
 
 # 6. View app URL
-databricks apps get actuarial-risk-dashboard --profile e2-demo-west
+databricks apps get actuarial-risk-dashboard --profile your-profile
 """
 
 print(deploy_commands_display := DEPLOY_COMMANDS)

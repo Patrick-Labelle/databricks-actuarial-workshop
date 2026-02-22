@@ -475,7 +475,7 @@ print(json.dumps(result, indent=2))
 # MAGIC        ↓ (training data)
 # MAGIC MLflow Run [sarima_personal_auto_ontario_champion]
 # MAGIC        ↓ (registered model)
-# MAGIC patrick_labelle.actuarial_workshop.sarima_claims_forecaster @ Champion
+# MAGIC {catalog}.{schema}.sarima_claims_forecaster @ Champion
 # MAGIC        ↓ (serving)
 # MAGIC actuarial-workshop-sarima-forecaster (endpoint)
 # MAGIC        ↓ (request logs)
@@ -512,7 +512,7 @@ except Exception as e:
 # MAGIC | Step | What Happened |
 # MAGIC |---|---|
 # MAGIC | Log model | SARIMAX wrapped as PyFunc with signature → logged to MLflow experiment |
-# MAGIC | Register | Model version created in `patrick_labelle.actuarial_workshop.sarima_claims_forecaster` |
+# MAGIC | Register | Model version created in `{catalog}.{schema}.sarima_claims_forecaster` |
 # MAGIC | Alias | `@Champion` alias points to approved version — decouples serving from version numbers |
 # MAGIC | Serve | Real-time REST endpoint with scale-to-zero, UC permissions, request logging |
 # MAGIC | Lineage | Full chain: training data → experiment → model version → endpoint → logs |

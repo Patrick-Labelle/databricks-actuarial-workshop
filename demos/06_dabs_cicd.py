@@ -56,7 +56,7 @@
 # MAGIC   name: actuarial-workshop
 # MAGIC
 # MAGIC workspace:
-# MAGIC   host: https://e2-demo-field-eng.cloud.databricks.com
+# MAGIC   host: https://your-workspace.cloud.databricks.com
 # MAGIC
 # MAGIC include:
 # MAGIC   - resources/*.yml     # Pull in job, serving, pipeline definitions
@@ -71,7 +71,7 @@
 # MAGIC
 # MAGIC   staging:
 # MAGIC     workspace:
-# MAGIC       host: https://e2-demo-field-eng.cloud.databricks.com
+# MAGIC       host: https://your-workspace.cloud.databricks.com
 # MAGIC       root_path: /Shared/.bundle/${bundle.name}/staging
 # MAGIC     variables:
 # MAGIC       catalog:  staging_catalog
@@ -79,10 +79,10 @@
 # MAGIC
 # MAGIC   production:
 # MAGIC     workspace:
-# MAGIC       host: https://e2-demo-field-eng.cloud.databricks.com
+# MAGIC       host: https://your-workspace.cloud.databricks.com
 # MAGIC       root_path: /Shared/.bundle/${bundle.name}/prod
 # MAGIC     variables:
-# MAGIC       catalog:  patrick_labelle      # or your production catalog
+# MAGIC       catalog:  your_catalog          # or your production catalog
 # MAGIC       schema:   actuarial_workshop
 # MAGIC ```
 
@@ -95,7 +95,7 @@
 # MAGIC # resources/jobs.yml
 # MAGIC variables:
 # MAGIC   catalog:
-# MAGIC     default: patrick_labelle
+# MAGIC     default: your_catalog
 # MAGIC   schema:
 # MAGIC     default: actuarial_workshop
 # MAGIC
@@ -113,7 +113,7 @@
 # MAGIC       # Email on failure
 # MAGIC       email_notifications:
 # MAGIC         on_failure:
-# MAGIC           - patrick.labelle@databricks.com
+# MAGIC           - your.email@company.com
 # MAGIC
 # MAGIC       tasks:
 # MAGIC         - task_key: generate_silver_data
@@ -178,7 +178,7 @@
 # MAGIC       name: "[${bundle.target}] actuarial-sarima-forecaster"
 # MAGIC       config:
 # MAGIC         served_models:
-# MAGIC           - model_name: "patrick_labelle.actuarial_workshop.sarima_claims_forecaster"
+# MAGIC           - model_name: "${var.catalog}.${var.schema}.sarima_claims_forecaster"
 # MAGIC             model_version: "1"               # Override per environment
 # MAGIC             workload_size: "Small"
 # MAGIC             scale_to_zero_enabled: true
@@ -196,16 +196,16 @@
 # MAGIC ### Local Development
 # MAGIC ```bash
 # MAGIC # Authenticate (done once)
-# MAGIC databricks auth login https://e2-demo-field-eng.cloud.databricks.com --profile e2-demo-west
+# MAGIC databricks auth login https://your-workspace.cloud.databricks.com --profile your-profile
 # MAGIC
 # MAGIC # Validate the bundle (checks YAML syntax, resource references, permissions)
-# MAGIC databricks bundle validate --profile e2-demo-west
+# MAGIC databricks bundle validate --profile your-profile
 # MAGIC
 # MAGIC # Deploy to your personal development workspace path
-# MAGIC databricks bundle deploy --target development --profile e2-demo-west
+# MAGIC databricks bundle deploy --target development --profile your-profile
 # MAGIC
 # MAGIC # Run the pipeline manually
-# MAGIC databricks bundle run actuarial_model_pipeline --target development --profile e2-demo-west
+# MAGIC databricks bundle run actuarial_model_pipeline --target development --profile your-profile
 # MAGIC
 # MAGIC # Watch run status
 # MAGIC databricks bundle run actuarial_model_pipeline --restart-on-failure --no-wait
@@ -248,7 +248,7 @@
 # MAGIC       - "release/*"
 # MAGIC
 # MAGIC variables:
-# MAGIC   DATABRICKS_HOST: https://e2-demo-field-eng.cloud.databricks.com
+# MAGIC   DATABRICKS_HOST: https://your-workspace.cloud.databricks.com
 # MAGIC
 # MAGIC stages:
 # MAGIC
@@ -424,23 +424,23 @@ print("""
     "target": "development"
   },
   "workspace": {
-    "host": "https://e2-demo-field-eng.cloud.databricks.com",
+    "host": "https://your-workspace.cloud.databricks.com",
     "current_user": {
-      "user_name": "patrick.labelle@databricks.com"
+      "user_name": "user@company.com"
     },
-    "root_path": "/Users/patrick.labelle@databricks.com/.bundle/actuarial-workshop/dev",
-    "file_path": "/Users/patrick.labelle@databricks.com/.bundle/actuarial-workshop/dev/files"
+    "root_path": "/Users/user@company.com/.bundle/actuarial-workshop/dev",
+    "file_path": "/Users/user@company.com/.bundle/actuarial-workshop/dev/files"
   },
   "resources": {
     "jobs": {
       "actuarial_model_pipeline": {
         "id": "123456789",
-        "name": "[dev patrick.labelle] Actuarial Model Pipeline"
+        "name": "[dev user] Actuarial Model Pipeline"
       }
     },
     "model_serving_endpoints": {
       "sarima_forecaster_endpoint": {
-        "name": "[dev patrick.labelle] actuarial-sarima-forecaster"
+        "name": "[dev user] actuarial-sarima-forecaster"
       }
     }
   }
@@ -449,18 +449,18 @@ print("""
 
 print("Typical `databricks bundle deploy` output:")
 print("""
-Uploading bundle files to /Users/patrick.labelle@databricks.com/.bundle/actuarial-workshop/dev/files...
+Uploading bundle files to /Users/user@company.com/.bundle/actuarial-workshop/dev/files...
   ./notebooks/04_classical_stats_at_scale.py (5.2 KB)
   ./notebooks/05_mlflow_uc_serving.py (4.8 KB)
   ./notebooks/06_dabs_cicd.py (3.1 KB)
   ./src/monte_carlo.py (1.2 KB)
 
 Deploying resources...
-  Updating job [dev patrick.labelle] Actuarial Model Pipeline...
-  Updating model serving endpoint [dev patrick.labelle] actuarial-sarima-forecaster...
+  Updating job [dev user] Actuarial Model Pipeline...
+  Updating model serving endpoint [dev user] actuarial-sarima-forecaster...
 
 Deployment complete!
-  Job URL: https://e2-demo-field-eng.cloud.databricks.com/jobs/123456789
+  Job URL: https://your-workspace.cloud.databricks.com/jobs/123456789
 """)
 
 # COMMAND ----------

@@ -16,11 +16,11 @@
 # MAGIC
 # MAGIC | Asset | Type | Created By |
 # MAGIC |---|---|---|
-# MAGIC | `patrick_labelle.actuarial_workshop` | UC Schema + all tables | Modules 1–5 |
+# MAGIC | `{catalog}.{schema}` | UC Schema + all tables | Modules 1–5 |
 # MAGIC | `segment_features_online` | Online Table | Module 3 |
 # MAGIC | `actuarial-workshop-sarima-forecaster` | Model Serving endpoint | Module 5 |
 # MAGIC | `actuarial_workshop_sarima_claims_forecaster` | MLflow experiment | Module 5 |
-# MAGIC | `patrick_labelle.actuarial_workshop.sarima_claims_forecaster` | UC Model | Module 5 |
+# MAGIC | `{catalog}.{schema}.sarima_claims_forecaster` | UC Model | Module 5 |
 # MAGIC | `Actuarial Workshop — DLT Pipeline` | DLT Pipeline | Module 1 |
 # MAGIC | `Actuarial Workshop — Orchestration Demo` | Databricks Job | Module 1 |
 
@@ -59,7 +59,7 @@ print(f"Token acquired: {'yes' if TOKEN else 'no'}")
 # MAGIC %md
 # MAGIC ## 1. Drop Unity Catalog Schema and All Tables
 # MAGIC
-# MAGIC This drops **all** tables, views, functions, and volumes in `patrick_labelle.actuarial_workshop`,
+# MAGIC This drops **all** tables, views, functions, and volumes in `{catalog}.{schema}`,
 # MAGIC then drops the schema itself.
 
 # COMMAND ----------
@@ -126,7 +126,7 @@ else:
 # MAGIC %md
 # MAGIC ## 4. Delete Registered Model from UC Registry
 # MAGIC
-# MAGIC Removes the model `patrick_labelle.actuarial_workshop.sarima_claims_forecaster`
+# MAGIC Removes the model `{catalog}.{schema}.sarima_claims_forecaster`
 # MAGIC and all its versions from Unity Catalog.
 
 # COMMAND ----------
@@ -294,7 +294,7 @@ print("\nCleanup complete.")
 # MAGIC
 # MAGIC | Asset | Action |
 # MAGIC |---|---|
-# MAGIC | `patrick_labelle.actuarial_workshop` schema | Dropped (CASCADE) |
+# MAGIC | `{catalog}.{schema}` schema | Dropped (CASCADE) |
 # MAGIC | Online Table `segment_features_online` | Deleted via REST API |
 # MAGIC | Model Serving endpoint | Deleted via REST API |
 # MAGIC | UC registered model | Deleted via MLflow client |
