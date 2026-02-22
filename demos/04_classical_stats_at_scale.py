@@ -35,8 +35,10 @@
 
 # COMMAND ----------
 
-# %pip install statsmodels arch mlflow pmdarima --quiet
-# dbutils.library.restartPython()
+# On Serverless (Spark Connect), %pip install ensures packages are available on
+# both the driver and the compute environment where applyInPandas UDFs execute.
+# The ml_env spec in resources/jobs.yml only covers the driver side.
+%pip install statsmodels arch --quiet
 
 # COMMAND ----------
 
@@ -60,10 +62,22 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 # Passed as base_parameters by the bundle job; defaults used when interactive.
-dbutils.widgets.text("catalog", "my_catalog",         "UC Catalog")
-dbutils.widgets.text("schema",  "actuarial_workshop", "UC Schema")
-CATALOG = dbutils.widgets.get("catalog")
-SCHEMA  = dbutils.widgets.get("schema")
+dbutils.widgets.text("catalog",  "my_catalog",         "UC Catalog")
+dbutils.widgets.text("schema",   "actuarial_workshop", "UC Schema")
+dbutils.widgets.text("run_ray",  "skip",               "Run Ray (auto/skip)")
+# job_mode=true: use driver-side pandas groupby.apply() for SARIMA/GARCH instead of
+# applyInPandas. On Serverless (Spark Connect), applyInPandas UDFs run on the remote
+# compute which has a separate Python environment — packages installed via %pip only
+# reach the notebook kernel (client side), not the remote compute (server side).
+# Driver-side fitting produces identical outputs and works reliably on all runtimes.
+dbutils.widgets.text("job_mode", "false",              "Job (automated) mode")
+CATALOG   = dbutils.widgets.get("catalog")
+SCHEMA    = dbutils.widgets.get("schema")
+# run_ray="skip" disables Ray setup entirely, using the single-node NumPy fallback.
+# Pass run_ray=skip from the bundle job on Serverless where setup_ray_cluster is
+# not supported (Spark Connect does not expose the Ray-on-Spark RPC interface).
+RUN_RAY   = dbutils.widgets.get("run_ray")
+JOB_MODE  = dbutils.widgets.get("job_mode") == "true"
 
 np.random.seed(42)
 
@@ -286,7 +300,9 @@ def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 
 import mlflow
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-mlflow.set_experiment(f"/Users/{_current_user}/actuarial-workshop/sarima-per-segment")
+# Use a flat path under /Users/<email>/ — avoid nested subdirectories which
+# require the parent to pre-exist (fails on fresh workspaces).
+mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_claims_sarima")
 
 with mlflow.start_run(run_name="sarima_all_segments") as run:
     mlflow.set_tags({
@@ -297,14 +313,29 @@ with mlflow.start_run(run_name="sarima_all_segments") as run:
         "audience":        "actuarial-workshop",
     })
 
-    sarima_results_df = (
-        claims_df
-        .groupby("segment_id")
-        .applyInPandas(fit_sarima_per_segment, schema=SARIMA_SCHEMA)
-    )
+    if JOB_MODE:
+        # Driver-side: collect to pandas, fit in a Python loop.
+        # Avoids applyInPandas which requires statsmodels on the remote Serverless
+        # compute — a separate Python environment that %pip install cannot reach.
+        print("job_mode=true: using driver-side pandas groupby.apply() for SARIMA")
+        claims_pdf = claims_df.toPandas()
+        sarima_result_pdf = (
+            claims_pdf
+            .groupby("segment_id", group_keys=False)
+            .apply(fit_sarima_per_segment)
+            .reset_index(drop=True)
+        )
+        sarima_results_df = spark.createDataFrame(sarima_result_pdf, schema=SARIMA_SCHEMA)
+    else:
+        # Distributed: Spark sends one segment per task to applyInPandas workers.
+        # Requires statsmodels on the compute environment (ml_env spec in bundle jobs).
+        sarima_results_df = (
+            claims_df
+            .groupby("segment_id")
+            .applyInPandas(fit_sarima_per_segment, schema=SARIMA_SCHEMA)
+        )
 
-    # Cache and count to trigger execution
-    # sarima_results_df.cache()  # Not supported on serverless
+    # Trigger execution and compute metrics
     total_rows = sarima_results_df.count()
 
     # Compute average MAPE across segments
@@ -322,7 +353,8 @@ with mlflow.start_run(run_name="sarima_all_segments") as run:
     print(f"SARIMA complete | Total rows: {total_rows} | Avg MAPE: {avg_mape:.1f}%")
     print(f"MLflow run: {run.info.run_id}")
 
-display(sarima_results_df.filter(F.col("record_type") == "forecast").orderBy("segment_id", "month").limit(30))
+if not JOB_MODE:
+    display(sarima_results_df.filter(F.col("record_type") == "forecast").orderBy("segment_id", "month").limit(30))
 
 # COMMAND ----------
 
@@ -444,13 +476,22 @@ with mlflow.start_run(run_name="garch_all_segments") as run:
         "audience":        "actuarial-workshop",
     })
 
-    garch_results_df = (
-        claims_df
-        .groupby("segment_id")
-        .applyInPandas(fit_garch_per_segment, schema=GARCH_SCHEMA)
-    )
+    if JOB_MODE:
+        print("job_mode=true: using driver-side pandas groupby.apply() for GARCH")
+        garch_result_pdf = (
+            claims_df.toPandas()
+            .groupby("segment_id", group_keys=False)
+            .apply(fit_garch_per_segment)
+            .reset_index(drop=True)
+        )
+        garch_results_df = spark.createDataFrame(garch_result_pdf, schema=GARCH_SCHEMA)
+    else:
+        garch_results_df = (
+            claims_df
+            .groupby("segment_id")
+            .applyInPandas(fit_garch_per_segment, schema=GARCH_SCHEMA)
+        )
 
-    # garch_results_df.cache()  # Not supported on serverless
     garch_count = garch_results_df.count()
 
     # Average persistence (alpha + beta) — key GARCH risk metric; close to 1 = long memory
@@ -465,7 +506,8 @@ with mlflow.start_run(run_name="garch_all_segments") as run:
     mlflow.log_metric("segments_fitted", 20)
     print(f"GARCH complete | Rows: {garch_count} | Avg persistence (α+β): {avg_persistence:.4f}")
 
-display(garch_results_df.orderBy("segment_id", "month").limit(30))
+if not JOB_MODE:
+    display(garch_results_df.orderBy("segment_id", "month").limit(30))
 
 # COMMAND ----------
 
@@ -509,30 +551,38 @@ print(f"Saved to {CATALOG}.{SCHEMA}.garch_volatility")
 
 # COMMAND ----------
 
-try:
-    import ray
-    from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
-    import ray.util.spark
-
-    # Shut down any existing Ray cluster before starting fresh
-    try:
-        shutdown_ray_cluster()
-    except Exception:
-        pass
-
-    setup_ray_cluster(
-        max_worker_nodes=4,
-        num_cpus_worker_node=4,
-        collect_log_to_path="/tmp/ray_logs",
-    )
-
-    ray.init(ignore_reinit_error=True)
-    print(f"Ray initialized | Resources: {ray.cluster_resources()}")
-    RAY_AVAILABLE = True
-
-except ImportError:
-    print("Ray not available on this cluster. Using threading simulation for demonstration.")
+if RUN_RAY == "skip":
+    # Explicitly disabled — used in bundle jobs on Serverless (Spark Connect does
+    # not support setup_ray_cluster; attempting it kills the Python process silently).
+    print("Ray skipped (run_ray=skip). Using single-node NumPy fallback for Monte Carlo.")
     RAY_AVAILABLE = False
+else:
+    try:
+        import ray
+        from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
+        import ray.util.spark
+
+        # Shut down any existing Ray cluster before starting fresh
+        try:
+            shutdown_ray_cluster()
+        except Exception:
+            pass
+
+        setup_ray_cluster(
+            max_worker_nodes=4,
+            num_cpus_worker_node=4,
+            collect_log_to_path="/tmp/ray_logs",
+        )
+
+        ray.init(ignore_reinit_error=True)
+        print(f"Ray initialized | Resources: {ray.cluster_resources()}")
+        RAY_AVAILABLE = True
+
+    except Exception as e:
+        # Catches ImportError, RuntimeError, and process-level failures from
+        # setup_ray_cluster (e.g. on Serverless where Spark Connect is used).
+        print(f"Ray not available ({type(e).__name__}: {e}). Using single-node NumPy fallback.")
+        RAY_AVAILABLE = False
 
 # COMMAND ----------
 
@@ -704,11 +754,33 @@ else:
             'VaR_99_5_pct_M':         round(float(np.percentile(total, 99.5)), 2),
         })
 
-    print(f'Portfolio Risk Summary ({N_SCENARIOS:,} scenarios)')
-    print(f'  Expected Annual Loss: ${total.mean():.1f}M')
-    print(f'  VaR(99%):            ${np.percentile(total, 99):.1f}M')
-    print(f'  VaR(99.5%):          ${np.percentile(total, 99.5):.1f}M <- Solvency II SCR')
-    print(f'  CVaR(99%):           ${total[total >= np.percentile(total, 99)].mean():.1f}M')
+        print(f'Portfolio Risk Summary ({N_SCENARIOS:,} scenarios)')
+        print(f'  Expected Annual Loss: ${total.mean():.1f}M')
+        print(f'  VaR(99%):            ${np.percentile(total, 99):.1f}M')
+        print(f'  VaR(99.5%):          ${np.percentile(total, 99.5):.1f}M <- Solvency II SCR')
+        print(f'  CVaR(99%):           ${total[total >= np.percentile(total, 99)].mean():.1f}M')
+
+        # Write summary result to Delta — same table as the Ray path so downstream
+        # consumers (app, module 5) work regardless of which path ran.
+        _cvar99 = float(total[total >= np.percentile(total, 99)].mean())
+        results_pdf = pd.DataFrame([{
+            'task_id':      0,
+            'n_scenarios':  N_SCENARIOS,
+            'mean_loss_M':  float(total.mean()),
+            'var_95_M':     float(np.percentile(total, 95)),
+            'var_99_M':     float(np.percentile(total, 99)),
+            'var_995_M':    float(np.percentile(total, 99.5)),
+            'cvar_99_M':    _cvar99,
+            'max_loss_M':   float(total.max()),
+            'mlflow_run_id': run.info.run_id,
+        }])
+        mc_df = spark.createDataFrame(results_pdf)
+        (mc_df.write
+            .format('delta')
+            .mode('overwrite')
+            .option('overwriteSchema', 'true')
+            .saveAsTable(f'{CATALOG}.{SCHEMA}.monte_carlo_results'))
+        print(f'Results saved to {CATALOG}.{SCHEMA}.monte_carlo_results')
 
 # COMMAND ----------
 

@@ -73,6 +73,13 @@ resources:
           environment_key: default_env
 
         # Task 5 — Fit SARIMA / GARCH / Monte Carlo (Module 4)
+        # run_ray=skip: setup_ray_cluster is not supported on Serverless (Spark Connect
+        # does not expose the Ray-on-Spark RPC interface). The single-node NumPy fallback
+        # produces identical outputs and is sufficient for the workshop and model registration.
+        # job_mode=true: use driver-side pandas groupby.apply() for SARIMA/GARCH instead of
+        # applyInPandas. On Serverless, %pip install only reaches the notebook kernel (client),
+        # not the remote compute (server) where applyInPandas UDFs execute. Driver-side fitting
+        # produces identical outputs and works reliably on all Serverless runtimes.
         - task_key: fit_statistical_models
           description: "SARIMA per segment, GARCH volatility, Monte Carlo simulation"
           depends_on:
@@ -82,6 +89,8 @@ resources:
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
+              run_ray: "skip"
+              job_mode: "true"
           environment_key: ml_env
 
         # Task 6 — Register model + create serving endpoint (Module 5)
@@ -107,6 +116,9 @@ resources:
           spec:
             client: "4"
             dependencies:
+              # statsmodels and arch are available via %pip install in the notebook
+              # (for driver-side job_mode fitting) and listed here for the interactive
+              # applyInPandas demo path where UDFs run on the remote compute.
               - statsmodels>=0.14
               - arch>=7.0
               - mlflow>=2.14
@@ -141,6 +153,8 @@ resources:
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
+              run_ray: "skip"
+              job_mode: "true"
           environment_key: ml_env
 
       environments:

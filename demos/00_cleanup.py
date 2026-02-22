@@ -152,29 +152,23 @@ except Exception as e:
 # COMMAND ----------
 
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial-workshop/champion-model"
-EXPERIMENT_NAME_4 = f"/Users/{_current_user}/actuarial-workshop/sarima-per-segment"
+# Flat paths used since run 4 fix (nested paths fail on fresh workspaces)
+EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster"
+EXPERIMENT_NAME_4 = f"/Users/{_current_user}/actuarial_workshop_claims_sarima"
+# Also handle old nested paths (in case workspace was seeded before the fix)
+EXPERIMENT_NAME_OLD   = f"/Users/{_current_user}/actuarial-workshop/champion-model"
+EXPERIMENT_NAME_4_OLD = f"/Users/{_current_user}/actuarial-workshop/sarima-per-segment"
 
-try:
-    experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
-    if experiment:
-        mlflow.delete_experiment(experiment.experiment_id)
-        print(f"MLflow experiment deleted: {EXPERIMENT_NAME}")
-    else:
-        print(f"Experiment not found: {EXPERIMENT_NAME}")
-except Exception as e:
-    print(f"Could not delete experiment: {e}")
-
-# Also clean up Module 4 experiment
-try:
-    experiment4 = mlflow.get_experiment_by_name(EXPERIMENT_NAME_4)
-    if experiment4:
-        mlflow.delete_experiment(experiment4.experiment_id)
-        print(f"MLflow experiment deleted: {EXPERIMENT_NAME_4}")
-    else:
-        print(f"Experiment not found (skipping): {EXPERIMENT_NAME_4}")
-except Exception as e:
-    print(f"Could not delete Module 4 experiment: {e}")
+for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_OLD, EXPERIMENT_NAME_4, EXPERIMENT_NAME_4_OLD]:
+    try:
+        experiment = mlflow.get_experiment_by_name(exp_name)
+        if experiment:
+            mlflow.delete_experiment(experiment.experiment_id)
+            print(f"MLflow experiment deleted: {exp_name}")
+        else:
+            print(f"Experiment not found (skipping): {exp_name}")
+    except Exception as e:
+        print(f"Could not delete experiment {exp_name}: {e}")
 
 # COMMAND ----------
 

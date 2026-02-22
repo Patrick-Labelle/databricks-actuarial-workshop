@@ -176,7 +176,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-mlflow.set_experiment(f"/Users/{_current_user}/actuarial-workshop/champion-model")
+# Use a flat path under /Users/<email>/ — avoid nested subdirectories which
+# require the parent to pre-exist (fails on fresh workspaces).
+mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster")
 
 with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
 
