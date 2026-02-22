@@ -17,6 +17,5 @@ targets:
       schema: actuarial_workshop
       endpoint_name: actuarial-workshop-sarima-forecaster
       warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
-      pg_host: "your-lakebase-host.database.cloud.databricks.com"  # ← optional (leave empty to disable)
-      pg_database: actuarial_workshop_db
+      pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional

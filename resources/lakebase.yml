@@ -1,0 +1,15 @@
+# ─── Lakebase: Managed PostgreSQL ────────────────────────────────────────────
+# Provisions a Databricks-managed Postgres instance for the Actuarial Workshop.
+# Used by the Streamlit app to persist scenario annotations across sessions.
+#
+# capacity CU_1 is the smallest sku (1 compute unit) — sufficient for a demo.
+# The app's service principal is granted access via the app resource in app.yml.
+
+resources:
+  database_instances:
+    actuarial_workshop_lakebase:
+      name: "actuarial-workshop-lakebase"
+      capacity: CU_1
+      # Allow Databricks tokens (PAT / notebook context token) to authenticate as a
+      # Postgres role. Required for psycopg2 connections from notebooks and the app.
+      enable_pg_native_login: true

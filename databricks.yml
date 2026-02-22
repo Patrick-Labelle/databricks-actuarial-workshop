@@ -18,10 +18,6 @@ variables:
     description: "SQL Warehouse ID for the Statement Execution API (used by the app)"
     default: ""
 
-  pg_host:
-    description: "Lakebase (managed Postgres) hostname. Leave empty to disable Lakebase."
-    default: ""
-
   pg_database:
     description: "Lakebase database name"
     default: actuarial_workshop_db
