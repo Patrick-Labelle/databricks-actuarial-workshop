@@ -106,6 +106,23 @@ resources:
               endpoint_name: "${var.endpoint_name}"
           environment_key: ml_env
 
+        # Task 7 — App setup: Lakebase DB + table + UC grants to app SP
+        # Runs after the serving endpoint exists so that app_sp_client_id is available
+        # and all tables that need SELECT grants are already present.
+        - task_key: setup_app_dependencies
+          description: "Create Lakebase DB, scenario_annotations table, and grant UC permissions to app SP"
+          depends_on:
+            - task_key: register_and_serve_model
+          notebook_task:
+            notebook_path: ../demos/00_app_setup.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              pg_database: "${var.pg_database}"
+              lakebase_instance: "${resources.database_instances.actuarial_workshop_lakebase.name}"
+              app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
+          environment_key: pg_env
+
       environments:
         - environment_key: default_env
           spec:
@@ -122,6 +139,11 @@ resources:
               - statsmodels>=0.14
               - arch>=7.0
               - mlflow>=2.14
+        - environment_key: pg_env
+          spec:
+            client: "4"
+            dependencies:
+              - psycopg2-binary
 
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
     # Scheduled job: refreshes data via DLT then re-fits the SARIMA models.

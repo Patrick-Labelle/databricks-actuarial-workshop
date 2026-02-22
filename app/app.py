@@ -237,8 +237,34 @@ def get_lakebase_conn():
         user=user, password=token, sslmode=sslmode,
     )
 
+_annotations_table_ensured = False
+
+def _ensure_annotations_table():
+    """Create scenario_annotations if it doesn't exist (idempotent, runs once per process)."""
+    global _annotations_table_ensured
+    if _annotations_table_ensured:
+        return
+    try:
+        conn = get_lakebase_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scenario_annotations (
+                id          SERIAL      PRIMARY KEY,
+                segment_id  TEXT        NOT NULL,
+                note        TEXT,
+                analyst     TEXT,
+                created_at  TIMESTAMP   DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        conn.close()
+        _annotations_table_ensured = True
+    except Exception:
+        pass  # Non-fatal — table may already exist or Lakebase may be unavailable
+
 def save_scenario_annotation(segment: str, note: str, analyst: str):
     try:
+        _ensure_annotations_table()
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
@@ -255,6 +281,7 @@ def save_scenario_annotation(segment: str, note: str, analyst: str):
 
 def load_annotations(segment_id: str):
     try:
+        _ensure_annotations_table()
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
