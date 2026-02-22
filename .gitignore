@@ -41,3 +41,7 @@ Thumbs.db
 .env
 .env.local
 *.pem
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
