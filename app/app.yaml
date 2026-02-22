@@ -26,9 +26,9 @@ env:
   - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
     value: "false"
 
-  # Databricks connection — injected by the bundle; set manually for standalone
-  - name: DATABRICKS_HOST
-    value: "${workspace.host}"
+  # DATABRICKS_HOST is injected automatically by the Databricks Apps runtime.
+  # Do NOT set it here — ${workspace.host} is a bundle-level reference that is
+  # not substituted in app.yaml, which causes the literal string to be used.
 
   # Data layer — set in databricks.yml variables
   - name: CATALOG
