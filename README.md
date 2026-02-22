@@ -1,4 +1,4 @@
-# Actuarial Workshop
+# Databricks Actuarial Workshop
 
 Actuarial workshop materials: a Databricks App (Streamlit dashboard) and demo content for workshops.
 
