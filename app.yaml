@@ -1,0 +1,21 @@
+# app.yaml — Databricks App configuration for Actuarial Workshop
+command:
+  - "streamlit"
+  - "run"
+  - "app.py"
+  - "--server.port=8000"
+  - "--server.address=0.0.0.0"
+
+env:
+  - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+    value: "false"
+  - name: DATABRICKS_HOST
+    value: "https://e2-demo-field-eng.cloud.databricks.com"
+  - name: PGHOST
+    value: "instance-57a2aeba-243b-43a5-a17f-98b78910be06.database.cloud.databricks.com"
+  - name: PGPORT
+    value: "5432"
+  - name: PGDATABASE
+    value: "actuarial_workshop_db"
+  - name: PGSSLMODE
+    value: "require"

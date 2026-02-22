@@ -1,0 +1,750 @@
+import os
+import base64
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import json
+
+# ─── Lazy import for psycopg2 (may not be available in all environments) ─────
+_psycopg2 = None
+_psycopg2_error = None
+
+def _get_psycopg2():
+    """Lazy-load psycopg2 on first use; cache the result."""
+    global _psycopg2, _psycopg2_error
+    if _psycopg2 is not None:
+        return _psycopg2
+    if _psycopg2_error is not None:
+        return None
+    try:
+        import psycopg2 as _pg
+        _psycopg2 = _pg
+        return _psycopg2
+    except ImportError as exc:
+        _psycopg2_error = str(exc)
+        return None
+
+# ─── Page config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Actuarial Risk Dashboard",
+    page_icon="📊",
+    layout="wide",
+)
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+_workspace_client = None
+_auth_init_error = None
+
+def _get_workspace_client():
+    """Lazily initialise the Databricks WorkspaceClient."""
+    global _workspace_client, _auth_init_error
+    if _workspace_client is not None:
+        return _workspace_client
+    if _auth_init_error is not None:
+        return None
+    try:
+        from databricks import sdk
+        _workspace_client = sdk.WorkspaceClient()
+        return _workspace_client
+    except Exception as exc:
+        _auth_init_error = str(exc)
+        return None
+
+def get_token():
+    """Get OAuth token for user-context operations (Lakebase, model serving).
+    Prefers the forwarded user token, falls back to the SDK service principal token."""
+    user_token = st.context.headers.get("X-Forwarded-Access-Token")
+    if user_token:
+        return user_token
+    w = _get_workspace_client()
+    if w is not None:
+        try:
+            if w.config.token:
+                return w.config.token
+            headers = {}
+            w.config.authenticate(headers)
+            if "Authorization" in headers:
+                return headers["Authorization"].replace("Bearer ", "")
+        except Exception:
+            pass
+    return None
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+WORKSPACE_HOST = os.environ.get("DATABRICKS_HOST", "")
+if WORKSPACE_HOST and not WORKSPACE_HOST.startswith("http"):
+    WORKSPACE_HOST = f"https://{WORKSPACE_HOST}"
+
+ENDPOINT_NAME = "actuarial-workshop-sarima-forecaster"
+WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "862f1d757f0424f7")
+CATALOG = "patrick_labelle"
+SCHEMA  = "actuarial_workshop"
+
+if _auth_init_error is not None:
+    st.warning(
+        f"Databricks SDK could not initialise: {_auth_init_error}. "
+        "Data features will be unavailable until the issue is resolved."
+    )
+
+# ─── SQL Execution Helper ────────────────────────────────────────────────────
+
+def execute_sql(statement: str) -> pd.DataFrame:
+    """Execute SQL via the Databricks SDK StatementExecution — handles auth automatically."""
+    w = _get_workspace_client()
+    if w is None:
+        st.error(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
+        return pd.DataFrame()
+    try:
+        result = w.statement_execution.execute_statement(
+            warehouse_id=WAREHOUSE_ID,
+            statement=statement,
+            wait_timeout="30s",
+        )
+        state = result.status.state.value if result.status and result.status.state else "UNKNOWN"
+        if state == "SUCCEEDED":
+            columns = []
+            if result.manifest and result.manifest.schema and result.manifest.schema.columns:
+                columns = [c.name for c in result.manifest.schema.columns]
+            rows = []
+            if result.result and result.result.data_array:
+                rows = result.result.data_array
+            if columns and rows:
+                return pd.DataFrame(rows, columns=columns)
+            return pd.DataFrame()
+        else:
+            error_msg = "Unknown SQL error"
+            if result.status and result.status.error:
+                error_msg = result.status.error.message or error_msg
+            st.error(f"SQL Error ({state}): {error_msg}")
+            return pd.DataFrame()
+    except Exception as exc:
+        st.error(f"SQL execution failed: {exc}")
+        return pd.DataFrame()
+
+# ─── Data Loading Functions ──────────────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def load_segments():
+    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.claims_time_series ORDER BY 1")
+    if not df.empty:
+        return df["segment_id"].tolist()
+    return []
+
+@st.cache_data(ttl=300)
+def load_forecasts(segment_id: str):
+    return execute_sql(f"""
+        SELECT month, record_type, claims_count, forecast_mean, forecast_lo95, forecast_hi95
+        FROM {CATALOG}.{SCHEMA}.sarima_forecasts
+        WHERE segment_id = '{segment_id}'
+        ORDER BY month
+    """)
+
+@st.cache_data(ttl=600)
+def load_monte_carlo_summary():
+    df = execute_sql(f"""
+        SELECT
+            AVG(mean_loss_M)  AS expected_loss,
+            AVG(var_99_M)     AS var_99,
+            AVG(var_995_M)    AS var_995,
+            AVG(cvar_99_M)    AS cvar_99,
+            MAX(max_loss_M)   AS max_loss
+        FROM {CATALOG}.{SCHEMA}.monte_carlo_results
+    """)
+    if not df.empty:
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.iloc[0]
+    return pd.Series({
+        'expected_loss': 0, 'var_99': 0, 'var_995': 0, 'cvar_99': 0, 'max_loss': 0
+    })
+
+@st.cache_data(ttl=600)
+def load_monte_carlo_distribution():
+    """Load per-simulation total loss for portfolio loss distribution chart."""
+    return execute_sql(f"""
+        SELECT mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M
+        FROM {CATALOG}.{SCHEMA}.monte_carlo_results
+        ORDER BY mean_loss_M
+    """)
+
+@st.cache_data(ttl=600)
+def load_segment_stats(segment_id: str):
+    """Summary statistics for the selected segment's history."""
+    return execute_sql(f"""
+        SELECT
+            MIN(month)                          AS first_month,
+            MAX(month)                          AS last_month,
+            COUNT(*)                            AS num_months,
+            ROUND(AVG(claims_count), 1)         AS avg_monthly_claims,
+            ROUND(STDDEV(claims_count), 1)      AS stddev_claims,
+            MIN(claims_count)                   AS min_claims,
+            MAX(claims_count)                   AS max_claims
+        FROM {CATALOG}.{SCHEMA}.claims_time_series
+        WHERE segment_id = '{segment_id}'
+    """)
+
+def call_serving_endpoint(horizon: int) -> pd.DataFrame:
+    """Call Model Serving endpoint via Databricks SDK."""
+    w = _get_workspace_client()
+    if w is None:
+        st.error(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
+        return pd.DataFrame()
+    try:
+        response = w.serving_endpoints.query(
+            name=ENDPOINT_NAME,
+            dataframe_records=[{"horizon": horizon}],
+        )
+        predictions = response.predictions
+        if predictions:
+            return pd.DataFrame(predictions)
+        return pd.DataFrame()
+    except Exception as exc:
+        st.warning(f"Endpoint unavailable: {exc}")
+        return pd.DataFrame()
+
+# ─── Lakebase: Scenario annotations ──────────────────────────────────────────
+
+def _email_from_token(token: str) -> str:
+    """Decode the JWT payload (without verification) to extract the user identity."""
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("sub", payload.get("email", ""))
+    except Exception:
+        return ""
+
+def get_lakebase_conn():
+    """Connect to Lakebase Postgres for scenario annotations."""
+    psycopg2 = _get_psycopg2()
+    if psycopg2 is None:
+        raise RuntimeError(
+            f"psycopg2 is not available ({_psycopg2_error or 'unknown reason'}). "
+            "Lakebase features are disabled."
+        )
+    token = st.context.headers.get("X-Forwarded-Access-Token")
+    if not token:
+        raise RuntimeError("User token unavailable — cannot connect to Lakebase.")
+    host = os.environ.get("PGHOST", "")
+    if not host:
+        raise RuntimeError("PGHOST not set — Lakebase not configured.")
+    port = int(os.environ.get("PGPORT", "5432"))
+    database = os.environ.get("PGDATABASE", "actuarial_workshop_db")
+    user = os.environ.get("PGUSER", "") or _email_from_token(token)
+    sslmode = os.environ.get("PGSSLMODE", "require")
+    return psycopg2.connect(
+        host=host, port=port, database=database,
+        user=user, password=token, sslmode=sslmode,
+    )
+
+def save_scenario_annotation(segment: str, note: str, analyst: str):
+    try:
+        conn = get_lakebase_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO scenario_annotations (segment_id, note, analyst, created_at) "
+            "VALUES (%s, %s, %s, NOW())",
+            (segment, note, analyst)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.warning(f"Could not save annotation: {e}")
+        return False
+
+def load_annotations(segment_id: str):
+    try:
+        conn = get_lakebase_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT analyst, note, created_at FROM scenario_annotations "
+            "WHERE segment_id = %s ORDER BY created_at DESC LIMIT 10",
+            (segment_id,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if rows:
+            return pd.DataFrame(rows, columns=["Analyst", "Note", "Created At"])
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+# ─── Sidebar: Data & Model Reference ─────────────────────────────────────────
+
+with st.sidebar:
+    st.header("About This Dashboard")
+
+    st.markdown("**Source Data**")
+    st.markdown("""
+Synthetic insurance claims time series across **20 segments**
+(product line × Canadian province):
+
+| Dimension | Values |
+|---|---|
+| Product lines | Commercial Auto, Commercial Property, Personal Auto, Liability |
+| Provinces | Alberta, Atlantic, BC, Ontario, Quebec |
+| History | Jan 2019 – Dec 2024 |
+| Granularity | Monthly claims counts |
+| Observations | ~72 months × 20 segments = 1,440 rows |
+
+Each row records the monthly **claims count** for one segment.
+Rolling features (3/6/12-month means and volatility) are
+pre-computed in the Feature Store for model training.
+""")
+
+    st.divider()
+    st.markdown("**Models**")
+    st.markdown("""
+| Model | What it does |
+|---|---|
+| **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. |
+| **GARCH(1,1)** | Models time-varying volatility in loss ratios. Useful for risk capital estimation when variance is not constant. |
+| **Monte Carlo** | 100,000 correlated lognormal loss scenarios across three lines (Property, Auto, Liability). Produces the full loss distribution for VaR/CVaR. |
+""")
+
+    st.divider()
+    st.markdown("**Pipeline**")
+    st.markdown("""
+```
+Raw CDC events
+  → Bronze (Delta Live Tables)
+  → Silver (SCD Type 2 policies)
+  → Gold (monthly segment stats)
+  → Feature Store (point-in-time joins)
+  → SARIMA / GARCH per segment
+  → Monte Carlo portfolio simulation
+  → UC Model Registry (@Champion)
+  → This App
+```
+All assets are version-controlled and reproducible.
+Model artifacts are logged to MLflow and promoted via
+the Unity Catalog Model Registry.
+""")
+
+    st.divider()
+    st.caption("Powered by Databricks Apps + Streamlit")
+
+# ─── App Header ───────────────────────────────────────────────────────────────
+
+st.title("📊 Actuarial Risk Dashboard")
+st.caption("Powered by Databricks | SARIMA Forecasting + Monte Carlo Portfolio Risk")
+
+tab1, tab2, tab3 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast"])
+
+# ── Tab 1: Segment Forecasts ──────────────────────────────────────────────────
+with tab1:
+    st.subheader("SARIMA Claims Forecasts by Segment")
+
+    with st.expander("ℹ️ How this forecast works", expanded=False):
+        st.markdown("""
+**Model:** SARIMA (Seasonal AutoRegressive Integrated Moving Average), fitted independently
+per segment using `statsmodels.SARIMAX`.
+
+**What SARIMA captures:**
+- **AR (AutoRegressive):** Each month's claim count is partly explained by prior months —
+  a high-claims month tends to be followed by another high-claims month.
+- **I (Integrated):** Differencing removes trends so the series is stationary before fitting.
+- **MA (Moving Average):** Residual shocks (e.g., a one-time weather event) decay over time
+  rather than persisting indefinitely.
+- **Seasonal (S):** A 12-month seasonal cycle accounts for recurring annual patterns
+  (e.g., winter driving claims peak in Q1).
+
+**Order used:** SARIMA(1,1,1)(1,1,1)₁₂ — a conservative, widely applicable specification.
+
+**Confidence interval:** The shaded band is the **95% prediction interval** — the range within
+which the model expects 95% of actual future observations to fall, accounting for both
+parameter uncertainty and inherent randomness in the claims process.
+
+**Limitations:** SARIMA assumes the historical seasonal pattern continues. It will not
+anticipate structural breaks (e.g., a new product launch, regulatory change, or pandemic shock).
+Use the annotation tool below to flag such assumptions.
+""")
+
+    segments = load_segments()
+    if segments:
+        selected = st.selectbox("Select segment:", segments, index=0)
+
+        if selected:
+            # Load segment history stats alongside the forecast
+            stats_df = load_segment_stats(selected)
+            if not stats_df.empty:
+                for col in stats_df.columns:
+                    stats_df[col] = stats_df[col].apply(
+                        lambda x: pd.to_numeric(x, errors='ignore') if x is not None else x
+                    )
+                s = stats_df.iloc[0]
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric(
+                    "History",
+                    f"{s['first_month']} – {s['last_month']}",
+                    help="Date range of observed actuals used to fit the SARIMA model"
+                )
+                sc2.metric(
+                    "Avg Monthly Claims",
+                    f"{float(s['avg_monthly_claims']):,.0f}",
+                    help="Mean monthly claims count over the observed history"
+                )
+                sc3.metric(
+                    "Std Dev",
+                    f"{float(s['stddev_claims']):,.0f}",
+                    help="Standard deviation of monthly claims — higher values indicate greater volatility"
+                )
+                sc4.metric(
+                    "Range",
+                    f"{int(float(s['min_claims'])):,} – {int(float(s['max_claims'])):,}",
+                    help="Minimum and maximum observed monthly claims count"
+                )
+
+            df = load_forecasts(selected)
+
+            if not df.empty:
+                for col in ["claims_count", "forecast_mean", "forecast_lo95", "forecast_hi95"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+                actuals   = df[df["record_type"] == "actual"]
+                forecasts = df[df["record_type"] == "forecast"]
+
+                import plotly.graph_objects as go
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=actuals["month"], y=actuals["claims_count"],
+                    mode="lines+markers", name="Actual claims",
+                    line=dict(color="#1f77b4"),
+                    hovertemplate="<b>%{x}</b><br>Actual: %{y:,.0f} claims<extra></extra>",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=forecasts["month"], y=forecasts["forecast_mean"],
+                    mode="lines+markers", name="SARIMA forecast (mean)",
+                    line=dict(color="#FF3419", dash="dash"),
+                    hovertemplate="<b>%{x}</b><br>Forecast: %{y:,.0f} claims<extra></extra>",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=pd.concat([forecasts["month"], forecasts["month"][::-1]]),
+                    y=pd.concat([forecasts["forecast_hi95"], forecasts["forecast_lo95"][::-1]]),
+                    fill="toself", fillcolor="rgba(255,52,25,0.15)",
+                    line=dict(color="rgba(255,0,0,0)"),
+                    name="95% prediction interval",
+                    hoverinfo="skip",
+                ))
+                # Add a vertical marker at the forecast start
+                if not actuals.empty and not forecasts.empty:
+                    cutoff = str(actuals["month"].max())
+                    fig.add_shape(
+                        type="line",
+                        x0=cutoff, x1=cutoff, y0=0, y1=1, yref="paper",
+                        line=dict(dash="dot", color="grey", width=1),
+                    )
+                    fig.add_annotation(
+                        x=cutoff, y=1, yref="paper",
+                        text="Forecast start", showarrow=False,
+                        yanchor="bottom", font=dict(color="grey", size=11),
+                    )
+                fig.update_layout(
+                    title=f"{selected} — SARIMA Forecast",
+                    xaxis_title="Month",
+                    yaxis_title="Monthly Claims Count",
+                    height=420,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                col1, col2, col3 = st.columns(3)
+                if "mape" in df.columns:
+                    mape_vals = pd.to_numeric(df[df["record_type"] == "forecast"]["mape"], errors='coerce')
+                    col1.metric(
+                        "Avg MAPE (hold-out)",
+                        f"{mape_vals.mean():.1f}%",
+                        help="Mean Absolute Percentage Error on the hold-out test set. Lower is better; <10% is considered good for insurance time series."
+                    )
+                if not forecasts.empty:
+                    col2.metric(
+                        "Avg Monthly Forecast",
+                        f"{int(forecasts['forecast_mean'].mean()):,}",
+                        help="Average of the 12 monthly point forecasts (mean of the predictive distribution)"
+                    )
+                    half_width = int((forecasts['forecast_hi95'] - forecasts['forecast_lo95']).mean() / 2)
+                    col3.metric(
+                        "Avg 95% CI Half-Width",
+                        f"±{half_width:,}",
+                        help="Average half-width of the 95% prediction interval. Wider intervals reflect greater uncertainty — typical for longer-horizon forecasts."
+                    )
+
+                with st.expander("📋 Raw forecast data"):
+                    st.markdown("""
+| Column | Description |
+|---|---|
+| `month` | Calendar month (YYYY-MM-DD, first of month) |
+| `record_type` | `actual` = observed history; `forecast` = SARIMA prediction |
+| `claims_count` | Observed monthly claims count (actuals only) |
+| `forecast_mean` | Point forecast — mean of the predictive distribution |
+| `forecast_lo95` | Lower bound of 95% prediction interval |
+| `forecast_hi95` | Upper bound of 95% prediction interval |
+""")
+                    display_df = df.copy()
+                    display_df.columns = [c.replace("_", " ").title() for c in display_df.columns]
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Scenario annotation
+        with st.expander("📝 Add Scenario Note"):
+            st.caption(
+                "Use this to record assumption overrides, external events, or review comments "
+                "for this segment. Notes are stored in Lakebase (PostgreSQL) and persist across sessions."
+            )
+            analyst = st.text_input("Analyst name:")
+            note    = st.text_area("Assumptions / adjustments:")
+            if st.button("Save Note"):
+                if save_scenario_annotation(selected, note, analyst):
+                    st.success("Note saved to Lakebase")
+
+        with st.expander("📋 View Previous Notes"):
+            if selected:
+                annotations = load_annotations(selected)
+                if not annotations.empty:
+                    st.dataframe(annotations, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No annotations yet for this segment.")
+    else:
+        st.warning("No segments found. The data pipeline may still be running — please check back shortly.")
+
+# ── Tab 2: Portfolio Risk ─────────────────────────────────────────────────────
+with tab2:
+    st.subheader("Monte Carlo Portfolio Risk Summary")
+    st.caption("100,000 correlated lognormal scenarios | Property + Auto + Liability")
+
+    with st.expander("ℹ️ How the simulation works", expanded=False):
+        st.markdown("""
+**Simulation design:**
+
+The portfolio is modelled as three correlated lines of business:
+- **Commercial Property** — large-loss severity, moderate frequency
+- **Commercial Auto** — moderate severity, higher frequency
+- **Liability** — long-tail, low frequency / high severity
+
+Each simulation path draws correlated annual losses using a **Cholesky decomposition**
+of the inter-line correlation matrix, applied to independent lognormal samples.
+The correlation structure captures co-movement during adverse scenarios (e.g., a
+widespread weather event affecting both Property and Auto simultaneously).
+
+**Parameter inputs:**
+- Line means and standard deviations are calibrated from the SARIMA forecasts and
+  GARCH volatility estimates produced in the modelling pipeline.
+- Correlation matrix is assumed (not estimated), with moderate positive correlation (ρ ≈ 0.3–0.5)
+  between lines — conservative for a standard formula approach.
+
+**Output:** 100,000 total portfolio loss values. The empirical distribution of these
+values produces the risk metrics shown below.
+""")
+
+    summary = load_monte_carlo_summary()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(
+        "Expected Annual Loss",
+        f"${summary['expected_loss']:.1f}M",
+        help="The mean of the simulated loss distribution — the long-run average annual loss across all 100,000 scenarios. This is the actuarial best estimate of what the portfolio will cost in a given year."
+    )
+    col2.metric(
+        "VaR (99%)",
+        f"${summary['var_99']:.1f}M",
+        help="Value at Risk at the 99th percentile — the loss level exceeded in only 1% of scenarios (1-in-100 year event). Under Basel and Solvency frameworks, this is a common risk appetite threshold."
+    )
+    col3.metric(
+        "VaR (99.5%)",
+        f"${summary['var_995']:.1f}M",
+        help="The Solvency II Solvency Capital Requirement (SCR) calibration point — the 1-in-200 year loss. Insurers must hold capital sufficient to cover losses up to this level with 99.5% confidence over a one-year horizon."
+    )
+    col4.metric(
+        "CVaR (99%)",
+        f"${summary['cvar_99']:.1f}M",
+        help="Conditional Value at Risk (Expected Shortfall) at 99% — the average loss across the worst 1% of scenarios. CVaR is more conservative than VaR because it accounts for the severity of tail events, not just the threshold."
+    )
+
+    st.divider()
+
+    # Risk metric comparison chart
+    metrics = {
+        "Expected Loss\n(Mean)": float(summary["expected_loss"]),
+        "VaR 99%\n(1-in-100)": float(summary["var_99"]),
+        "VaR 99.5%\n(SCR / 1-in-200)": float(summary["var_995"]),
+        "CVaR 99%\n(Expected Shortfall)": float(summary["cvar_99"]),
+    }
+    import plotly.graph_objects as go
+    colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd"]
+    fig2 = go.Figure(go.Bar(
+        x=list(metrics.keys()),
+        y=list(metrics.values()),
+        marker_color=colors,
+        text=[f"${v:.1f}M" for v in metrics.values()],
+        textposition="outside",
+        hovertemplate="%{x}<br><b>$%{y:.1f}M</b><extra></extra>",
+    ))
+    fig2.update_layout(
+        title="Portfolio Risk Metrics — Comparison",
+        yaxis_title="Annual Loss ($M)",
+        height=380,
+        showlegend=False,
+        yaxis=dict(range=[0, max(metrics.values()) * 1.25]),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # Simulated distribution using the per-row mean losses as a proxy histogram
+    dist_df = load_monte_carlo_distribution()
+    if not dist_df.empty:
+        for col in dist_df.columns:
+            dist_df[col] = pd.to_numeric(dist_df[col], errors='coerce')
+
+        with st.expander("📊 Simulated Loss Distribution", expanded=True):
+            st.markdown("""
+The histogram below shows the distribution of **mean portfolio losses** across simulated scenarios.
+The vertical lines mark the key risk thresholds. The heavy right tail is characteristic of
+insurance loss distributions — most years are near the expected loss, but rare extreme years
+can be multiples of the mean.
+""")
+            fig3 = go.Figure()
+            fig3.add_trace(go.Histogram(
+                x=dist_df["mean_loss_M"],
+                nbinsx=60,
+                name="Simulated scenarios",
+                marker_color="rgba(31,119,180,0.6)",
+                hovertemplate="Loss: $%{x:.1f}M<br>Count: %{y}<extra></extra>",
+            ))
+            for label, val, color in [
+                ("E[Loss]", float(summary["expected_loss"]), "#2ca02c"),
+                ("VaR 99%", float(summary["var_99"]), "#ff7f0e"),
+                ("VaR 99.5%", float(summary["var_995"]), "#d62728"),
+            ]:
+                fig3.add_vline(
+                    x=val, line_dash="dash", line_color=color,
+                    annotation_text=f"{label}: ${val:.1f}M",
+                    annotation_position="top right",
+                )
+            fig3.update_layout(
+                xaxis_title="Annual Portfolio Loss ($M)",
+                yaxis_title="Number of Scenarios",
+                height=360,
+                showlegend=False,
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+
+    st.markdown("""
+> **Solvency II context:** The VaR(99.5%) figure is the calibration point for the
+> Solvency Capital Requirement (SCR) under the Solvency II Standard Formula. Insurers
+> operating under this framework must hold own funds at least equal to their SCR.
+> The CVaR (Expected Shortfall) goes further — it represents the average cost of the
+> scenarios beyond VaR and is increasingly used in IFRS 17 risk adjustment calculations.
+""")
+
+# ── Tab 3: On-Demand Forecast ─────────────────────────────────────────────────
+with tab3:
+    st.subheader("On-Demand Forecast via Model Serving")
+    st.caption("Calls the deployed SARIMA REST endpoint in real time")
+
+    with st.expander("ℹ️ About this endpoint", expanded=False):
+        st.markdown("""
+**What this does:**
+
+This tab calls a live **Databricks Model Serving** endpoint that wraps the fitted SARIMA model
+in a standardised `mlflow.pyfunc` interface. The endpoint is version-controlled — it serves
+the model tagged as `@Champion` in the Unity Catalog Model Registry.
+
+**Input:** A single integer `horizon` — the number of months to forecast ahead.
+
+**Output:** One row per forecast month, with columns:
+
+| Column | Description |
+|---|---|
+| `month_offset` | Months ahead (1 = next month, 2 = two months ahead, …) |
+| `forecast_mean` | Point forecast — mean of the predictive distribution |
+| `forecast_lo95` | Lower bound of the 95% prediction interval |
+| `forecast_hi95` | Upper bound of the 95% prediction interval |
+
+**Why a serving endpoint?**
+
+Deploying the model as a REST endpoint decouples scoring from the training pipeline.
+Any downstream system (this app, a pricing tool, a reserving worksheet) can call the
+same endpoint without needing access to the training cluster or model code. The
+`@Champion` alias means a new model version can be promoted without changing any
+calling code.
+
+**Note:** The model is fitted on an aggregate of all segments. For segment-specific
+forecasts with the full historical context, use the **Forecasts** tab.
+""")
+
+    horizon = st.slider(
+        "Forecast horizon (months):",
+        min_value=1, max_value=24, value=6,
+        help="How many months ahead to forecast. Uncertainty (CI width) grows with horizon."
+    )
+
+    if st.button("Generate Forecast"):
+        with st.spinner("Calling Model Serving endpoint..."):
+            result_df = call_serving_endpoint(horizon)
+
+            if not result_df.empty:
+                # Rename for display
+                display_cols = {
+                    "month_offset": "Month Ahead",
+                    "forecast_mean": "Point Forecast (mean)",
+                    "forecast_lo95": "Lower 95% CI",
+                    "forecast_hi95": "Upper 95% CI",
+                }
+                display_df = result_df.rename(columns={k: v for k, v in display_cols.items() if k in result_df.columns})
+
+                # Numeric formatting
+                for col in display_df.columns:
+                    if col != "Month Ahead":
+                        display_df[col] = pd.to_numeric(display_df[col], errors='coerce').round(1)
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # Visualise the forecast
+                if all(c in result_df.columns for c in ["month_offset", "forecast_mean", "forecast_lo95", "forecast_hi95"]):
+                    result_df["forecast_mean"] = pd.to_numeric(result_df["forecast_mean"], errors='coerce')
+                    result_df["forecast_lo95"] = pd.to_numeric(result_df["forecast_lo95"], errors='coerce')
+                    result_df["forecast_hi95"] = pd.to_numeric(result_df["forecast_hi95"], errors='coerce')
+
+                    fig4 = go.Figure()
+                    fig4.add_trace(go.Scatter(
+                        x=result_df["month_offset"], y=result_df["forecast_mean"],
+                        mode="lines+markers", name="Point forecast",
+                        line=dict(color="#FF3419"),
+                        hovertemplate="Month +%{x}<br>Forecast: %{y:,.1f}<extra></extra>",
+                    ))
+                    fig4.add_trace(go.Scatter(
+                        x=pd.concat([result_df["month_offset"], result_df["month_offset"][::-1]]),
+                        y=pd.concat([result_df["forecast_hi95"], result_df["forecast_lo95"][::-1]]),
+                        fill="toself", fillcolor="rgba(255,52,25,0.15)",
+                        line=dict(color="rgba(255,0,0,0)"),
+                        name="95% prediction interval",
+                        hoverinfo="skip",
+                    ))
+                    fig4.update_layout(
+                        title=f"SARIMA On-Demand Forecast — {horizon}-Month Horizon",
+                        xaxis_title="Months Ahead",
+                        yaxis_title="Forecast Claims Count",
+                        height=360,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig4, use_container_width=True)
+
+                    # Flag widening CI
+                    ci_width_start = float(result_df["forecast_hi95"].iloc[0] - result_df["forecast_lo95"].iloc[0])
+                    ci_width_end   = float(result_df["forecast_hi95"].iloc[-1] - result_df["forecast_lo95"].iloc[-1])
+                    if ci_width_end > ci_width_start * 1.5:
+                        st.info(
+                            f"The 95% interval widens from ±{ci_width_start/2:,.0f} at month 1 "
+                            f"to ±{ci_width_end/2:,.0f} at month {horizon}, reflecting "
+                            "increasing uncertainty at longer horizons — expected behaviour for ARIMA models."
+                        )
+
+                st.download_button(
+                    "Download CSV",
+                    result_df.to_csv(index=False),
+                    file_name=f"sarima_forecast_{horizon}m.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.warning("Endpoint not available — start the Model Serving endpoint from Module 5")
