@@ -28,5 +28,5 @@ resources:
           description: "Lakebase (managed Postgres) for persistent scenario annotations"
           database:
             instance_name: "${resources.database_instances.actuarial_workshop_lakebase.name}"
-            database_name: "${var.pg_database}"
+            database_name: "postgres"
             permission: CAN_CONNECT_AND_CREATE
