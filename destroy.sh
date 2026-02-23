@@ -47,7 +47,7 @@ while [ $i -lt ${#BUNDLE_ARGS[@]} ]; do
 done
 
 # ── Step 1: resolve variables ─────────────────────────────────────────────────
-echo "==> Resolving bundle workspace path..."
+echo "==> Resolving bundle variables..."
 VALIDATE_JSON=$(databricks bundle validate --output json "${VALIDATE_ARGS[@]}" 2>/dev/null)
 
 ROOT_PATH=$(echo "$VALIDATE_JSON" \

@@ -10,8 +10,8 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 .
 ├── databricks.yml            # Bundle config — variables, sync, includes
 ├── databricks.local.yml.example  # Template for your workspace-specific target
-├── deploy.sh                 # Deploy wrapper (generates _bundle_config.py first)
-├── destroy.sh                # Destroy wrapper (bundle destroy + workspace cleanup)
+├── deploy.sh                 # End-to-end deploy: bundle deploy → setup job → app deploy
+├── destroy.sh                # Full teardown: workspace assets + bundle destroy
 ├── resources/
 │   ├── pipeline.yml          # DLT pipeline (Bronze → Silver → Gold)
 │   ├── jobs.yml              # Orchestration jobs (setup + monthly refresh)
@@ -120,8 +120,10 @@ The app's runtime configuration is provided through three channels:
 | `DATABRICKS_CLIENT_ID` / `_SECRET` | Auto-injected by Databricks Apps runtime (SP credentials) | — |
 
 `deploy.sh` runs `databricks bundle validate --output json` to resolve all variables,
-writes `app/_bundle_config.py` with the literal values, then runs `databricks bundle deploy`.
-The file is gitignored but force-included in the bundle sync via `databricks.yml`.
+writes `app/_bundle_config.py` with the literal values, runs `databricks bundle deploy`,
+starts app compute if needed, waits for the setup job to complete (which grants all SP
+permissions), then deploys the app source code last so it starts with full permissions.
+`app/_bundle_config.py` is gitignored but force-included in the bundle sync via `databricks.yml`.
 
 ---
 
@@ -152,7 +154,7 @@ the top of each notebook allow standalone execution without the bundle.
 
 ## Deployed Resources
 
-After running the Full Setup job, the following resources will be created:
+After running `./deploy.sh`, the following resources will be created:
 
 | Resource | Name |
 |----------|------|
