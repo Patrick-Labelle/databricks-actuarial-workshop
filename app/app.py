@@ -223,6 +223,44 @@ def _email_from_token(token: str) -> str:
     except Exception:
         return ""
 
+_sp_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+def _get_sp_lakebase_token() -> tuple:
+    """Return (client_id, access_token) for the app SP via OIDC M2M.
+
+    DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET are injected at runtime
+    by the Databricks Apps platform — they are never stored in source code.
+    The token is cached until 60 s before expiry.
+    """
+    import time
+    now = time.time()
+    client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    if _sp_token_cache["token"] and _sp_token_cache["expires_at"] > now + 60:
+        return client_id, _sp_token_cache["token"]
+
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        return None, None
+
+    host = WORKSPACE_HOST or os.environ.get("DATABRICKS_HOST", "")
+    if host and not host.startswith("http"):
+        host = f"https://{host}"
+
+    resp = requests.post(
+        f"{host}/oidc/v1/token",
+        data={"grant_type": "client_credentials", "scope": "all-apis"},
+        auth=(client_id, client_secret),
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        return client_id, None
+
+    data = resp.json()
+    _sp_token_cache["token"] = data.get("access_token")
+    _sp_token_cache["expires_at"] = now + int(data.get("expires_in", 3600))
+    return client_id, _sp_token_cache["token"]
+
+
 def get_lakebase_conn():
     """Connect to Lakebase Postgres as the app service principal.
 
@@ -241,16 +279,12 @@ def get_lakebase_conn():
     if not host:
         raise RuntimeError("PGHOST not set — Lakebase not configured.")
 
-    # Authenticate as the app SP using the SDK — the SP has CAN_CONNECT_AND_CREATE.
-    w = _get_workspace_client()
-    if w is None:
-        raise RuntimeError(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
-    auth_headers = {}
-    w.config.authenticate(auth_headers)
-    sp_token = auth_headers.get("Authorization", "").replace("Bearer ", "")
-    sp_user  = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    # Authenticate as the app SP via OIDC M2M — the SP has CAN_CONNECT_AND_CREATE.
+    # DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET are injected automatically
+    # by the Databricks Apps runtime; they never appear in source code or config files.
+    sp_user, sp_token = _get_sp_lakebase_token()
     if not sp_token:
-        raise RuntimeError("Could not obtain SP token from Databricks SDK.")
+        raise RuntimeError("Could not obtain SP token — check DATABRICKS_CLIENT_ID/SECRET env vars.")
 
     port     = int(os.environ.get("PGPORT", "5432"))
     database = os.environ.get("PGDATABASE") or PG_DATABASE_DEFAULT
@@ -427,7 +461,7 @@ Use the annotation tool below to flag such assumptions.
                 sc1, sc2, sc3, sc4 = st.columns(4)
                 sc1.metric(
                     "History",
-                    f"{s['first_month']} – {s['last_month']}",
+                    f"{str(s['first_month'])[:7]} – {str(s['last_month'])[:7]}",
                     help="Date range of observed actuals used to fit the SARIMA model"
                 )
                 sc2.metric(
