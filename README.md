@@ -158,13 +158,39 @@ After running the Full Setup job, the following resources will be created:
 
 ## Teardown
 
-To remove all workshop assets after the session:
+Two steps to remove all workshop assets:
+
+### Step 1 — Run the cleanup notebook
+
+Run `demos/00_cleanup.py` interactively in the workspace (open it, attach to a cluster or serverless, and run all cells). This removes:
+
+| Asset | How |
+|---|---|
+| UC schema + all tables | `DROP SCHEMA … CASCADE` |
+| Online Table | REST API |
+| Model Serving endpoint | REST API |
+| UC registered model + versions | MLflow client |
+| MLflow experiments | MLflow client |
+| DLT pipeline | REST API |
+| Databricks Jobs | REST API |
+| Lakebase PostgreSQL database | `DROP DATABASE` via psycopg2 |
+
+### Step 2 — Destroy bundle-managed infrastructure
 
 ```bash
-# 1. Run the cleanup notebook to drop UC assets, MLflow experiments, and Lakebase data
-databricks bundle run actuarial_workshop_cleanup --target my-workspace
-# (or run demos/00_cleanup.py interactively in the workspace)
-
-# 2. Destroy all bundle-managed infrastructure (app, jobs, pipeline, Lakebase instance)
 databricks bundle destroy --target my-workspace
 ```
+
+This removes the resources provisioned by the bundle deploy:
+
+| Resource | Notes |
+|---|---|
+| Databricks App | Stopped and deleted |
+| Lakebase instance | Managed PostgreSQL instance (async delete, takes ~1 min) |
+| Setup + Monthly Refresh jobs | Bundle-managed jobs |
+| DLT pipeline | If not already deleted in Step 1 |
+| Workspace files | `/Workspace/Users/…/.bundle/actuarial-workshop/…` |
+
+> **Note:** `bundle destroy` only removes resources it deployed in the current target.
+> Jobs or pipelines left over from previous deployments (different targets or re-deploys)
+> must be deleted manually from the workspace UI or via the REST API.
