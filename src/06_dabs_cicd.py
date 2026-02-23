@@ -34,11 +34,10 @@
 # MAGIC │   ├── jobs.yml            ← Job definitions
 # MAGIC │   ├── serving.yml         ← Model Serving endpoint definitions
 # MAGIC │   └── pipelines.yml       ← DLT pipeline definitions (Module 1)
-# MAGIC ├── notebooks/
+# MAGIC ├── src/
 # MAGIC │   ├── 04_classical_stats_at_scale.py
 # MAGIC │   ├── 05_mlflow_uc_serving.py
-# MAGIC │   └── 06_dabs_cicd.py
-# MAGIC ├── src/
+# MAGIC │   ├── 06_dabs_cicd.py
 # MAGIC │   └── monte_carlo.py      ← Reusable Python modules
 # MAGIC ├── tests/
 # MAGIC │   └── test_monte_carlo.py ← Unit tests (run in CI)
@@ -119,7 +118,7 @@
 # MAGIC         - task_key: generate_silver_data
 # MAGIC           description: "Load/refresh claims time series to Silver"
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/notebooks/04_classical_stats_at_scale
+# MAGIC             notebook_path: ${workspace.file_path}/src/04_classical_stats_at_scale
 # MAGIC             base_parameters:
 # MAGIC               catalog:  ${var.catalog}
 # MAGIC               schema:   ${var.schema}
@@ -130,7 +129,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: generate_silver_data
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/notebooks/04_classical_stats_at_scale
+# MAGIC             notebook_path: ${workspace.file_path}/src/04_classical_stats_at_scale
 # MAGIC             base_parameters:
 # MAGIC               step: fit_models
 # MAGIC           environment_key: ml_env
@@ -140,7 +139,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: fit_sarima_garch
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/notebooks/05_mlflow_uc_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/05_mlflow_uc_serving
 # MAGIC             base_parameters:
 # MAGIC               step: register
 # MAGIC           environment_key: ml_env
@@ -150,7 +149,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: register_champion_model
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/notebooks/05_mlflow_uc_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/05_mlflow_uc_serving
 # MAGIC             base_parameters:
 # MAGIC               step: deploy_endpoint
 # MAGIC           environment_key: ml_env
@@ -449,9 +448,9 @@ print(json.dumps({
 print("\nTypical `databricks bundle deploy` output:")
 print(f"""
 Uploading bundle files to {_bundle_root}/files...
-  ./notebooks/04_classical_stats_at_scale.py (5.2 KB)
-  ./notebooks/05_mlflow_uc_serving.py (4.8 KB)
-  ./notebooks/06_dabs_cicd.py (3.1 KB)
+  ./src/04_classical_stats_at_scale.py (5.2 KB)
+  ./src/05_mlflow_uc_serving.py (4.8 KB)
+  ./src/06_dabs_cicd.py (3.1 KB)
   ./src/monte_carlo.py (1.2 KB)
 
 Deploying resources...

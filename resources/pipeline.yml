@@ -1,6 +1,6 @@
 # ─── DLT Pipeline: Medallion Architecture ────────────────────────────────────
 # Bronze → Silver (SCD Type 2) → Gold (segment monthly stats)
-# Source notebook: notebooks/01_dlt_pipeline_and_jobs.py
+# Source notebook: src/01_dlt_pipeline_and_jobs.py
 
 resources:
   pipelines:
@@ -23,4 +23,4 @@ resources:
 
       libraries:
         - notebook:
-            path: ../notebooks/01_dlt_pipeline_and_jobs.py
+            path: ../src/01_dlt_pipeline_and_jobs.py
