@@ -218,17 +218,17 @@ These values are injected at deploy time by `./deploy.sh` (which generates `app/
 
 ### Bonus App: `Could not save annotation` / Lakebase connection errors
 1. **SP auth failing** — Ensure `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` are available in the Apps runtime (they are auto-injected if the app resource has an associated service principal in `resources/app.yml`).
-2. **`relation "scenario_annotations" does not exist`** — The table must be created in the `public` schema. Run `demos/00_app_setup.py` as Task 7 of the setup job to create the table and grant the required PostgreSQL privileges to the app SP.
+2. **`relation "scenario_annotations" does not exist`** — The table must be created in the `public` schema. Run `notebooks/ops/app_setup.py` as Task 7 of the setup job to create the table and grant the required PostgreSQL privileges to the app SP.
 3. **`permission denied for sequence`** — The setup notebook grants `USAGE ON SEQUENCE public.scenario_annotations_id_seq`. If skipped, re-run the setup notebook or grant manually.
 
 ---
 
 ## Cleanup
 
-A cleanup notebook (`00_cleanup.py`) is provided to remove all workshop assets. Review it carefully before running — it permanently deletes all tables, the UC model, the serving endpoint, MLflow experiments, and the DLT pipeline.
+A cleanup notebook (`ops/cleanup.py`) is provided to remove all workshop assets. Review it carefully before running — it permanently deletes all tables, the UC model, the serving endpoint, MLflow experiments, and the DLT pipeline.
 
 ```
-00_cleanup.py — removes all assets (run post-workshop only)
+ops/cleanup.py — removes all assets (run post-workshop only)
 ```
 
 ---
@@ -310,7 +310,7 @@ A cleanup notebook (`00_cleanup.py`) is provided to remove all workshop assets. 
 
 ---
 
-### Bonus: Databricks Apps + Lakebase (`07_databricks_apps_bonus.py`)
+### Bonus: Databricks Apps + Lakebase (`07_databricks_apps.py`)
 
 **What it demonstrates:**
 - Streamlit application running on Databricks Apps (serverless, UC-integrated, SSO)

@@ -23,7 +23,7 @@ resources:
         - task_key: generate_source_data
           description: "Generate synthetic policy CDC data → policy_cdc_raw"
           notebook_task:
-            notebook_path: ../demos/01_dlt_pipeline_and_jobs.py
+            notebook_path: ../notebooks/01_dlt_pipeline_and_jobs.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -48,7 +48,7 @@ resources:
           depends_on:
             - task_key: run_dlt_pipeline
           notebook_task:
-            notebook_path: ../demos/02_spark_vs_ray.py
+            notebook_path: ../notebooks/02_spark_vs_ray.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -64,7 +64,7 @@ resources:
           depends_on:
             - task_key: build_rolling_features
           notebook_task:
-            notebook_path: ../demos/03_feature_store.py
+            notebook_path: ../notebooks/03_feature_store.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -85,7 +85,7 @@ resources:
           depends_on:
             - task_key: build_feature_store
           notebook_task:
-            notebook_path: ../demos/04_classical_stats_at_scale.py
+            notebook_path: ../notebooks/04_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -99,7 +99,7 @@ resources:
           depends_on:
             - task_key: fit_statistical_models
           notebook_task:
-            notebook_path: ../demos/05_mlflow_uc_serving.py
+            notebook_path: ../notebooks/05_mlflow_uc_serving.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -114,7 +114,7 @@ resources:
           depends_on:
             - task_key: register_and_serve_model
           notebook_task:
-            notebook_path: ../demos/00_app_setup.py
+            notebook_path: ../notebooks/ops/app_setup.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -171,7 +171,7 @@ resources:
           depends_on:
             - task_key: refresh_dlt_pipeline
           notebook_task:
-            notebook_path: ../demos/04_classical_stats_at_scale.py
+            notebook_path: ../notebooks/04_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"

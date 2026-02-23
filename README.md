@@ -17,9 +17,10 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 │   ├── jobs.yml              # Orchestration jobs (setup + monthly refresh)
 │   ├── app.yml               # Databricks App resource + SP authorizations
 │   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
-├── demos/
-│   ├── 00_app_setup.py       # App setup: Lakebase DB, table, UC + PG grants
-│   ├── 00_cleanup.py         # Post-workshop teardown notebook
+├── notebooks/
+│   ├── ops/
+│   │   ├── app_setup.py      # App setup: Lakebase DB, table, UC + PG grants
+│   │   └── cleanup.py        # Post-workshop teardown notebook
 │   └── 01–07_*.py            # Workshop notebooks (Modules 1–6 + Bonus)
 ├── app/
 │   ├── app.py                # Streamlit application
@@ -143,7 +144,7 @@ The file is gitignored but force-included in the bundle sync via `databricks.yml
 | 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, Monte Carlo, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
-| Bonus | `07_databricks_apps_bonus.py` | Databricks Apps, Lakebase |
+| Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |
 
 All notebooks accept `catalog`, `schema`, and `endpoint_name` as widget
 parameters (passed automatically by the bundle jobs).
@@ -153,7 +154,7 @@ parameters (passed automatically by the bundle jobs).
 ## Running Modules Interactively
 
 Notebooks can also be run interactively in the workspace. Clone or upload the
-`demos/` directory, then run each notebook in order. The widget defaults at
+`notebooks/` directory, then run each notebook in order. The widget defaults at
 the top of each notebook allow standalone execution without the bundle.
 
 ---
@@ -182,7 +183,7 @@ Two steps to remove all workshop assets:
 
 ### Step 1 — Run the cleanup notebook
 
-Run `demos/00_cleanup.py` interactively in the workspace (open it, attach to a cluster or serverless, and run all cells). This removes:
+Run `notebooks/ops/cleanup.py` interactively in the workspace (open it, attach to a cluster or serverless, and run all cells). This removes:
 
 | Asset | How |
 |---|---|
