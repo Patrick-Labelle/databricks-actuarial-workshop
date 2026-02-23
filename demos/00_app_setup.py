@@ -95,14 +95,17 @@ conn.close()
 
 # COMMAND ----------
 
-# ─── 4. Create scenario_annotations table (idempotent) ─────────────────────────
+# ─── 4. Create scenario_annotations table in public schema (idempotent) ────────
+# Explicit public schema qualifier is critical: Lakebase sets each user's
+# search_path to "$user", public — without public. the table would be created
+# in the connecting user's personal schema and invisible to the app SP.
 conn = psycopg2.connect(
     host=HOST, port=5432, database=PG_DATABASE,
     user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
 )
 cur = conn.cursor()
 cur.execute("""
-    CREATE TABLE IF NOT EXISTS scenario_annotations (
+    CREATE TABLE IF NOT EXISTS public.scenario_annotations (
         id          SERIAL      PRIMARY KEY,
         segment_id  TEXT        NOT NULL,
         note        TEXT,
@@ -111,8 +114,19 @@ cur.execute("""
     )
 """)
 conn.commit()
+
+# Grant the app SP access to the public schema and the table so it can
+# INSERT/SELECT using its own PostgreSQL role (its Databricks client_id).
+if APP_SP_CLIENT_ID:
+    cur.execute(f'GRANT USAGE ON SCHEMA public TO "{APP_SP_CLIENT_ID}"')
+    cur.execute(f'GRANT SELECT, INSERT ON TABLE public.scenario_annotations TO "{APP_SP_CLIENT_ID}"')
+    conn.commit()
+    print(f"[OK] Granted public schema + scenario_annotations to SP: {APP_SP_CLIENT_ID}")
+else:
+    print("[SKIP] No app_sp_client_id — skipping Lakebase PostgreSQL grants.")
+
 conn.close()
-print("[OK] Table 'scenario_annotations' ensured.")
+print("[OK] Table 'public.scenario_annotations' ensured.")
 
 # COMMAND ----------
 

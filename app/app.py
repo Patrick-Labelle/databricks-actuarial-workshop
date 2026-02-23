@@ -304,8 +304,10 @@ def _ensure_annotations_table():
     try:
         conn = get_lakebase_conn()
         cur = conn.cursor()
+        # Explicit public schema — Lakebase sets search_path = "$user", public so an
+        # unqualified name would land in the connecting user's personal schema instead.
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS scenario_annotations (
+            CREATE TABLE IF NOT EXISTS public.scenario_annotations (
                 id          SERIAL      PRIMARY KEY,
                 segment_id  TEXT        NOT NULL,
                 note        TEXT,
@@ -325,7 +327,7 @@ def save_scenario_annotation(segment: str, note: str, analyst: str):
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO scenario_annotations (segment_id, note, analyst, created_at) "
+            "INSERT INTO public.scenario_annotations (segment_id, note, analyst, created_at) "
             "VALUES (%s, %s, %s, NOW())",
             (segment, note, analyst)
         )
@@ -342,7 +344,7 @@ def load_annotations(segment_id: str):
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
-            "SELECT analyst, note, created_at FROM scenario_annotations "
+            "SELECT analyst, note, created_at FROM public.scenario_annotations "
             "WHERE segment_id = %s ORDER BY created_at DESC LIMIT 10",
             (segment_id,)
         )
