@@ -170,7 +170,7 @@ class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
 
 # COMMAND ----------
 
-import os, pickle, tempfile
+import os, pickle, tempfile, cloudpickle
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -274,7 +274,11 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
             artifacts={"sarimax_model": tmpdir},
             signature=signature,
             registered_model_name=MODEL_NAME,   # Auto-registers to UC
-            pip_requirements=["statsmodels>=0.14", "numpy>=1.24"],
+            pip_requirements=[
+                "statsmodels>=0.14",
+                "numpy>=1.24",
+                f"cloudpickle=={cloudpickle.__version__}",  # pin to training version to avoid deserialization hang at serve time
+            ],
         )
 
     RUN_ID = run.info.run_id

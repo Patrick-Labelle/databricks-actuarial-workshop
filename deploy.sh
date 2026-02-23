@@ -10,6 +10,10 @@
 # startup to get the correct catalog and schema names.
 #
 # app/_bundle_config.py is gitignored and re-generated on every deploy.
+#
+# After bundle deploy, the app source code is pushed via `databricks apps deploy`
+# so the app is live without any manual steps. bundle deploy creates/updates the
+# app resource but does not trigger an app deployment on its own.
 
 set -euo pipefail
 
@@ -40,3 +44,40 @@ EOF
 
 echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
 databricks bundle deploy "${BUNDLE_ARGS[@]}"
+
+# bundle deploy creates/updates the app resource but does not trigger an app
+# deployment (the step that pushes source code into the running container).
+# Extract the resolved app name, workspace source path, and profile from the
+# validate output and deploy explicitly so no manual step is needed.
+APP_NAME=$(echo "$VALIDATE_JSON" \
+    | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+apps = d.get('resources', {}).get('apps', {})
+print(list(apps.values())[0].get('name', '')) if apps else print('')
+")
+APP_SOURCE_PATH=$(echo "$VALIDATE_JSON" \
+    | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+apps = d.get('resources', {}).get('apps', {})
+print(list(apps.values())[0].get('source_code_path', '')) if apps else print('')
+")
+PROFILE=$(echo "$VALIDATE_JSON" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('profile',''))")
+
+if [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
+    echo "==> Deploying app source code..."
+    echo "    App:    ${APP_NAME}"
+    echo "    Source: ${APP_SOURCE_PATH}"
+    PROFILE_ARGS=()
+    if [ -n "$PROFILE" ]; then
+        PROFILE_ARGS=(--profile "$PROFILE")
+    fi
+    databricks apps deploy "${APP_NAME}" \
+        --source-code-path "${APP_SOURCE_PATH}" \
+        "${PROFILE_ARGS[@]}"
+    echo "==> App deployment complete!"
+else
+    echo "==> No app found in bundle, skipping app deployment."
+fi

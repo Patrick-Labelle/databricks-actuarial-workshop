@@ -55,8 +55,10 @@ databricks bundle validate --target my-workspace
 
 > **Use `deploy.sh` instead of `databricks bundle deploy` directly.**
 > The script resolves bundle variable values via `bundle validate`, generates
-> `app/_bundle_config.py` with the actual catalog/schema names, then runs the
-> deploy. This is necessary because `app/app.yaml` is uploaded as source code
+> `app/_bundle_config.py` with the actual catalog/schema names, runs
+> `databricks bundle deploy`, and then automatically triggers
+> `databricks apps deploy` so the app is live without any manual steps.
+> This is necessary because `app/app.yaml` is uploaded as source code
 > and does not receive DAB variable substitution at deploy time.
 
 ### 4. Run the setup job
@@ -73,12 +75,6 @@ This runs all modules in sequence:
 5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
 6. Register model to UC Registry + create Model Serving endpoint (Module 5)
 7. **App setup** — create Lakebase DB, `scenario_annotations` table, grant UC permissions and PostgreSQL privileges to the app service principal, and grant `CAN_QUERY` on the serving endpoint to the app SP
-
-### 5. Start the app
-
-```bash
-databricks bundle run actuarial_workshop_app --target my-workspace
-```
 
 ---
 
@@ -218,4 +214,4 @@ workspace bundle folder:
 
 > **Lakebase re-deploy:** Lakebase instance deletion is asynchronous. If you run
 > `./deploy.sh` immediately after `./destroy.sh` you may see `Instance name is not unique`.
-> Wait ~1 minute and retry — the name reservation clears quickly.
+> Wait a few minutes and retry — the deletion propagates in the background.
