@@ -224,26 +224,40 @@ def _email_from_token(token: str) -> str:
         return ""
 
 def get_lakebase_conn():
-    """Connect to Lakebase Postgres for scenario annotations."""
+    """Connect to Lakebase Postgres as the app service principal.
+
+    The app SP is granted CAN_CONNECT_AND_CREATE on the Lakebase database via
+    resources/app.yml. Individual workshop users do not need Lakebase grants —
+    all DB operations go through the SP. The human analyst's identity is captured
+    separately from the forwarded user token and stored in the `analyst` column.
+    """
     psycopg2 = _get_psycopg2()
     if psycopg2 is None:
         raise RuntimeError(
             f"psycopg2 is not available ({_psycopg2_error or 'unknown reason'}). "
             "Lakebase features are disabled."
         )
-    token = st.context.headers.get("X-Forwarded-Access-Token")
-    if not token:
-        raise RuntimeError("User token unavailable — cannot connect to Lakebase.")
     host = os.environ.get("PGHOST", "")
     if not host:
         raise RuntimeError("PGHOST not set — Lakebase not configured.")
-    port = int(os.environ.get("PGPORT", "5432"))
+
+    # Authenticate as the app SP using the SDK — the SP has CAN_CONNECT_AND_CREATE.
+    w = _get_workspace_client()
+    if w is None:
+        raise RuntimeError(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
+    auth_headers = {}
+    w.config.authenticate(auth_headers)
+    sp_token = auth_headers.get("Authorization", "").replace("Bearer ", "")
+    sp_user  = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    if not sp_token:
+        raise RuntimeError("Could not obtain SP token from Databricks SDK.")
+
+    port     = int(os.environ.get("PGPORT", "5432"))
     database = os.environ.get("PGDATABASE") or PG_DATABASE_DEFAULT
-    user = os.environ.get("PGUSER", "") or _email_from_token(token)
-    sslmode = os.environ.get("PGSSLMODE", "require")
+    sslmode  = os.environ.get("PGSSLMODE", "require")
     return psycopg2.connect(
         host=host, port=port, database=database,
-        user=user, password=token, sslmode=sslmode,
+        user=sp_user, password=sp_token, sslmode=sslmode,
     )
 
 _annotations_table_ensured = False
@@ -529,7 +543,10 @@ Use the annotation tool below to flag such assumptions.
                 "Use this to record assumption overrides, external events, or review comments "
                 "for this segment. Notes are stored in Lakebase (PostgreSQL) and persist across sessions."
             )
-            analyst = st.text_input("Analyst name:")
+            # Pre-populate analyst name from the forwarded user token if available
+            _user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
+            _default_analyst = _email_from_token(_user_token) if _user_token else ""
+            analyst = st.text_input("Analyst name:", value=_default_analyst)
             note    = st.text_area("Assumptions / adjustments:")
             if st.button("Save Note"):
                 if save_scenario_annotation(selected, note, analyst):
