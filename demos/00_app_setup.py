@@ -120,8 +120,11 @@ conn.commit()
 if APP_SP_CLIENT_ID:
     cur.execute(f'GRANT USAGE ON SCHEMA public TO "{APP_SP_CLIENT_ID}"')
     cur.execute(f'GRANT SELECT, INSERT ON TABLE public.scenario_annotations TO "{APP_SP_CLIENT_ID}"')
+    # SERIAL columns create a backing sequence that requires a separate USAGE grant —
+    # INSERT on the table alone does not include sequence access.
+    cur.execute(f'GRANT USAGE ON SEQUENCE public.scenario_annotations_id_seq TO "{APP_SP_CLIENT_ID}"')
     conn.commit()
-    print(f"[OK] Granted public schema + scenario_annotations to SP: {APP_SP_CLIENT_ID}")
+    print(f"[OK] Granted public schema + scenario_annotations + sequence to SP: {APP_SP_CLIENT_ID}")
 else:
     print("[SKIP] No app_sp_client_id — skipping Lakebase PostgreSQL grants.")
 
