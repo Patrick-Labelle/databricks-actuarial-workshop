@@ -77,8 +77,17 @@ if WORKSPACE_HOST and not WORKSPACE_HOST.startswith("http"):
 
 ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "actuarial-workshop-sarima-forecaster")
 WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
-CATALOG       = os.environ.get("CATALOG", "my_catalog")
-SCHEMA        = os.environ.get("SCHEMA", "actuarial_workshop")
+
+# CATALOG / SCHEMA / PG_DATABASE: prefer env vars (set manually or by platform),
+# fall back to the bundle-generated _bundle_config.py (created by preDeploy hook).
+try:
+    from _bundle_config import CATALOG as _BC_CATALOG, SCHEMA as _BC_SCHEMA, PG_DATABASE as _BC_PG
+except ImportError:
+    _BC_CATALOG, _BC_SCHEMA, _BC_PG = "my_catalog", "actuarial_workshop", "actuarial_workshop_db"
+
+CATALOG             = os.environ.get("CATALOG") or _BC_CATALOG
+SCHEMA              = os.environ.get("SCHEMA") or _BC_SCHEMA
+PG_DATABASE_DEFAULT = os.environ.get("PGDATABASE") or _BC_PG
 
 if _auth_init_error is not None:
     st.warning(
@@ -229,7 +238,7 @@ def get_lakebase_conn():
     if not host:
         raise RuntimeError("PGHOST not set — Lakebase not configured.")
     port = int(os.environ.get("PGPORT", "5432"))
-    database = os.environ.get("PGDATABASE", "actuarial_workshop_db")
+    database = os.environ.get("PGDATABASE") or PG_DATABASE_DEFAULT
     user = os.environ.get("PGUSER", "") or _email_from_token(token)
     sslmode = os.environ.get("PGSSLMODE", "require")
     return psycopg2.connect(

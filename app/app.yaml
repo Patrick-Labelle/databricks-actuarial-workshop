@@ -26,15 +26,8 @@ env:
   - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
     value: "false"
 
-  # DATABRICKS_HOST is injected automatically by the Databricks Apps runtime.
-  # Do NOT set it here — ${workspace.host} is a bundle-level reference that is
-  # not substituted in app.yaml, which causes the literal string to be used.
-
-  # Data layer — set in databricks.yml variables
-  - name: CATALOG
-    value: "${var.catalog}"
-  - name: SCHEMA
-    value: "${var.schema}"
+  # DATABRICKS_HOST, CATALOG, SCHEMA, PGDATABASE are injected by the platform.
+  # See resources/app.yml config.env for bundle-substituted values.
 
   # Model serving — injected at runtime from the 'serving-endpoint' app resource.
   # The app's service principal is granted CAN_QUERY on the endpoint (see app.yml).
@@ -53,7 +46,5 @@ env:
     valueFrom: database
   - name: PGPORT
     value: "5432"
-  - name: PGDATABASE
-    value: "${var.pg_database}"
   - name: PGSSLMODE
     value: "require"
