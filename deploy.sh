@@ -10,9 +10,7 @@
 #   The app imports _bundle_config.py at startup to get CATALOG / SCHEMA /
 #   PG_DATABASE when they are not already set via environment variables.
 #
-# app/_bundle_config.py is gitignored — it's re-generated on every deploy.
-# Use `databricks bundle deploy` directly only if you set CATALOG / SCHEMA /
-# PGDATABASE as environment variables in the app's configuration instead.
+# app/_bundle_config.py is gitignored and re-generated on every deploy.
 
 set -euo pipefail
 

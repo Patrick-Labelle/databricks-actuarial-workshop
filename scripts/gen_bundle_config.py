@@ -1,11 +1,10 @@
 """
-gen_bundle_config.py — called by bundle.scripts.preDeploy in databricks.yml
+gen_bundle_config.py — called by deploy.sh before each bundle deploy.
 
-Generates app/_bundle_config.py with the bundle variable values substituted
-at deploy time. The bundle substitutes ${var.*} references in the command
-string before invoking this script, so sys.argv[1:4] contain the real values.
+Writes app/_bundle_config.py with the resolved catalog, schema, and
+pg_database values so the app can import them at startup.
 
-Usage (called by bundle, not directly):
+Usage:
     python scripts/gen_bundle_config.py <catalog> <schema> <pg_database>
 """
 import sys

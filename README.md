@@ -11,6 +11,7 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 ├── databricks.yml            # Bundle config — variables, sync, includes
 ├── databricks.local.yml.example  # Template for your workspace-specific target
 ├── deploy.sh                 # Deploy wrapper (generates _bundle_config.py first)
+├── destroy.sh                # Destroy wrapper (bundle destroy + workspace cleanup)
 ├── scripts/
 │   └── gen_bundle_config.py  # Writes app/_bundle_config.py with substituted vars
 ├── resources/
@@ -115,10 +116,9 @@ configuration is needed.
 
 ## Variable Injection — How the App Gets Its Config
 
-Databricks Apps uploads `app/app.yaml` as source code **without** bundle variable
-substitution, so `${var.*}` references in that file would arrive literally. The
-`config.env` block in the app bundle resource is also silently ignored by the
-Apps platform. The following mechanisms are used instead:
+`app/app.yaml` is uploaded to the workspace as source code and does not receive
+bundle variable substitution, so `${var.*}` references cannot be used there.
+The app's runtime configuration is provided through three channels:
 
 | Variable | Mechanism | Where set |
 |----------|-----------|-----------|
@@ -200,10 +200,11 @@ Run `demos/00_cleanup.py` interactively in the workspace (open it, attach to a c
 ### Step 2 — Destroy bundle-managed infrastructure
 
 ```bash
-databricks bundle destroy --target my-workspace
+./destroy.sh --target my-workspace
 ```
 
-This removes the resources provisioned by the bundle deploy:
+This removes the resources provisioned by the bundle deploy and cleans up the
+workspace bundle folder:
 
 | Resource | Notes |
 |---|---|
@@ -211,8 +212,8 @@ This removes the resources provisioned by the bundle deploy:
 | Lakebase instance | Managed PostgreSQL instance (async delete, takes ~1 min) |
 | Setup + Monthly Refresh jobs | Bundle-managed jobs |
 | DLT pipeline | If not already deleted in Step 1 |
-| Workspace files | `/Workspace/Users/…/.bundle/actuarial-workshop/…` |
+| Workspace bundle folder | `/Workspace/Users/…/.bundle/actuarial-workshop` |
 
-> **Note:** `bundle destroy` only removes resources it deployed in the current target.
+> **Note:** `destroy.sh` only removes resources deployed in the current target.
 > Jobs or pipelines left over from previous deployments (different targets or re-deploys)
 > must be deleted manually from the workspace UI or via the REST API.

@@ -9,12 +9,9 @@ resources:
       name: "actuarial-workshop"
       source_code_path: ../app
 
-      # ── Note on CATALOG / SCHEMA / PGDATABASE ────────────────────────────────
-      # These cannot go in app/app.yaml (uploaded as-is, no ${var.*} substitution)
-      # and the config.env block here is silently ignored by the Apps platform.
-      # Instead, deploy.sh generates app/_bundle_config.py with the resolved values
-      # before each deploy. The app imports _bundle_config.py at startup as a fallback.
-      # Always deploy with ./deploy.sh, not bare `databricks bundle deploy`.
+      # ── CATALOG / SCHEMA / PGDATABASE ────────────────────────────────────────
+      # Provided to the app via app/_bundle_config.py, which deploy.sh generates
+      # with the resolved variable values before each deploy. See deploy.sh.
 
       # ── App resource authorizations ──────────────────────────────────────────
       # Each entry grants the app's service principal a specific permission on a
