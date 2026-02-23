@@ -170,39 +170,24 @@ After running the Full Setup job, the following resources will be created:
 
 ## Teardown
 
-Two steps to remove all workshop assets:
-
-### Step 1 — Run the cleanup notebook
-
-Run `src/ops/cleanup.py` interactively in the workspace (open it, attach to a cluster or serverless, and run all cells). This removes:
-
-| Asset | How |
-|---|---|
-| UC schema + all tables | `DROP SCHEMA … CASCADE` |
-| Online Table | REST API |
-| Model Serving endpoint | REST API |
-| UC registered model + versions | MLflow client |
-| MLflow experiments | MLflow client |
-| DLT pipeline | REST API |
-| Databricks Jobs | REST API |
-| Lakebase PostgreSQL database | `DROP DATABASE` via psycopg2 |
-
-### Step 2 — Destroy bundle-managed infrastructure
-
 ```bash
 ./destroy.sh --target my-workspace
 ```
 
-This removes the resources provisioned by the bundle deploy and cleans up the
-workspace bundle folder:
+`destroy.sh` is a single-command full teardown. It removes all workshop assets in the correct order:
 
-| Resource | Notes |
+| Asset | How |
 |---|---|
-| Databricks App | Stopped and deleted |
-| Lakebase instance | Managed PostgreSQL instance (async delete, takes ~1 min) |
-| Setup + Monthly Refresh jobs | Bundle-managed jobs |
-| DLT pipeline | If not already deleted in Step 1 |
-| Workspace bundle folder | `/Workspace/Users/…/.bundle/actuarial-workshop` (all target subfolders) |
+| UC schema + all tables | Statement Execution API (`DROP SCHEMA … CASCADE`) — auto-starts warehouse |
+| Online Table | REST API |
+| Model Serving endpoint | REST API |
+| UC registered model + versions | REST API |
+| MLflow experiments | REST API |
+| Databricks App | Bundle destroy |
+| Lakebase instance (+ all databases) | Bundle destroy (async delete) |
+| Setup + Monthly Refresh jobs | Bundle destroy |
+| DLT pipeline | Bundle destroy |
+| Workspace bundle folder | `databricks workspace delete --recursive` |
 
 > **Note:** `destroy.sh` only removes resources deployed in the current target.
 > Jobs or pipelines left over from previous deployments (different targets or re-deploys)
