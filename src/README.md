@@ -213,7 +213,7 @@ ps.set_option("compute.ops_on_diff_frames", True)
 ### `Py4JJavaError` on DLT import in non-DLT context
 Module 1's `IN_DLT` guard catches the `Py4JJavaError` that can occur when importing the `dlt` module outside of a DLT pipeline context. If you see this error in other modules, the guard is working as intended — DLT cells will be skipped.
 
-### Bonus App: `PGHOST` / `CATALOG` / `SCHEMA` not set
+### Bonus App: `PGHOST` / `CATALOG` / `SCHEMA` / `ENDPOINT_NAME` not set
 These values are injected at deploy time by `./deploy.sh` (which generates `app/_bundle_config.py`) and at runtime via the `resources: database:` declaration in `app/app.yaml` for `PGHOST`. Always deploy using `./deploy.sh --target <target>` rather than `databricks bundle deploy` directly to ensure `_bundle_config.py` is generated with the correct values.
 
 ### Bonus App: `Could not save annotation` / Lakebase connection errors

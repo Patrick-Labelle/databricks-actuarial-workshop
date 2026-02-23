@@ -11,11 +11,32 @@ set -euo pipefail
 
 BUNDLE_ARGS=("$@")
 
+# Extract only the flags that `bundle validate` accepts (--target, --profile, --var)
+# so that destroy-only flags like --auto-approve don't cause validate to fail.
+VALIDATE_ARGS=()
+i=0
+while [ $i -lt ${#BUNDLE_ARGS[@]} ]; do
+    arg="${BUNDLE_ARGS[$i]}"
+    case "$arg" in
+        --target|-t|--profile|-p|--var)
+            VALIDATE_ARGS+=("$arg" "${BUNDLE_ARGS[$((i+1))]}")
+            i=$((i+2))
+            ;;
+        --target=*|--profile=*|--var=*)
+            VALIDATE_ARGS+=("$arg")
+            i=$((i+1))
+            ;;
+        *)
+            i=$((i+1))
+            ;;
+    esac
+done
+
 # Resolve the bundle workspace path before destroying so we know what to clean up.
 # root_path is e.g. /Workspace/Users/you@co.com/.bundle/actuarial-workshop/<target>
 # dirname strips the target, giving the bundle-named parent directory.
 echo "==> Resolving bundle workspace path..."
-VALIDATE_JSON=$(databricks bundle validate --output json "${BUNDLE_ARGS[@]}" 2>/dev/null)
+VALIDATE_JSON=$(databricks bundle validate --output json "${VALIDATE_ARGS[@]}" 2>/dev/null)
 
 ROOT_PATH=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('root_path',''))")

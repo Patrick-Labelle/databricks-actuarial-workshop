@@ -72,7 +72,7 @@ This runs all modules in sequence:
 4. Register the Feature Store + Online Table (Module 3)
 5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
 6. Register model to UC Registry + create Model Serving endpoint (Module 5)
-7. **App setup** — create Lakebase DB, `scenario_annotations` table, grant UC permissions and PostgreSQL privileges to the app service principal
+7. **App setup** — create Lakebase DB, `scenario_annotations` table, grant UC permissions and PostgreSQL privileges to the app service principal, and grant `CAN_QUERY` on the serving endpoint to the app SP
 
 ### 5. Start the app
 
