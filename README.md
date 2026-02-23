@@ -215,3 +215,7 @@ workspace bundle folder:
 > **Note:** `destroy.sh` only removes resources deployed in the current target.
 > Jobs or pipelines left over from previous deployments (different targets or re-deploys)
 > must be deleted manually from the workspace UI or via the REST API.
+
+> **Lakebase re-deploy:** Lakebase instance deletion is asynchronous. If you run
+> `./deploy.sh` immediately after `./destroy.sh` you may see `Instance name is not unique`.
+> Wait ~1 minute and retry — the name reservation clears quickly.
