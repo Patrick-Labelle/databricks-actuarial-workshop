@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
-# deploy.sh — wrapper around `databricks bundle deploy`
+# deploy.sh — full end-to-end deploy: bundle + setup job + app
 #
 # Usage:  ./deploy.sh [--target <target>] [other bundle flags]
 #
-# Databricks Apps uploads app/app.yaml as-is without bundle variable substitution,
-# so CATALOG / SCHEMA / PGDATABASE cannot use ${var.*} in that file. This script
-# resolves those values from `bundle validate`, writes app/_bundle_config.py with
-# the actual values, then runs the deploy. The app imports _bundle_config.py at
-# startup to get the correct catalog and schema names.
+# Sequence
+# --------
+#   1. Resolve bundle variables via `bundle validate`; generate app/_bundle_config.py
+#      (app/app.yaml is uploaded as source and does not receive DAB variable
+#      substitution, so catalog/schema/pg_database are injected via this file).
+#   2. `databricks bundle deploy` — provisions all bundle-managed resources
+#      (Lakebase instance, jobs, DLT pipeline, app resource).
+#   3. If a fresh app was created with compute STOPPED, call `apps start` to
+#      start the compute and clear the bundle's initial-deployment lock.
+#   4. `databricks bundle run actuarial_workshop_setup` — runs the setup job,
+#      which seeds the data, trains and registers the SARIMA model, and (crucially)
+#      grants the app's service principal permissions on all UC catalog/schema/table
+#      assets, the Lakebase PostgreSQL database, and the model-serving endpoint.
+#   5. `databricks apps deploy` — performs the final app deployment only after
+#      all permissions are in place, so the app starts cleanly without
+#      catalog-permission errors.
 #
 # app/_bundle_config.py is gitignored and re-generated on every deploy.
-#
-# After bundle deploy, the app source code is pushed via `databricks apps deploy`
-# so the app is live without any manual steps. bundle deploy creates/updates the
-# app resource but does not trigger an app deployment on its own.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_ARGS=("$@")
 
+# ── Step 1: resolve variables and generate app/_bundle_config.py ─────────────
 echo "==> Resolving bundle variables..."
 VALIDATE_JSON=$(databricks bundle validate --output json "${BUNDLE_ARGS[@]}" 2>/dev/null)
 
@@ -42,13 +50,7 @@ PG_DATABASE = '${PG_DATABASE}'
 ENDPOINT_NAME = '${ENDPOINT_NAME}'
 EOF
 
-echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
-databricks bundle deploy "${BUNDLE_ARGS[@]}"
-
-# bundle deploy creates/updates the app resource but does not trigger an app
-# deployment (the step that pushes source code into the running container).
-# Extract the resolved app name, workspace source path, and profile from the
-# validate output and deploy explicitly so no manual step is needed.
+# Extract app name, workspace source path, and CLI profile from validate output.
 APP_NAME=$(echo "$VALIDATE_JSON" \
     | python3 -c "
 import sys, json
@@ -66,14 +68,52 @@ print(list(apps.values())[0].get('source_code_path', '')) if apps else print('')
 PROFILE=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('profile',''))")
 
+PROFILE_ARGS=()
+if [ -n "$PROFILE" ]; then
+    PROFILE_ARGS=(--profile "$PROFILE")
+fi
+
+# ── Step 2: bundle deploy ─────────────────────────────────────────────────────
+echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
+databricks bundle deploy "${BUNDLE_ARGS[@]}"
+
+# ── Step 3: start app compute if needed ──────────────────────────────────────
+# When bundle creates a fresh app it leaves compute STOPPED and queues an
+# initial deployment internally. That deployment holds the deployment lock,
+# permanently blocking our later `apps deploy` call. Starting the compute
+# clears the lock without deploying anything, so step 5 can proceed cleanly.
+if [ -n "$APP_NAME" ]; then
+    COMPUTE_STATE=$(databricks api get "/api/2.0/apps/${APP_NAME}" \
+        "${PROFILE_ARGS[@]}" 2>/dev/null \
+        | python3 -c "
+import sys, json
+lines = sys.stdin.read().split('\n')
+j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
+if j is not None:
+    print(json.loads('\n'.join(lines[j:])).get('compute_status', {}).get('state', ''))
+" 2>/dev/null || echo "")
+    if [ "$COMPUTE_STATE" = "STOPPED" ]; then
+        echo "==> App compute is STOPPED — starting it to clear bundle's initial deployment lock..."
+        databricks apps start "${APP_NAME}" "${PROFILE_ARGS[@]}" > /dev/null 2>&1 || true
+        echo "    App compute started."
+    fi
+fi
+
+# ── Step 4: run setup job ─────────────────────────────────────────────────────
+# This provisions all data assets and — critically — grants the app's service
+# principal permissions on UC catalog/schema/tables, the Lakebase PostgreSQL
+# database, and the model-serving endpoint. The app must not be deployed until
+# this completes, otherwise it starts with missing permissions.
+echo "==> Running setup job (this takes ~15 min)..."
+databricks bundle run actuarial_workshop_setup "${BUNDLE_ARGS[@]}"
+
+# ── Step 5: deploy app ────────────────────────────────────────────────────────
+# All permissions are now in place. Deploy the app source code so it starts
+# with a clean slate against the fully-provisioned, permissioned environment.
 if [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
     echo "==> Deploying app source code..."
     echo "    App:    ${APP_NAME}"
     echo "    Source: ${APP_SOURCE_PATH}"
-    PROFILE_ARGS=()
-    if [ -n "$PROFILE" ]; then
-        PROFILE_ARGS=(--profile "$PROFILE")
-    fi
     databricks apps deploy "${APP_NAME}" \
         --source-code-path "${APP_SOURCE_PATH}" \
         "${PROFILE_ARGS[@]}"

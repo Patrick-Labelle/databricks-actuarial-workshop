@@ -54,20 +54,16 @@ databricks bundle validate --target my-workspace
 ```
 
 > **Use `deploy.sh` instead of `databricks bundle deploy` directly.**
-> The script resolves bundle variable values via `bundle validate`, generates
-> `app/_bundle_config.py` with the actual catalog/schema names, runs
-> `databricks bundle deploy`, and then automatically triggers
-> `databricks apps deploy` so the app is live without any manual steps.
-> This is necessary because `app/app.yaml` is uploaded as source code
-> and does not receive DAB variable substitution at deploy time.
+> The script handles the full end-to-end deployment in a single command:
+> 1. Resolves bundle variable values via `bundle validate` and generates `app/_bundle_config.py`
+>    (necessary because `app/app.yaml` is uploaded as source code and does not receive DAB variable substitution).
+> 2. Runs `databricks bundle deploy` to provision all bundle-managed infrastructure.
+> 3. Starts the app compute if needed (clears a bundle-internal deployment lock that occurs on fresh installs).
+> 4. Runs the full setup job, which seeds the data, trains the SARIMA model, and grants the
+>    app's service principal permissions on all UC catalog/schema/tables, Lakebase, and the model-serving endpoint.
+> 5. Deploys the app source code only after all permissions are in place, so the app starts without permission errors.
 
-### 4. Run the setup job
-
-```bash
-databricks bundle run actuarial_workshop_setup --target my-workspace
-```
-
-This runs all modules in sequence:
+The setup job runs the following modules in sequence:
 1. Generate synthetic policy CDC data
 2. Run the DLT pipeline (Bronze → Silver → Gold)
 3. Build rolling features (Module 2)
