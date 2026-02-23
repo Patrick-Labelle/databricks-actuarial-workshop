@@ -23,6 +23,11 @@
 # MAGIC | `{catalog}.{schema}.sarima_claims_forecaster` | UC Model | Module 5 |
 # MAGIC | `Actuarial Workshop — DLT Pipeline` | DLT Pipeline | Module 1 |
 # MAGIC | `Actuarial Workshop — Orchestration Demo` | Databricks Job | Module 1 |
+# MAGIC | `actuarial_workshop_db` | Lakebase PostgreSQL database | Bonus (App setup) |
+# MAGIC
+# MAGIC > **Note:** The Databricks App, Lakebase instance, bundle jobs, and DLT pipeline managed
+# MAGIC > by the Asset Bundle are removed by `databricks bundle destroy --target <target>`.
+# MAGIC > This notebook removes assets created *inside* the workspace by the workshop notebooks.
 
 # COMMAND ----------
 
@@ -34,12 +39,16 @@
 # ─── Configuration ────────────────────────────────────────────────────────────
 # All values default to the workshop defaults but can be overridden via widgets
 # (or via job base_parameters) to clean up any target catalog/schema.
-dbutils.widgets.text("catalog",       "my_catalog",                           "UC Catalog")
-dbutils.widgets.text("schema",        "actuarial_workshop",                   "UC Schema")
-dbutils.widgets.text("endpoint_name", "actuarial-workshop-sarima-forecaster", "Serving Endpoint")
-CATALOG       = dbutils.widgets.get("catalog")
-SCHEMA        = dbutils.widgets.get("schema")
-ENDPOINT_NAME = dbutils.widgets.get("endpoint_name")
+dbutils.widgets.text("catalog",           "my_catalog",                           "UC Catalog")
+dbutils.widgets.text("schema",            "actuarial_workshop",                   "UC Schema")
+dbutils.widgets.text("endpoint_name",     "actuarial-workshop-sarima-forecaster", "Serving Endpoint")
+dbutils.widgets.text("pg_database",       "actuarial_workshop_db",                "Lakebase DB name")
+dbutils.widgets.text("lakebase_instance", "actuarial-workshop-lakebase",          "Lakebase instance name")
+CATALOG           = dbutils.widgets.get("catalog")
+SCHEMA            = dbutils.widgets.get("schema")
+ENDPOINT_NAME     = dbutils.widgets.get("endpoint_name")
+PG_DATABASE       = dbutils.widgets.get("pg_database")
+LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 TOKEN = (
@@ -47,11 +56,12 @@ TOKEN = (
     .apiToken().get()
 )
 
-import requests, json, mlflow
+import requests, json, mlflow, time
 
 print(f"Workspace: {WORKSPACE_URL}")
 print(f"Target catalog/schema: {CATALOG}.{SCHEMA}")
 print(f"Endpoint: {ENDPOINT_NAME}")
+print(f"Lakebase: {LAKEBASE_INSTANCE} / {PG_DATABASE}")
 print(f"Token acquired: {'yes' if TOKEN else 'no'}")
 
 # COMMAND ----------
@@ -245,9 +255,82 @@ for j in jobs:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Cleanup Verification
+# MAGIC ## 8. Drop Lakebase PostgreSQL Database
+# MAGIC
+# MAGIC Drops the `actuarial_workshop_db` database (and all tables in it) from the
+# MAGIC Lakebase instance. This removes `public.scenario_annotations` and all analyst annotations.
+# MAGIC
+# MAGIC > The Lakebase **instance** itself is removed by `databricks bundle destroy`.
+# MAGIC > This step only drops the database inside the instance.
+
+# COMMAND ----------
+
+%pip install psycopg2-binary --quiet
+
+# COMMAND ----------
+
+import psycopg2, psycopg2.extensions
+
+# ─── Get Lakebase hostname ──────────────────────────────────────────────────
+inst_resp = requests.get(
+    f"https://{WORKSPACE_URL}/api/2.0/database/instances/{LAKEBASE_INSTANCE}",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+)
+inst = inst_resp.json()
+print("Instance state:", inst.get("state"))
+LB_HOST = inst.get("read_write_dns")
+
+if inst.get("state") != "AVAILABLE":
+    print(f"[SKIP] Lakebase instance not AVAILABLE (state={inst.get('state')}). Skipping Lakebase cleanup.")
+    LB_HOST = None
+
+# ─── Get Lakebase credential ────────────────────────────────────────────────
+if LB_HOST:
+    cred_resp = requests.post(
+        f"https://{WORKSPACE_URL}/api/2.0/database/credentials",
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        json={"request_id": f"cleanup-{int(time.time())}", "instance_names": [LAKEBASE_INSTANCE]},
+    )
+    if cred_resp.status_code != 200:
+        print(f"[SKIP] Could not obtain Lakebase credential: {cred_resp.text[:200]}")
+        LB_HOST = None
+    else:
+        PG_TOKEN = cred_resp.json().get("token")
+        print("Lakebase credential obtained:", bool(PG_TOKEN))
+
+# COMMAND ----------
+
+if LB_HOST:
+    CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
+    conn = psycopg2.connect(
+        host=LB_HOST, port=5432, database="postgres",
+        user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
+    )
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (PG_DATABASE,))
+    if cur.fetchone():
+        cur.execute(
+            f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+            (PG_DATABASE,),
+        )
+        cur.execute(f'DROP DATABASE "{PG_DATABASE}"')
+        print(f"[DROPPED] Database '{PG_DATABASE}' dropped.")
+    else:
+        print(f"[OK] Database '{PG_DATABASE}' does not exist (already removed).")
+
+    conn.close()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. Cleanup Verification
 # MAGIC
 # MAGIC Verify all assets have been removed.
+# MAGIC
+# MAGIC > After running this notebook, run `databricks bundle destroy --target <target>` to
+# MAGIC > remove the Databricks App, Lakebase instance, jobs, and DLT pipeline managed by the bundle.
 
 # COMMAND ----------
 
@@ -295,3 +378,5 @@ print("\nCleanup complete.")
 # MAGIC | MLflow experiments | Deleted |
 # MAGIC | DLT pipeline | Deleted via REST API |
 # MAGIC | Databricks Job | Deleted via REST API |
+# MAGIC | Lakebase database `actuarial_workshop_db` | Dropped (PostgreSQL DROP DATABASE) |
+# MAGIC | Databricks App + Lakebase instance + bundle jobs | Run `databricks bundle destroy` |

@@ -152,7 +152,7 @@ After running all modules, the following assets will exist in your workspace:
 | Asset | Details |
 |-------|---------|
 | Databricks App `actuarial-workshop` | Available at your workspace Apps URL after deployment |
-| Lakebase instance `actuarial-workshop-db` | Managed PostgreSQL, database `actuarial_workshop_db`, table `annotations` |
+| Lakebase instance `actuarial-workshop-lakebase` | Managed PostgreSQL, database `actuarial_workshop_db`, table `public.scenario_annotations` |
 
 ---
 
@@ -172,7 +172,7 @@ ENDPOINT_NAME = "your-endpoint-name"
 
 The `WORKSPACE_URL` is derived automatically from Spark config (`spark.conf.get("spark.databricks.workspaceUrl")`), so no changes are needed there.
 
-For the Bonus app, update `app.yaml` with your Lakebase `PGHOST`, `PGDATABASE`, and `DATABRICKS_HOST` values.
+For the Bonus app, all connection values (`PGHOST`, `DATABRICKS_HOST`, `CATALOG`, `SCHEMA`, `PGDATABASE`) are injected automatically when deployed via `./deploy.sh`. No manual `app.yaml` edits are needed.
 
 ### Other Things to Customize
 
@@ -213,8 +213,13 @@ ps.set_option("compute.ops_on_diff_frames", True)
 ### `Py4JJavaError` on DLT import in non-DLT context
 Module 1's `IN_DLT` guard catches the `Py4JJavaError` that can occur when importing the `dlt` module outside of a DLT pipeline context. If you see this error in other modules, the guard is working as intended — DLT cells will be skipped.
 
-### Bonus App: Lakebase `PGHOST not set`
-The app reads `PGHOST` from environment variables. Ensure `app.yaml` has the `PGHOST` env var set to your Lakebase instance hostname. Lakebase env vars are **not** automatically injected without an explicit `resources:` declaration in `app.yaml`.
+### Bonus App: `PGHOST` / `CATALOG` / `SCHEMA` not set
+These values are injected at deploy time by `./deploy.sh` (which generates `app/_bundle_config.py`) and at runtime via the `resources: database:` declaration in `app/app.yaml` for `PGHOST`. Always deploy using `./deploy.sh --target <target>` rather than `databricks bundle deploy` directly to ensure `_bundle_config.py` is generated with the correct values.
+
+### Bonus App: `Could not save annotation` / Lakebase connection errors
+1. **SP auth failing** — Ensure `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` are available in the Apps runtime (they are auto-injected if the app resource has an associated service principal in `resources/app.yml`).
+2. **`relation "scenario_annotations" does not exist`** — The table must be created in the `public` schema. Run `demos/00_app_setup.py` as Task 7 of the setup job to create the table and grant the required PostgreSQL privileges to the app SP.
+3. **`permission denied for sequence`** — The setup notebook grants `USAGE ON SEQUENCE public.scenario_annotations_id_seq`. If skipped, re-run the setup notebook or grant manually.
 
 ---
 
@@ -324,7 +329,7 @@ A cleanup notebook (`00_cleanup.py`) is provided to remove all workshop assets. 
 **Authentication architecture:**
 - SQL queries: `WorkspaceClient` with `statement_execution.execute_statement()` — uses the forwarded user token automatically in Databricks Apps context
 - Model Serving: `WorkspaceClient.serving_endpoints.query()` — same SDK, same token
-- Lakebase: direct `psycopg2` connection with `PGPASSWORD` set from the forwarded `X-Forwarded-Access-Token` header; `PGUSER` extracted from the JWT `sub` claim (user email)
+- Lakebase: direct `psycopg2` connection using the app's **service principal** identity. The app exchanges `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` (auto-injected by Databricks Apps) for a short-lived OIDC token via `POST /oidc/v1/token`, then connects as the SP. The analyst's email is still extracted from the forwarded `X-Forwarded-Access-Token` JWT (`sub` claim) for display and row attribution — only the Lakebase *connection* uses the SP credential. Tokens are cached with a 60-second pre-expiry buffer.
 
 **URL:** Available at your workspace Apps URL after deployment (`databricks apps get actuarial-workshop`).
 

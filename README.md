@@ -8,15 +8,23 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 
 ```
 .
-├── databricks.yml       # Bundle config — all variables here
+├── databricks.yml            # Bundle config — variables, sync, includes
+├── databricks.local.yml.example  # Template for your workspace-specific target
+├── deploy.sh                 # Deploy wrapper (generates _bundle_config.py first)
+├── scripts/
+│   └── gen_bundle_config.py  # Writes app/_bundle_config.py with substituted vars
 ├── resources/
-│   ├── pipeline.yml     # DLT pipeline (Bronze → Silver → Gold)
-│   ├── jobs.yml         # Orchestration jobs (setup + monthly refresh)
-│   └── app.yml          # Databricks App resource
-├── demos/               # Workshop notebooks (Modules 1–7)
+│   ├── pipeline.yml          # DLT pipeline (Bronze → Silver → Gold)
+│   ├── jobs.yml              # Orchestration jobs (setup + monthly refresh)
+│   ├── app.yml               # Databricks App resource + SP authorizations
+│   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
+├── demos/
+│   ├── 00_app_setup.py       # App setup: Lakebase DB, table, UC + PG grants
+│   ├── 00_cleanup.py         # Post-workshop teardown notebook
+│   └── 01–07_*.py            # Workshop notebooks (Modules 1–6 + Bonus)
 ├── app/
-│   ├── app.py           # Streamlit application
-│   ├── app.yaml         # App config (env vars substituted from bundle)
+│   ├── app.py                # Streamlit application
+│   ├── app.yaml              # App command + valueFrom resource injections
 │   └── requirements.txt
 └── README.md
 ```
@@ -42,11 +50,14 @@ databricks bundle validate --target my-workspace
 ### 3. Deploy
 
 ```bash
-databricks bundle deploy --target my-workspace
+./deploy.sh --target my-workspace
 ```
 
-This uploads the notebooks, creates the DLT pipeline, orchestration jobs, and
-the Databricks App.
+> **Use `deploy.sh` instead of `databricks bundle deploy` directly.**
+> The script resolves bundle variable values via `bundle validate`, generates
+> `app/_bundle_config.py` with the actual catalog/schema names, then runs the
+> deploy. This is necessary because `app/app.yaml` is uploaded as source code
+> and does not receive DAB variable substitution at deploy time.
 
 ### 4. Run the setup job
 
@@ -61,12 +72,12 @@ This runs all modules in sequence:
 4. Register the Feature Store + Online Table (Module 3)
 5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
 6. Register model to UC Registry + create Model Serving endpoint (Module 5)
+7. **App setup** — create Lakebase DB, `scenario_annotations` table, grant UC permissions and PostgreSQL privileges to the app service principal
 
 ### 5. Start the app
 
-Start the Databricks App from the Apps UI or:
 ```bash
-databricks apps start actuarial-workshop
+databricks bundle run actuarial_workshop_app --target my-workspace
 ```
 
 ---
@@ -93,9 +104,12 @@ All configurable values live in `databricks.yml` under `variables:`.
 | `schema` | UC schema (created if missing) | `actuarial_workshop` |
 | `endpoint_name` | Model Serving endpoint name | `actuarial-workshop-sarima-forecaster` |
 | `warehouse_id` | SQL Warehouse ID for the app | _(empty)_ |
-| `pg_host` | Lakebase hostname (empty = disable annotations) | _(empty)_ |
-| `pg_database` | Lakebase database name | `actuarial_workshop_db` |
+| `pg_database` | Lakebase PostgreSQL database name | `actuarial_workshop_db` |
 | `notification_email` | Email for job failure alerts | _(empty)_ |
+
+The Lakebase instance hostname (`PGHOST`) is injected into the app at runtime
+via the `valueFrom: database` resource reference in `app/app.yaml` — no manual
+configuration is needed.
 
 ---
 
@@ -126,14 +140,31 @@ the top of each notebook allow standalone execution without the bundle.
 
 ## Deployed Resources
 
-After running the Full Setup job, the following resources will be created in your workspace:
+After running the Full Setup job, the following resources will be created:
 
 | Resource | Name |
 |----------|------|
+| Lakebase instance | `actuarial-workshop-lakebase` (provisioned by bundle deploy) |
+| Lakebase database | `actuarial_workshop_db` (created by setup job Task 7) |
 | DLT Pipeline | `actuarial-workshop-medallion` |
 | Setup Job | `Actuarial Workshop — Full Setup` |
 | Monthly Refresh Job | `Actuarial Workshop — Monthly Model Refresh` |
-| Model Serving Endpoint | value of `endpoint_name` variable (default: `actuarial-workshop-sarima-forecaster`) |
+| Model Serving Endpoint | value of `endpoint_name` variable |
 | Databricks App | `actuarial-workshop` |
 | Feature Table | `{catalog}.{schema}.segment_monthly_features` |
 | UC Model | `{catalog}.{schema}.sarima_claims_forecaster` |
+
+---
+
+## Teardown
+
+To remove all workshop assets after the session:
+
+```bash
+# 1. Run the cleanup notebook to drop UC assets, MLflow experiments, and Lakebase data
+databricks bundle run actuarial_workshop_cleanup --target my-workspace
+# (or run demos/00_cleanup.py interactively in the workspace)
+
+# 2. Destroy all bundle-managed infrastructure (app, jobs, pipeline, Lakebase instance)
+databricks bundle destroy --target my-workspace
+```
