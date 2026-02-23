@@ -211,7 +211,7 @@ workspace bundle folder:
 | Lakebase instance | Managed PostgreSQL instance (async delete, takes ~1 min) |
 | Setup + Monthly Refresh jobs | Bundle-managed jobs |
 | DLT pipeline | If not already deleted in Step 1 |
-| Workspace bundle folder | `/Workspace/Users/…/.bundle/actuarial-workshop` |
+| Workspace bundle folder | `/Workspace/Users/…/.bundle/actuarial-workshop` (all target subfolders) |
 
 > **Note:** `destroy.sh` only removes resources deployed in the current target.
 > Jobs or pipelines left over from previous deployments (different targets or re-deploys)

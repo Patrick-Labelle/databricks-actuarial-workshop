@@ -4,19 +4,19 @@
 # Usage:  ./destroy.sh [--target <target>] [other bundle flags]
 #
 # In addition to destroying bundle-managed resources, this script removes
-# the .bundle/<bundle-name> workspace folder that `bundle destroy` leaves
-# behind after removing the target-specific subfolder.
+# the entire .bundle/<bundle-name> workspace folder (all target subfolders)
+# that `bundle destroy` leaves behind.
 
 set -euo pipefail
 
 BUNDLE_ARGS=("$@")
 
 # Resolve the bundle workspace path before destroying so we know what to clean up.
+# root_path is e.g. /Workspace/Users/you@co.com/.bundle/actuarial-workshop/<target>
+# dirname strips the target, giving the bundle-named parent directory.
 echo "==> Resolving bundle workspace path..."
 VALIDATE_JSON=$(databricks bundle validate --output json "${BUNDLE_ARGS[@]}" 2>/dev/null)
 
-BUNDLE_NAME=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('bundle',{}).get('name',''))")
 ROOT_PATH=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('root_path',''))")
 PROFILE=$(echo "$VALIDATE_JSON" \
@@ -25,11 +25,10 @@ PROFILE=$(echo "$VALIDATE_JSON" \
 echo "==> Running databricks bundle destroy ${BUNDLE_ARGS[*]}"
 databricks bundle destroy "${BUNDLE_ARGS[@]}"
 
-# Remove the leftover .bundle/<bundle-name> workspace folder.
-# bundle destroy removes the target subfolder (e.g. .bundle/actuarial-workshop/fevm-serverless)
-# but leaves the parent bundle-named directory.
-if [ -n "$BUNDLE_NAME" ] && [ -n "$ROOT_PATH" ]; then
-    BUNDLE_DIR="${ROOT_PATH}/.bundle/${BUNDLE_NAME}"
+# Remove the entire .bundle/<bundle-name> directory (all target subfolders).
+# bundle destroy does not clean up the workspace file sync directories.
+if [ -n "$ROOT_PATH" ]; then
+    BUNDLE_DIR=$(dirname "${ROOT_PATH}")
     echo "==> Removing workspace bundle folder: ${BUNDLE_DIR}"
     PROFILE_ARGS=()
     [ -n "$PROFILE" ] && PROFILE_ARGS=(--profile "$PROFILE")
