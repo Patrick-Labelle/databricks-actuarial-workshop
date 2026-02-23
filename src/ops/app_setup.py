@@ -13,21 +13,24 @@
 # MAGIC | 2 | Create the `{pg_database}` PostgreSQL database inside the Lakebase instance |
 # MAGIC | 3 | Create the `scenario_annotations` table (idempotent) |
 # MAGIC | 4 | Grant `USE CATALOG`, `USE SCHEMA`, and `SELECT` on all workshop tables to the app SP |
+# MAGIC | 5 | Grant `CAN_QUERY` on the model serving endpoint to the app SP |
 
 # COMMAND ----------
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-dbutils.widgets.text("catalog",           "my_catalog",                  "UC Catalog")
-dbutils.widgets.text("schema",            "actuarial_workshop",           "UC Schema")
-dbutils.widgets.text("pg_database",       "actuarial_workshop_db",        "Lakebase DB name")
-dbutils.widgets.text("lakebase_instance", "actuarial-workshop-lakebase",  "Lakebase instance name")
-dbutils.widgets.text("app_sp_client_id",  "",                             "App SP client ID")
+dbutils.widgets.text("catalog",           "my_catalog",                           "UC Catalog")
+dbutils.widgets.text("schema",            "actuarial_workshop",                    "UC Schema")
+dbutils.widgets.text("pg_database",       "actuarial_workshop_db",                 "Lakebase DB name")
+dbutils.widgets.text("lakebase_instance", "actuarial-workshop-lakebase",           "Lakebase instance name")
+dbutils.widgets.text("app_sp_client_id",  "",                                      "App SP client ID")
+dbutils.widgets.text("endpoint_name",     "actuarial-workshop-sarima-forecaster",  "Model Serving endpoint name")
 
 CATALOG           = dbutils.widgets.get("catalog")
 SCHEMA            = dbutils.widgets.get("schema")
 PG_DATABASE       = dbutils.widgets.get("pg_database")
 LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance")
 APP_SP_CLIENT_ID  = dbutils.widgets.get("app_sp_client_id")
+ENDPOINT_NAME     = dbutils.widgets.get("endpoint_name")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 TOKEN = (
@@ -39,6 +42,7 @@ CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 print(f"Workspace:        {WORKSPACE_URL}")
 print(f"Catalog/Schema:   {CATALOG}.{SCHEMA}")
 print(f"Lakebase:         {LAKEBASE_INSTANCE} / {PG_DATABASE}")
+print(f"Endpoint:         {ENDPOINT_NAME}")
 print(f"App SP client ID: {APP_SP_CLIENT_ID or '(not provided)'}")
 print(f"Running as:       {CURRENT_USER}")
 
@@ -180,3 +184,32 @@ for t in tables:
         print(f"  [WARN] {t}: {e}")
 
 print("\nApp setup complete.")
+
+# COMMAND ----------
+
+# ─── 6. Grant CAN_QUERY on the serving endpoint to the app SP ──────────────────
+# The serving endpoint is created by the setup job (Task 6) before this task runs.
+# This grant replaces the bundle-time serving_endpoint resource authorization,
+# which would fail at deploy time since the endpoint doesn't exist until Task 6.
+if not APP_SP_CLIENT_ID:
+    print("[SKIP] No app_sp_client_id — skipping serving endpoint grant.")
+    dbutils.notebook.exit("skipped endpoint grant: no app_sp_client_id")
+
+endpoint_resp = requests.get(
+    f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+)
+assert endpoint_resp.status_code == 200, \
+    f"Could not find endpoint '{ENDPOINT_NAME}': {endpoint_resp.text[:200]}"
+endpoint_id = endpoint_resp.json()["id"]
+
+perms_resp = requests.patch(
+    f"https://{WORKSPACE_URL}/api/2.0/permissions/serving-endpoints/{endpoint_id}",
+    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+    json={"access_control_list": [
+        {"service_principal_name": APP_SP_CLIENT_ID, "permission_level": "CAN_QUERY"},
+    ]},
+)
+assert perms_resp.status_code == 200, \
+    f"Failed to grant CAN_QUERY on endpoint: {perms_resp.text[:200]}"
+print(f"[OK] Granted CAN_QUERY on endpoint '{ENDPOINT_NAME}' to SP: {APP_SP_CLIENT_ID}")

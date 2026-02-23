@@ -121,6 +121,7 @@ resources:
               pg_database: "${var.pg_database}"
               lakebase_instance: "${resources.database_instances.actuarial_workshop_lakebase.name}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
+              endpoint_name: "${var.endpoint_name}"
           environment_key: pg_env
 
       environments:
