@@ -352,6 +352,18 @@ def get_pipeline_id(pipeline_name: str) -> str | None:
     pipelines = resp.json().get("statuses", [])
     return pipelines[0]["pipeline_id"] if pipelines else None
 
+
+def get_job_id(job_name: str) -> int | None:
+    """Find an existing job by exact name. Returns the job_id or None."""
+    resp = requests.get(
+        f"https://{WORKSPACE_URL}/api/2.1/jobs/list",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        params={"name": job_name, "limit": 5},
+    )
+    jobs = resp.json().get("jobs", [])
+    matches = [j for j in jobs if j.get("settings", {}).get("name") == job_name]
+    return matches[0]["job_id"] if matches else None
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -369,58 +381,65 @@ pipeline_id = get_pipeline_id(PIPELINE_NAME)
 # Derive the current user's workspace home for notebook path resolution
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 
-if pipeline_id:
-    job_config = {
-        "name": "Actuarial Workshop — Monthly Model Refresh",
-        "schedule": {
-            "quartz_cron_expression": "0 0 3 1 * ?",   # 3am on the 1st of each month
-            "timezone_id": "America/Toronto",
-            "pause_status": "PAUSED",                   # Unpaused in production
-        },
-        "email_notifications": {
-            "on_failure": [NOTIFICATION_EMAIL] if NOTIFICATION_EMAIL else [],
-        },
-        "tasks": [
-            {
-                "task_key":    "refresh_medallion_pipeline",
-                "description": "Refresh Bronze→Silver→Gold via DLT Apply Changes",
-                "pipeline_task": {
-                    "pipeline_id": pipeline_id,
-                    "full_refresh": False,
-                },
-            },
-            {
-                "task_key":    "fit_sarima_models",
-                "description": "Fit SARIMA/GARCH per segment; log to MLflow",
-                "depends_on":  [{"task_key": "refresh_medallion_pipeline"}],
-                "notebook_task": {
-                    "notebook_path": f"/Users/{_current_user}/actuarial-workshop/04_classical_stats_at_scale",
-                    "base_parameters": {"catalog": CATALOG, "schema": SCHEMA},
-                },
-                "environment_key": "ml_env",
-            },
-        ],
-        "environments": [{
-            "environment_key": "ml_env",
-            "spec": {
-                "client": "4",
-                "dependencies": ["statsmodels>=0.14", "arch>=7.0", "mlflow>=2.14"],
-            },
-        }],
-    }
+JOB_NAME = "Actuarial Workshop — Monthly Model Refresh"
 
-    resp = requests.post(
-        f"https://{WORKSPACE_URL}/api/2.1/jobs/create",
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        json=job_config,
-    )
-    if resp.status_code == 200:
-        job_id = resp.json()["job_id"]
-        print(f"Job created: {job_id}")
-        print(f"https://{WORKSPACE_URL}/jobs/{job_id}")
+if pipeline_id:
+    existing_job_id = get_job_id(JOB_NAME)
+    if existing_job_id:
+        print(f"Job '{JOB_NAME}' already exists (job_id={existing_job_id}) — skipping creation.")
+        print(f"https://{WORKSPACE_URL}/jobs/{existing_job_id}")
     else:
-        print(f"Could not create job (pipeline not running): {resp.text}")
-        print("Tip: Create the DLT pipeline first via Workflows UI, then re-run this cell.")
+        job_config = {
+            "name": JOB_NAME,
+            "schedule": {
+                "quartz_cron_expression": "0 0 3 1 * ?",   # 3am on the 1st of each month
+                "timezone_id": "America/Toronto",
+                "pause_status": "PAUSED",                   # Unpaused in production
+            },
+            "email_notifications": {
+                "on_failure": [NOTIFICATION_EMAIL] if NOTIFICATION_EMAIL else [],
+            },
+            "tasks": [
+                {
+                    "task_key":    "refresh_medallion_pipeline",
+                    "description": "Refresh Bronze→Silver→Gold via DLT Apply Changes",
+                    "pipeline_task": {
+                        "pipeline_id": pipeline_id,
+                        "full_refresh": False,
+                    },
+                },
+                {
+                    "task_key":    "fit_sarima_models",
+                    "description": "Fit SARIMA/GARCH per segment; log to MLflow",
+                    "depends_on":  [{"task_key": "refresh_medallion_pipeline"}],
+                    "notebook_task": {
+                        "notebook_path": f"/Users/{_current_user}/actuarial-workshop/04_classical_stats_at_scale",
+                        "base_parameters": {"catalog": CATALOG, "schema": SCHEMA},
+                    },
+                    "environment_key": "ml_env",
+                },
+            ],
+            "environments": [{
+                "environment_key": "ml_env",
+                "spec": {
+                    "client": "4",
+                    "dependencies": ["statsmodels>=0.14", "arch>=7.0", "mlflow>=2.14"],
+                },
+            }],
+        }
+
+        resp = requests.post(
+            f"https://{WORKSPACE_URL}/api/2.1/jobs/create",
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            json=job_config,
+        )
+        if resp.status_code == 200:
+            job_id = resp.json()["job_id"]
+            print(f"Job created: {job_id}")
+            print(f"https://{WORKSPACE_URL}/jobs/{job_id}")
+        else:
+            print(f"Could not create job: {resp.text}")
+            print("Tip: Create the DLT pipeline first via Workflows UI, then re-run this cell.")
 else:
     print(f"Pipeline '{PIPELINE_NAME}' not found — create it via Workflows UI first.")
     print("Steps:")
