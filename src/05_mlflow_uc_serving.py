@@ -136,19 +136,7 @@ class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
 
         forecast = self.model_fit.get_forecast(steps=horizon)
         mean_fcst = forecast.predicted_mean
-        ci        = forecast.conf_int(alpha=0.05)
-        # Handle both DataFrame and numpy array from statsmodels
-        import numpy as _np
-        if not hasattr(ci, "iloc"):
-            ci = _np.array(ci)
-            class _CIWrapper:
-                def __init__(self, arr): self._arr = arr
-                class _IlocAccessor:
-                    def __init__(self, arr): self._arr = arr
-                    def __getitem__(self, key): return self._arr[key]
-                @property
-                def iloc(self): return self._IlocAccessor(self._arr)
-            ci = _CIWrapper(ci)
+        ci        = forecast.conf_int(alpha=0.05)  # DataFrame in statsmodels >= 0.14
 
         return pd.DataFrame({
             "month_offset":   list(range(1, horizon + 1)),
@@ -170,7 +158,7 @@ class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
 
 # COMMAND ----------
 
-import os, pickle, tempfile, cloudpickle
+import os, pickle, tempfile, cloudpickle, scipy, statsmodels as _statsmodels
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -230,13 +218,7 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
     fc_ci   = fc.conf_int()
     t_fc = range(len(y_train), len(y_train) + 12)
     ax.plot(t_fc, fc_mean, label="Forecast (12m)", color="orange", lw=2)
-    # Handle both DataFrame (older statsmodels) and numpy array (newer statsmodels)
-    import numpy as np
-    if hasattr(fc_ci, "iloc"):
-        ci_lo, ci_hi = fc_ci.iloc[:, 0], fc_ci.iloc[:, 1]
-    else:
-        fc_ci_arr = np.array(fc_ci)
-        ci_lo, ci_hi = fc_ci_arr[:, 0], fc_ci_arr[:, 1]
+    ci_lo, ci_hi = fc_ci.iloc[:, 0], fc_ci.iloc[:, 1]  # DataFrame in statsmodels >= 0.14
     ax.fill_between(t_fc, ci_lo, ci_hi, alpha=0.2, color="orange")
     ax.set_title("SARIMA(1,0,1)(1,1,0,12) — Personal Auto Ontario")
     ax.set_xlabel("Month offset")
@@ -275,9 +257,12 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
             signature=signature,
             registered_model_name=MODEL_NAME,   # Auto-registers to UC
             pip_requirements=[
-                "statsmodels>=0.14",
-                "numpy>=1.24",
-                f"cloudpickle=={cloudpickle.__version__}",  # pin to training version to avoid deserialization hang at serve time
+                # Pin exact training-time versions so the serving env is built from
+                # the package cache without running pip's dependency resolver.
+                f"statsmodels=={_statsmodels.__version__}",
+                f"numpy=={np.__version__}",
+                f"scipy=={scipy.__version__}",
+                f"cloudpickle=={cloudpickle.__version__}",
             ],
         )
 
