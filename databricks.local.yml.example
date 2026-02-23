@@ -1,11 +1,14 @@
 # ─── LOCAL CONFIG TEMPLATE ────────────────────────────────────────────────────
 # 1. Copy this file:  cp databricks.local.yml.example databricks.local.yml
 # 2. Fill in your workspace-specific values below
-# 3. Deploy:          databricks bundle deploy --target my-workspace
+# 3. Deploy:          ./deploy.sh --target my-workspace
+#
+# IMPORTANT: always use ./deploy.sh instead of `databricks bundle deploy` directly.
+# deploy.sh generates app/_bundle_config.py with the resolved catalog/schema/pg_database
+# values before deploying. Skipping it means the app will use hardcoded defaults.
 #
 # This file is auto-merged by the bundle (via the include glob in databricks.yml)
 # and is gitignored to keep sensitive IDs/URLs out of version control.
-# No need to copy it over databricks.yml — just use --target <your-target>.
 
 targets:
   my-workspace:                                                   # ← rename this

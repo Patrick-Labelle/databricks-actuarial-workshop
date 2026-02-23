@@ -9,17 +9,12 @@ resources:
       name: "actuarial-workshop"
       source_code_path: ../app
 
-      # ── Bundle-substituted environment variables ──────────────────────────────
-      # ${var.*} is substituted here (resources/app.yml is a bundle file).
-      # These cannot be set in app/app.yaml because that file is uploaded as-is.
-      config:
-        env:
-          - name: CATALOG
-            value: "${var.catalog}"
-          - name: SCHEMA
-            value: "${var.schema}"
-          - name: PGDATABASE
-            value: "${var.pg_database}"
+      # ── Note on CATALOG / SCHEMA / PGDATABASE ────────────────────────────────
+      # These cannot go in app/app.yaml (uploaded as-is, no ${var.*} substitution)
+      # and the config.env block here is silently ignored by the Apps platform.
+      # Instead, deploy.sh generates app/_bundle_config.py with the resolved values
+      # before each deploy. The app imports _bundle_config.py at startup as a fallback.
+      # Always deploy with ./deploy.sh, not bare `databricks bundle deploy`.
 
       # ── App resource authorizations ──────────────────────────────────────────
       # Each entry grants the app's service principal a specific permission on a

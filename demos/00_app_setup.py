@@ -51,16 +51,33 @@ print(f"Running as:       {CURRENT_USER}")
 import requests, time
 import psycopg2, psycopg2.extensions
 
-# ─── 1. Get Lakebase instance hostname ────────────────────────────────────────
-inst_resp = requests.get(
-    f"https://{WORKSPACE_URL}/api/2.0/database/instances/{LAKEBASE_INSTANCE}",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-)
-inst = inst_resp.json()
-print("Instance state:", inst.get("state"))
-HOST = inst.get("read_write_dns")
+# ─── 1. Get Lakebase instance hostname (wait up to 10 min for AVAILABLE) ──────
+# The Lakebase instance is provisioned by bundle deploy, which runs before this
+# setup job. Provisioning typically completes in 2–5 minutes. We poll with
+# backoff so the job doesn't fail if the instance is still starting up.
+_MAX_WAIT_S = 600   # 10 minutes
+_POLL_S     = 30
+_waited     = 0
+HOST        = None
+
+while _waited <= _MAX_WAIT_S:
+    inst_resp = requests.get(
+        f"https://{WORKSPACE_URL}/api/2.0/database/instances/{LAKEBASE_INSTANCE}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    inst  = inst_resp.json()
+    state = inst.get("state")
+    HOST  = inst.get("read_write_dns")
+    print(f"Instance state: {state} (waited {_waited}s)")
+    if state == "AVAILABLE":
+        break
+    if state not in ("PROVISIONING", "PENDING"):
+        raise RuntimeError(f"Lakebase instance in unexpected state: {state}. Response: {inst}")
+    time.sleep(_POLL_S)
+    _waited += _POLL_S
+
+assert HOST, f"Lakebase instance not AVAILABLE after {_MAX_WAIT_S}s. Last state: {state}"
 print("Host:", HOST)
-assert inst.get("state") == "AVAILABLE", f"Instance not AVAILABLE: {inst.get('state')}"
 
 # ─── 2. Get Lakebase-scoped credential ────────────────────────────────────────
 # The /api/2.0/database/credentials endpoint issues a JWT scoped for PostgreSQL
