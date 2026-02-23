@@ -51,12 +51,29 @@ PG_DATABASE       = dbutils.widgets.get("pg_database")
 LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-TOKEN = (
-    dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-    .apiToken().get()
-)
+import requests, json, mlflow, time, os
 
-import requests, json, mlflow, time
+# Serverless-compatible token acquisition.
+# Method 1: notebook context (classic clusters and most job runs).
+# Method 2: Databricks SDK authenticate() (serverless one-time runs where
+#           the notebook context token is unavailable).
+TOKEN = None
+try:
+    TOKEN = (
+        dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        .apiToken().get()
+    )
+except Exception:
+    TOKEN = None
+
+if not TOKEN:
+    try:
+        from databricks.sdk import WorkspaceClient as _WC
+        _h = {}
+        _WC().config.authenticate(_h)
+        TOKEN = _h.get("Authorization", "").replace("Bearer ", "")
+    except Exception:
+        TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 
 print(f"Workspace: {WORKSPACE_URL}")
 print(f"Target catalog/schema: {CATALOG}.{SCHEMA}")
