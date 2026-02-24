@@ -136,13 +136,13 @@ class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
 
         forecast = self.model_fit.get_forecast(steps=horizon)
         mean_fcst = forecast.predicted_mean
-        ci        = forecast.conf_int(alpha=0.05)  # DataFrame in statsmodels >= 0.14
+        ci        = np.asarray(forecast.conf_int(alpha=0.05))  # numpy or DataFrame depending on statsmodels version
 
         return pd.DataFrame({
             "month_offset":   list(range(1, horizon + 1)),
             "forecast_mean":  list(mean_fcst.round(1)),
-            "forecast_lo95":  list(ci.iloc[:, 0].round(1)),
-            "forecast_hi95":  list(ci.iloc[:, 1].round(1)),
+            "forecast_lo95":  list(np.round(ci[:, 0], 1)),
+            "forecast_hi95":  list(np.round(ci[:, 1], 1)),
         })
 
 # COMMAND ----------
@@ -215,10 +215,10 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
 
     fc = fit.get_forecast(steps=12)
     fc_mean = fc.predicted_mean
-    fc_ci   = fc.conf_int()
+    fc_ci   = np.asarray(fc.conf_int())  # numpy array; statsmodels may return DataFrame or ndarray
     t_fc = range(len(y_train), len(y_train) + 12)
     ax.plot(t_fc, fc_mean, label="Forecast (12m)", color="orange", lw=2)
-    ci_lo, ci_hi = fc_ci.iloc[:, 0], fc_ci.iloc[:, 1]  # DataFrame in statsmodels >= 0.14
+    ci_lo, ci_hi = fc_ci[:, 0], fc_ci[:, 1]
     ax.fill_between(t_fc, ci_lo, ci_hi, alpha=0.2, color="orange")
     ax.set_title("SARIMA(1,0,1)(1,1,0,12) — Personal Auto Ontario")
     ax.set_xlabel("Month offset")

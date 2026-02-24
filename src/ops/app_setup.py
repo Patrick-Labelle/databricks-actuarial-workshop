@@ -73,17 +73,20 @@ while _waited <= _MAX_WAIT_S:
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
     ep = ep_resp.json()
-    state = ep.get("status", {}).get("state", "UNKNOWN")
-    HOST  = ep.get("status", {}).get("host", "")
+    # Autoscaling endpoints use current_state (IDLE / ACTIVE / STARTING / PROVISIONING)
+    state = ep.get("status", {}).get("current_state", "UNKNOWN")
+    # Host is nested under status.hosts.host
+    HOST  = ep.get("status", {}).get("hosts", {}).get("host", "")
     print(f"Endpoint state: {state} (waited {_waited}s)")
-    if state == "READY":
+    # IDLE = scale-to-zero paused but operational; ACTIVE = serving queries
+    if state in ("IDLE", "ACTIVE"):
         break
     if state not in ("PROVISIONING", "STARTING", "PENDING", "UNKNOWN"):
         raise RuntimeError(f"Lakebase endpoint in unexpected state: {state}. Response: {ep}")
     time.sleep(_POLL_S)
     _waited += _POLL_S
 
-assert HOST, f"Lakebase endpoint not READY after {_MAX_WAIT_S}s. Last state: {state}"
+assert HOST, f"Lakebase endpoint not operational after {_MAX_WAIT_S}s. Last state: {state}"
 print("Host:", HOST)
 
 # COMMAND ----------

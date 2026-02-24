@@ -252,7 +252,7 @@ def _get_lakebase_host() -> str:
     try:
         # Endpoint resource path: projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}
         data = w.api_client.do("GET", f"/api/2.0/postgres/{LAKEBASE_ENDPOINT_PATH}")
-        host = data.get("status", {}).get("host", "")
+        host = data.get("status", {}).get("hosts", {}).get("host", "")
         if host:
             _lakebase_host_cache["host"] = host
         return host
