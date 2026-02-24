@@ -52,10 +52,8 @@ print(f"Running as:       {CURRENT_USER}")
 
 # COMMAND ----------
 
-%pip install psycopg2-binary --quiet
-
-# COMMAND ----------
-
+# psycopg2-binary is provided by the pg_env environment spec (resources/jobs.yml).
+# No %pip install needed — the package is pre-installed on the serverless compute.
 import requests, time
 import psycopg2, psycopg2.extensions
 
