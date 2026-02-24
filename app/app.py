@@ -339,11 +339,14 @@ def _ensure_annotations_table():
         # unqualified name would land in the connecting user's personal schema instead.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.scenario_annotations (
-                id          SERIAL      PRIMARY KEY,
-                segment_id  TEXT        NOT NULL,
-                note        TEXT,
-                analyst     TEXT,
-                created_at  TIMESTAMP   DEFAULT NOW()
+                id              SERIAL        PRIMARY KEY,
+                segment_id      TEXT          NOT NULL,
+                note            TEXT,
+                analyst         TEXT,
+                scenario_type   TEXT,
+                adjustment_pct  NUMERIC(5,1),
+                approval_status TEXT          DEFAULT 'Draft',
+                created_at      TIMESTAMP     DEFAULT NOW()
             )
         """)
         conn.commit()
@@ -352,15 +355,36 @@ def _ensure_annotations_table():
     except Exception:
         pass  # Non-fatal — table may already exist or Lakebase may be unavailable
 
-def save_scenario_annotation(segment: str, note: str, analyst: str):
+_SCENARIO_TYPES = [
+    "Assumption Override",
+    "External Event",
+    "Review Comment",
+    "Judgment Adjustment",
+    "Model Calibration",
+]
+
+_APPROVAL_STATUSES = ["Draft", "Pending Review", "Approved"]
+
+def save_scenario_annotation(
+    segment: str,
+    note: str,
+    analyst: str,
+    scenario_type: str = "",
+    adjustment_pct: float | None = None,
+    approval_status: str = "Draft",
+):
     try:
         _ensure_annotations_table()
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO public.scenario_annotations (segment_id, note, analyst, created_at) "
-            "VALUES (%s, %s, %s, NOW())",
-            (segment, note, analyst)
+            "INSERT INTO public.scenario_annotations "
+            "(segment_id, note, analyst, scenario_type, adjustment_pct, approval_status, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+            (segment, note, analyst,
+             scenario_type or None,
+             adjustment_pct,
+             approval_status or "Draft"),
         )
         conn.commit()
         conn.close()
@@ -375,14 +399,18 @@ def load_annotations(segment_id: str):
         conn = get_lakebase_conn()
         cur = conn.cursor()
         cur.execute(
-            "SELECT analyst, note, created_at FROM public.scenario_annotations "
-            "WHERE segment_id = %s ORDER BY created_at DESC LIMIT 10",
+            "SELECT analyst, scenario_type, adjustment_pct, approval_status, note, created_at "
+            "FROM public.scenario_annotations "
+            "WHERE segment_id = %s ORDER BY created_at DESC LIMIT 20",
             (segment_id,)
         )
         rows = cur.fetchall()
         conn.close()
         if rows:
-            return pd.DataFrame(rows, columns=["Analyst", "Note", "Created At"])
+            return pd.DataFrame(
+                rows,
+                columns=["Analyst", "Type", "Adj %", "Status", "Note", "Created At"],
+            )
         return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -417,7 +445,7 @@ pre-computed in the Feature Store for model training.
 |---|---|
 | **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. |
 | **GARCH(1,1)** | Models time-varying volatility in loss ratios. Useful for risk capital estimation when variance is not constant. |
-| **Monte Carlo** | 100,000 correlated lognormal loss scenarios across three lines (Property, Auto, Liability). Produces the full loss distribution for VaR/CVaR. |
+| **Monte Carlo** | 100,000 correlated lognormal scenarios across three lines (Property, Auto, Liability). Parallelised with Ray-on-Spark (100 tasks × 1,000 paths); produces the full loss distribution for VaR/CVaR. |
 """)
 
     st.divider()
@@ -607,16 +635,29 @@ Use the annotation tool below to flag such assumptions.
         # Scenario annotation
         with st.expander("📝 Add Scenario Note"):
             st.caption(
-                "Use this to record assumption overrides, external events, or review comments "
+                "Record assumption overrides, external events, or actuarial judgments "
                 "for this segment. Notes are stored in Lakebase (PostgreSQL) and persist across sessions."
             )
             # Pre-populate analyst name from the forwarded user token if available
             _user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
             _default_analyst = _email_from_token(_user_token) if _user_token else ""
-            analyst = st.text_input("Analyst name:", value=_default_analyst)
-            note    = st.text_area("Assumptions / adjustments:")
+
+            _an_col1, _an_col2 = st.columns(2)
+            with _an_col1:
+                analyst       = st.text_input("Analyst:", value=_default_analyst)
+                scenario_type = st.selectbox("Type:", _SCENARIO_TYPES)
+            with _an_col2:
+                approval_status = st.selectbox("Status:", _APPROVAL_STATUSES)
+                adjustment_pct  = st.number_input(
+                    "Forecast adjustment (%):",
+                    min_value=-50.0, max_value=50.0, value=0.0, step=0.5,
+                    help="Positive = upward revision; negative = downward revision. Enter 0 if no adjustment.",
+                )
+            note = st.text_area("Notes / assumptions:")
             if st.button("Save Note"):
-                if save_scenario_annotation(selected, note, analyst):
+                adj = adjustment_pct if adjustment_pct != 0.0 else None
+                if save_scenario_annotation(selected, note, analyst,
+                                            scenario_type, adj, approval_status):
                     st.success("Note saved to Lakebase")
 
         with st.expander("📋 View Previous Notes"):
@@ -653,6 +694,12 @@ widespread weather event affecting both Property and Auto simultaneously).
   GARCH volatility estimates produced in the modelling pipeline.
 - Correlation matrix is assumed (not estimated), with moderate positive correlation (ρ ≈ 0.3–0.5)
   between lines — conservative for a standard formula approach.
+
+**Distributed execution (Module 4):**
+The simulation is task-parallelised using **Ray-on-Spark**: 100 `@ray.remote` tasks
+each generate 1,000 correlated scenarios, running concurrently on the Spark cluster.
+On serverless runtimes without Ray, an equivalent single-node NumPy fallback produces
+identical results.
 
 **Output:** 100,000 total portfolio loss values. The empirical distribution of these
 values produces the risk metrics shown below.

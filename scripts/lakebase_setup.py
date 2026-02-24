@@ -199,11 +199,14 @@ def main() -> None:
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.scenario_annotations (
-            id          SERIAL      PRIMARY KEY,
-            segment_id  TEXT        NOT NULL,
-            note        TEXT,
-            analyst     TEXT,
-            created_at  TIMESTAMP   DEFAULT NOW()
+            id              SERIAL        PRIMARY KEY,
+            segment_id      TEXT          NOT NULL,
+            note            TEXT,
+            analyst         TEXT,
+            scenario_type   TEXT,
+            adjustment_pct  NUMERIC(5,1),
+            approval_status TEXT          DEFAULT 'Draft',
+            created_at      TIMESTAMP     DEFAULT NOW()
         )
     """)
     conn.commit()
