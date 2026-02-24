@@ -59,7 +59,6 @@ targets:
             # Override task 5 to use the classic ML cluster instead of serverless,
             # and enable Ray (run_ray: "auto") and applyInPandas (job_mode: "false").
             - task_key: fit_statistical_models
-              environment_key: null   # remove serverless env — cluster is provided by job_cluster_key
               job_cluster_key: ray_ml_cluster
               notebook_task:
                 base_parameters:

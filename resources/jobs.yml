@@ -80,6 +80,10 @@ resources:
         # applyInPandas. On Serverless, %pip install only reaches the notebook kernel (client),
         # not the remote compute (server) where applyInPandas UDFs execute. Driver-side fitting
         # produces identical outputs and works reliably on all Serverless runtimes.
+        #
+        # No environment_key: the notebook handles its own %pip install for job_mode=true.
+        # Classic-cluster targets (e2-demo-ray) add job_cluster_key via target override;
+        # environment_key cannot coexist with job_cluster_key on classic compute.
         - task_key: fit_statistical_models
           description: "SARIMA per segment, GARCH volatility, Monte Carlo simulation"
           depends_on:
@@ -91,7 +95,6 @@ resources:
               schema: "${var.schema}"
               run_ray: "skip"
               job_mode: "true"
-          environment_key: ml_env
 
         # Task 6 — Register model + create serving endpoint (Module 5)
         - task_key: register_and_serve_model
