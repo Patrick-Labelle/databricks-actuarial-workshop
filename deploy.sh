@@ -90,9 +90,48 @@ if [ -n "$PROFILE" ]; then
     PROFILE_ARGS=(--profile "$PROFILE")
 fi
 
+WORKSPACE_HOST=$(echo "$VALIDATE_JSON" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('host',''))")
+
 # ── Step 2: bundle deploy ─────────────────────────────────────────────────────
 echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
 databricks bundle deploy "${BUNDLE_ARGS[@]}"
+
+# ── Step 2.5: Lakebase database setup (runs locally using CLI OAuth JWT) ──────
+# Lakebase Autoscaling endpoints require standard OAuth JWTs for authentication.
+# Internal Databricks cluster tokens (apiToken(), DATABRICKS_TOKEN on job compute)
+# are opaque credentials rejected by Lakebase's databricks_auth extension.
+# The local CLI provides a proper OAuth JWT, so we run setup here instead of
+# from within the notebook.
+if python3 -c "import psycopg2" 2>/dev/null; then
+    # Get app SP client ID from the deployed app resource
+    SP_CLIENT_ID=""
+    if [ -n "$APP_NAME" ]; then
+        SP_CLIENT_ID=$(databricks api get "/api/2.0/apps/${APP_NAME}" \
+            "${PROFILE_ARGS[@]}" 2>/dev/null \
+            | python3 -c "
+import sys, json
+lines = sys.stdin.read().split('\n')
+j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
+if j is not None:
+    d = json.loads('\n'.join(lines[j:]))
+    print(d.get('service_principal_client_id', ''))
+" 2>/dev/null || echo "")
+    fi
+
+    echo "==> Setting up Lakebase database (using local OAuth JWT)..."
+    echo "    App SP client ID: ${SP_CLIENT_ID:-(not found)}"
+    python3 "${SCRIPT_DIR}/scripts/lakebase_setup.py" \
+        --workspace-host "${WORKSPACE_HOST}" \
+        --endpoint-path  "${LAKEBASE_ENDPOINT_PATH}" \
+        --pg-database    "${PG_DATABASE}" \
+        --app-sp-client-id "${SP_CLIENT_ID}" \
+        ${PROFILE:+--profile "$PROFILE"}
+else
+    echo "WARNING: psycopg2-binary not installed — skipping Lakebase setup."
+    echo "         Install with: pip install psycopg2-binary"
+    echo "         Then re-run deploy.sh to complete Lakebase setup."
+fi
 
 # ── Step 3: start app compute if needed ──────────────────────────────────────
 # When bundle creates a fresh app it leaves compute STOPPED and queues an
