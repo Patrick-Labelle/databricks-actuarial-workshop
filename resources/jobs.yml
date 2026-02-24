@@ -112,6 +112,11 @@ resources:
         # Task 7 — App setup: Lakebase DB + table + UC grants to app SP
         # Runs after the serving endpoint exists so that app_sp_client_id is available
         # and all tables that need SELECT grants are already present.
+        #
+        # No environment_key here — targets override this task with either:
+        #   • environment_key: pg_env   (serverless targets; requires classic cluster for
+        #                                Lakebase auth — apiToken PAT, not OAuth token)
+        #   • job_cluster_key + libraries (classic cluster targets such as e2-demo-ray)
         - task_key: setup_app_dependencies
           description: "Create Lakebase DB, scenario_annotations table, and grant UC permissions to app SP"
           depends_on:
@@ -125,7 +130,6 @@ resources:
               lakebase_endpoint_path: "${resources.postgres_endpoints.actuarial_workshop_endpoint.id}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
               endpoint_name: "${var.endpoint_name}"
-          environment_key: pg_env
 
       environments:
         - environment_key: default_env

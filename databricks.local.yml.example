@@ -22,6 +22,15 @@ targets:
       warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
       pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional
+    resources:
+      jobs:
+        actuarial_workshop_setup:
+          tasks:
+            # Task 7 must run with pg_env so psycopg2-binary is available.
+            # environment_key is removed from the base job definition so that
+            # classic-cluster targets can use job_cluster_key instead.
+            - task_key: setup_app_dependencies
+              environment_key: pg_env
 
   # ── Optional: Ray-enabled variant (classic ML cluster for Module 4) ──────────
   # Identical to my-workspace above, except Task 5 (fit_statistical_models) runs
@@ -64,3 +73,13 @@ targets:
                 base_parameters:
                   run_ray: "auto"    # Ray-on-Spark works on classic ML clusters
                   job_mode: "false"  # use applyInPandas (works on classic cluster)
+
+            # Override task 7 to use the same classic ML cluster so that
+            # apiToken().get() returns a PAT accepted by Lakebase's databricks_auth
+            # extension. Serverless DATABRICKS_TOKEN (OAuth) is rejected by Lakebase.
+            # The cluster stays warm from task 5 through task 7 (no extra spin-up).
+            - task_key: setup_app_dependencies
+              job_cluster_key: ray_ml_cluster
+              libraries:
+                - pypi:
+                    package: psycopg2-binary
