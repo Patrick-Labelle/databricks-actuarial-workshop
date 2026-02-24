@@ -39,31 +39,38 @@ ENDPOINT_NAME         = dbutils.widgets.get("endpoint_name")
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os, sys
 
-# Serverless-compatible token acquisition.
-# Try DATABRICKS_TOKEN env var first — set automatically on all serverless
-# compute, and avoids apiToken().get() which can block indefinitely on
-# serverless one-time runs.  Fall back to the notebook context for classic
-# clusters where the env var is not present.
-TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
-if not TOKEN:
+# Token acquisition — preference order:
+# 1. DATABRICKS_TOKEN env var (OAuth JWT on serverless; may also be set on classic)
+# 2. apiToken() from notebook context (PAT or ephemeral token on classic clusters)
+#    Note: apiToken().get() can hang for ~60s on serverless one-time runs, so
+#    we only fall back to it when DATABRICKS_TOKEN is not set.
+_env_token    = os.environ.get("DATABRICKS_TOKEN", "")
+_ctx_token    = ""
+_token_source = "unset"
+
+if _env_token:
+    TOKEN        = _env_token
+    _token_source = "env-var"
+else:
     try:
-        TOKEN = (
+        _ctx_token = (
             dbutils.notebook.entry_point.getDbutils().notebook().getContext()
             .apiToken().get()
         )
     except Exception:
-        TOKEN = ""
+        _ctx_token = ""
+    TOKEN        = _ctx_token
+    _token_source = "apiToken" if _ctx_token else "NONE"
 
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
-import sys
 print(f"Workspace:        {WORKSPACE_URL}", flush=True)
 print(f"Catalog/Schema:   {CATALOG}.{SCHEMA}", flush=True)
 print(f"Lakebase path:    {LAKEBASE_ENDPOINT_PATH} / {PG_DATABASE}", flush=True)
 print(f"Endpoint:         {ENDPOINT_NAME}", flush=True)
 print(f"App SP client ID: {APP_SP_CLIENT_ID or '(not provided)'}", flush=True)
 print(f"Running as:       {CURRENT_USER}", flush=True)
-print(f"Token source:     {'notebook-context' if TOKEN else 'MISSING'} ({len(TOKEN)} chars)", flush=True)
+print(f"Token source:     {_token_source}, len={len(TOKEN)}, prefix={TOKEN[:4] if TOKEN else 'N/A'}", flush=True)
 
 # COMMAND ----------
 
