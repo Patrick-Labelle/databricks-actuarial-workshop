@@ -40,11 +40,21 @@ WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os, sys
 
 # Serverless-compatible token acquisition.
-# Try DATABRICKS_TOKEN env var first — set automatically on all serverless
-# compute, and avoids apiToken().get() which can block indefinitely on
-# serverless one-time runs.  Fall back to the notebook context for classic
-# clusters where the env var is not present.
-TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+# Use mlflow's databricks_utils which returns the correct token type (PAT or
+# OAuth) across all Databricks compute: interactive notebooks, classic job
+# clusters, and serverless.  Fall back to the DATABRICKS_TOKEN env var
+# (set automatically on serverless) and finally the notebook context.
+TOKEN = ""
+try:
+    from mlflow.utils.databricks_utils import get_databricks_host_creds
+    _creds = get_databricks_host_creds()
+    TOKEN = _creds.token or ""
+except Exception:
+    pass
+
+if not TOKEN:
+    TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+
 if not TOKEN:
     try:
         TOKEN = (
