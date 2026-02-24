@@ -183,20 +183,26 @@ def main() -> None:
     print("    [OK] Extension 'databricks_auth' enabled.")
 
     if args.app_sp_client_id:
-        cur.execute(
-            "SELECT databricks_create_role(%s, %s)",
-            (args.app_sp_client_id, "service_principal"),
-        )
-        conn.commit()
-        print(f"    [OK] Postgres role created for SP: {args.app_sp_client_id}")
+        # Create the Postgres role only if it doesn't already exist.
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (args.app_sp_client_id,))
+        if cur.fetchone():
+            print(f"    [OK] Postgres role already exists for SP: {args.app_sp_client_id}")
+        else:
+            cur.execute(
+                "SELECT databricks_create_role(%s, %s)",
+                (args.app_sp_client_id, "service_principal"),
+            )
+            conn.commit()
+            print(f"    [OK] Postgres role created for SP: {args.app_sp_client_id}")
 
-        # Grant CONNECT now that the role exists.
+        # Grant CONNECT now that the role exists (GRANT is idempotent).
         cur.execute(
             f'GRANT CONNECT ON DATABASE "{args.pg_database}" TO "{args.app_sp_client_id}"'
         )
         conn.commit()
         print(f"    [OK] Granted CONNECT on '{args.pg_database}' to SP: {args.app_sp_client_id}")
 
+    # Create table if it doesn't exist, then add any new columns (idempotent upgrades).
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.scenario_annotations (
             id              SERIAL        PRIMARY KEY,
@@ -209,6 +215,13 @@ def main() -> None:
             created_at      TIMESTAMP     DEFAULT NOW()
         )
     """)
+    # Ensure new columns exist on pre-existing tables (no-op if already present).
+    for col_ddl in [
+        "ADD COLUMN IF NOT EXISTS scenario_type   TEXT",
+        "ADD COLUMN IF NOT EXISTS adjustment_pct  NUMERIC(5,1)",
+        "ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'Draft'",
+    ]:
+        cur.execute(f"ALTER TABLE public.scenario_annotations {col_ddl}")
     conn.commit()
     print("    [OK] Table 'public.scenario_annotations' ensured.")
 
