@@ -110,6 +110,8 @@ def main() -> None:
                         help="App service principal client ID (UUID)")
     parser.add_argument("--profile", default="",
                         help="Databricks CLI profile name")
+    parser.add_argument("--output-host-file", default="",
+                        help="If set, write the resolved Lakebase hostname to this file (for deploy.sh)")
     args = parser.parse_args()
 
     workspace_host = args.workspace_host.rstrip("/")
@@ -146,6 +148,9 @@ def main() -> None:
     if not host:
         raise RuntimeError(f"Lakebase endpoint not ready after {max_wait_s}s.")
     print(f"    Host:  {host}")
+    if args.output_host_file:
+        with open(args.output_host_file, "w") as fh:
+            fh.write(host)
 
     # ── 2–3. Connect to admin DB and create workshop DB ──────────────────────
     print(f"==> Connecting to databricks_postgres ...")

@@ -168,7 +168,14 @@ _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 # require the parent to pre-exist (fails on fresh workspaces).
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster")
 
+# Dataset reference for UC lineage — connects this model to its source table
+_claims_dataset = mlflow.data.load_delta(
+    table_name=f"{CATALOG}.{SCHEMA}.claims_time_series",
+    name="claims_time_series",
+)
+
 with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
+    mlflow.log_input(_claims_dataset, context="training")
 
     # ── Fit model ────────────────────────────────────────────────────────────
     model = SARIMAX(

@@ -96,7 +96,7 @@ resources:
               run_ray: "skip"
               job_mode: "true"
 
-        # Task 6 — Register model + create serving endpoint (Module 5)
+        # Task 6a — Register SARIMA model + create serving endpoint (Module 5)
         - task_key: register_and_serve_model
           description: "MLflow PyFunc, UC Model Registry @Champion, Model Serving endpoint"
           depends_on:
@@ -109,18 +109,33 @@ resources:
               endpoint_name: "${var.endpoint_name}"
           environment_key: ml_env
 
-        # Task 7 — App setup: UC grants + model serving endpoint grant
-        # Runs after the serving endpoint exists so that app_sp_client_id is available
-        # and all tables that need SELECT grants are already present.
+        # Task 6b — Register Monte Carlo model + create CPU serving endpoint (Module 6)
+        # Runs in parallel with task 6a: both depend on fit_statistical_models.
+        # CPU endpoint is sufficient — scipy t-CDF is not GPU-accelerated.
+        - task_key: register_monte_carlo_endpoint
+          description: "t-Copula PyFunc, UC Model Registry @Champion, CPU Monte Carlo endpoint"
+          depends_on:
+            - task_key: fit_statistical_models
+          notebook_task:
+            notebook_path: ../src/06_monte_carlo_serving.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              mc_endpoint_name: "${var.mc_endpoint_name}"
+          environment_key: ml_env
+
+        # Task 7 — App setup: UC grants + model serving endpoint grants
+        # Runs after both serving endpoints exist so that CAN_QUERY can be granted.
         #
         # Lakebase PostgreSQL setup (create DB, extension, SP role, table, grants)
         # is handled by scripts/lakebase_setup.py running locally from deploy.sh,
         # using the CLI's OAuth JWT. Internal cluster tokens cannot authenticate
         # with Lakebase Autoscaling's databricks_auth extension.
         - task_key: setup_app_dependencies
-          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on serving endpoint"
+          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on both serving endpoints"
           depends_on:
             - task_key: register_and_serve_model
+            - task_key: register_monte_carlo_endpoint
           notebook_task:
             notebook_path: ../src/ops/app_setup.py
             base_parameters:
@@ -128,6 +143,7 @@ resources:
               schema: "${var.schema}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
               endpoint_name: "${var.endpoint_name}"
+              mc_endpoint_name: "${var.mc_endpoint_name}"
           environment_key: default_env
 
       environments:

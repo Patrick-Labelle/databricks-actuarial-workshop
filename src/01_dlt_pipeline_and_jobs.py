@@ -97,7 +97,7 @@ else:
 # ── Helper: generate synthetic policy CDC data ────────────────────────────────
 # Run this cell OUTSIDE the DLT pipeline to seed the landing zone with data
 
-def generate_bronze_cdc_data(spark, catalog: str, schema: str, n_policies: int = 500):
+def generate_bronze_cdc_data(spark, catalog: str, schema: str, n_policies: int = 5000):
     """
     Generate synthetic insurance policy CDC records and write to a Delta table
     that acts as the Bronze source for the DLT pipeline.

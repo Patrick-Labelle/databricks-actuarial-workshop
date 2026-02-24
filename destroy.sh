@@ -198,8 +198,11 @@ api_delete "UC model ${MODEL_NAME}" \
 # and a note about manual cleanup is printed at the end.
 echo ""
 echo "    Deleting Lakebase project actuarial-workshop-lakebase..."
+# Use `|| _LAKEBASE_DELETED=$?` so that set -e does NOT abort the script when
+# the Python block exits non-zero (protected branch case). Without `||`, bash
+# exits immediately on the non-zero exit code before the capture assignment runs.
 _LAKEBASE_DELETED=0
-python3 - <<PYEOF
+python3 - <<PYEOF || _LAKEBASE_DELETED=$?
 import urllib.request, urllib.error, json, time, sys
 
 host    = "${WORKSPACE_HOST}"
@@ -221,10 +224,15 @@ def req(method, path, body=None):
 
 PROJECT = "actuarial-workshop-lakebase"
 
-# Try deleting the project (cascades to branches and endpoints).
-# Retry a few times in case endpoint reconciliation is in progress (HTTP 409).
+# Delete the project (cascades to branches and endpoints).
+# The branch is created without is_protected (defaults to false) so standard
+# project deletion works. If a previous deploy used is_protected=true, the
+# project delete returns HTTP 400; in that case we print a warning and let
+# bundle destroy handle cleanup via the Terraform provider.
+# Retry for HTTP 409 (endpoint reconciliation in progress from a previous
+# operation — can take several minutes to settle).
 deleted = False
-for attempt in range(4):
+for attempt in range(8):
     status, data = req("DELETE", f"/api/2.0/postgres/projects/{PROJECT}")
     if status in (200, 202, 204):
         print("    [OK]       Lakebase project deleted (async deletion may continue in background)")
@@ -235,20 +243,18 @@ for attempt in range(4):
         deleted = True
         break
     elif status == 409:
-        wait = 15 * (attempt + 1)
+        wait = 20 * (attempt + 1)
         print(f"    [WAIT]     Endpoint reconciliation in progress, retrying in {wait}s...")
         time.sleep(wait)
     elif status == 400 and "protected" in data.get("message", ""):
-        # Branch is is_protected=true — the REST API cannot unprotect it.
-        # bundle destroy (via the Terraform provider) handles protected branches
-        # correctly during its own destroy lifecycle; allow it to proceed.
-        print("    [WARN]     Protected branch detected — bundle destroy will handle Lakebase cleanup",
-              file=sys.stderr)
-        print("    [WARN]     If bundle destroy also fails, delete the project manually in the workspace UI",
+        # Branch has is_protected=true from a previous deploy — bundle destroy
+        # will handle the cleanup via the Terraform provider.
+        print("    [WARN]     Protected branch — bundle destroy will handle Lakebase cleanup",
               file=sys.stderr)
         break
     else:
-        print(f"    [WARN]     Lakebase project delete returned HTTP {status}: {data}", file=sys.stderr)
+        print(f"    [WARN]     Lakebase project delete returned HTTP {status}: {data.get('message', data)}",
+              file=sys.stderr)
         break
 
 if not deleted:
@@ -302,7 +308,7 @@ echo ""
 # ── Step 3: bundle destroy ────────────────────────────────────────────────────
 echo "==> Running databricks bundle destroy ${BUNDLE_ARGS[*]}"
 _BUNDLE_EXIT=0
-databricks bundle destroy "${BUNDLE_ARGS[@]}" || _BUNDLE_EXIT=$?
+databricks bundle destroy --auto-approve "${BUNDLE_ARGS[@]}" || _BUNDLE_EXIT=$?
 if [ "$_BUNDLE_EXIT" -ne 0 ] && [ "$_LAKEBASE_DELETED" -ne 0 ]; then
     # bundle destroy failed AND Lakebase was not pre-deleted (protected branch).
     # The failure is expected for the Lakebase endpoint. All other resources

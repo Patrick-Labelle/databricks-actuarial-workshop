@@ -24,7 +24,6 @@ resources:
       parent: ${resources.postgres_projects.actuarial_workshop_lakebase.id}
       branch_id: main
       no_expiry: true
-      is_protected: true
 
   postgres_endpoints:
     actuarial_workshop_endpoint:

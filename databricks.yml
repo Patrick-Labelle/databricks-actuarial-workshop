@@ -14,6 +14,10 @@ variables:
     description: "Name for the SARIMA Model Serving endpoint"
     default: actuarial-workshop-sarima-forecaster
 
+  mc_endpoint_name:
+    description: "Name for the Monte Carlo portfolio risk serving endpoint"
+    default: actuarial-workshop-monte-carlo
+
   warehouse_id:
     description: "SQL Warehouse ID for the Statement Execution API (used by the app)"
     default: ""

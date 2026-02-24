@@ -101,24 +101,40 @@ The setup job runs the following modules in sequence:
 
 ---
 
-## Ray-Enabled Deployment (Module 4 on classic ML cluster)
+## Ray-Enabled Deployment (Module 4 on GPU ML cluster)
 
-Module 4 (`04_classical_stats_at_scale.py`) includes optional Ray-on-Spark code that requires
-a classic ML runtime cluster. By default, the setup job skips the Ray section (`run_ray: "skip"`)
-so the full pipeline runs on serverless. If you want to demonstrate Ray, use the Ray-enabled variant:
+Module 4 (`04_classical_stats_at_scale.py`) includes Ray-on-Spark code for GPU-accelerated
+Monte Carlo simulation. By default, the setup job skips the Ray section (`run_ray: "skip"`)
+so the full pipeline runs on serverless. To demonstrate Ray + GPU, use the Ray-enabled variant:
 
 ```bash
-./deploy-ray.sh        # deploys to e2-demo-ray target (~25-30 min, allows ~5-10 min for cluster spin-up)
+./deploy-ray.sh        # deploys to e2-demo-ray target (~30 min, includes ~5-10 min cluster spin-up)
 ./destroy-ray.sh       # full teardown for the e2-demo-ray deployment
 ```
 
 `deploy-ray.sh` and `destroy-ray.sh` are thin wrappers around `deploy.sh` / `destroy.sh` that pass
 `--target e2-demo-ray`. The `e2-demo-ray` target (defined in `databricks.local.yml`) inherits all
 workspace settings from `e2-demo` and adds one override: Task 5 (`fit_statistical_models`) is moved
-from serverless to a classic DBR 17.4 ML job cluster, and `run_ray: "auto"` + `job_mode: "false"`
-are passed to the notebook so the full Ray and `applyInPandas` paths execute.
+from serverless to a **DBR 17.3-gpu-ml** job cluster (2 × `g4dn.2xlarge`, NVIDIA Tesla T4),
+and `run_ray: "auto"` + `job_mode: "false"` are passed to the notebook.
 
-> **Note:** Classic ML clusters are not available on serverless-only workspaces (e.g. FEVM).
+### GPU Monte Carlo (t-Copula, hybrid CPU/GPU)
+
+Module 4 uses Ray-on-Spark with PyTorch for GPU-accelerated Monte Carlo:
+- **4 tasks × 1M scenarios = 4M total paths** on two T4 GPUs
+- **t-Copula (df=4)** captures tail dependence between Property, Auto, and Liability lines
+- **Hybrid path:** correlated sampling, chi² mixing, and lognormal inverse CDF on GPU (torch);
+  t-CDF (`betainc`) on CPU via scipy (absent from PyTorch's stable API in 2.7.x)
+- Ray workers use `num_gpus=0.25` fractional allocation: 4 concurrent tasks per T4 = full utilization
+
+### Ray CPU Reservation
+
+`setup_ray_cluster` is called with `num_cpus_worker_node=6` (not 8) to leave 2 vCPUs per worker
+free for Spark. Without this, Ray occupies all task slots and subsequent `saveAsTable` calls stall
+at "0 tasks started". After Monte Carlo completes, `shutdown_ray_cluster()` is called before the
+Spark write to release all resources immediately.
+
+> **Note:** Classic/GPU ML clusters are not available on serverless-only workspaces (e.g. FEVM).
 > The Ray variant targets the `e2-demo-field-eng` workspace.
 
 ---
@@ -129,7 +145,7 @@ are passed to the notebook so the full Ray and `applyInPandas` paths execute.
 |--------|-----------|-------|
 | `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
 | _(your target)_ | Defined in `databricks.local.yml` | gitignored; auto-merged by bundle |
-| `e2-demo-ray` | e2-demo-field-eng | Same as e2-demo + Task 5 on classic DBR 17.4 ML cluster (Ray enabled) |
+| `e2-demo-ray` | e2-demo-field-eng | Same as e2-demo + Task 5 on DBR 17.3-gpu-ml cluster (2×g4dn.2xlarge, Tesla T4, Ray+GPU) |
 
 The bundle's `include:` glob (`databricks.local*.yml`) automatically merges your
 local target definitions when present, and silently skips if the file is absent.
@@ -184,7 +200,7 @@ permissions), then deploys the app source code last so it starts with full permi
 | 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API |
 | 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
 | 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
-| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, Monte Carlo, MLflow |
+| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, t-Copula Monte Carlo, Ray+GPU, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |

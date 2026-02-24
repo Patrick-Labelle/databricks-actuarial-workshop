@@ -86,18 +86,26 @@ try:
         PG_DATABASE as _BC_PG,
         ENDPOINT_NAME as _BC_ENDPOINT,
         LAKEBASE_ENDPOINT_PATH as _BC_LAKEBASE_PATH,
+        LAKEBASE_HOST as _BC_LAKEBASE_HOST,
     )
+    try:
+        from _bundle_config import MC_ENDPOINT_NAME as _BC_MC_ENDPOINT
+    except ImportError:
+        _BC_MC_ENDPOINT = "actuarial-workshop-monte-carlo"
 except ImportError:
     _BC_CATALOG = "my_catalog"
     _BC_SCHEMA = "actuarial_workshop"
     _BC_PG = "actuarial_workshop_db"
     _BC_ENDPOINT = "actuarial-workshop-sarima-forecaster"
+    _BC_MC_ENDPOINT = "actuarial-workshop-monte-carlo"
     _BC_LAKEBASE_PATH = "projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
+    _BC_LAKEBASE_HOST = ""
 
 CATALOG                = os.environ.get("CATALOG") or _BC_CATALOG
 SCHEMA                 = os.environ.get("SCHEMA") or _BC_SCHEMA
 PG_DATABASE_DEFAULT    = _BC_PG
 ENDPOINT_NAME          = os.environ.get("ENDPOINT_NAME") or _BC_ENDPOINT
+MC_ENDPOINT_NAME       = os.environ.get("MC_ENDPOINT_NAME") or _BC_MC_ENDPOINT
 LAKEBASE_ENDPOINT_PATH = os.environ.get("LAKEBASE_ENDPOINT_PATH") or _BC_LAKEBASE_PATH
 
 if _auth_init_error is not None:
@@ -204,7 +212,7 @@ def load_segment_stats(segment_id: str):
     """)
 
 def call_serving_endpoint(horizon: int) -> pd.DataFrame:
-    """Call Model Serving endpoint via Databricks SDK."""
+    """Call SARIMA Model Serving endpoint via Databricks SDK."""
     w = _get_workspace_client()
     if w is None:
         st.error(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
@@ -222,6 +230,29 @@ def call_serving_endpoint(horizon: int) -> pd.DataFrame:
         st.warning(f"Endpoint unavailable: {exc}")
         return pd.DataFrame()
 
+def call_monte_carlo_endpoint(scenario: dict) -> dict | None:
+    """Call the Monte Carlo serving endpoint with a scenario parameter dict.
+
+    Returns a dict of risk metrics or None on error.
+    """
+    w = _get_workspace_client()
+    if w is None:
+        st.error(f"Databricks SDK unavailable: {_auth_init_error or 'unknown error'}")
+        return None
+    try:
+        response = w.serving_endpoints.query(
+            name=MC_ENDPOINT_NAME,
+            dataframe_records=[scenario],
+        )
+        predictions = response.predictions
+        if predictions:
+            p = predictions[0] if isinstance(predictions, list) else predictions
+            return {k: float(v) if k != "copula" else v for k, v in p.items()}
+        return None
+    except Exception as exc:
+        st.warning(f"Monte Carlo endpoint unavailable: {exc}")
+        return None
+
 # ─── Lakebase: Scenario annotations ──────────────────────────────────────────
 
 def _email_from_token(token: str) -> str:
@@ -234,37 +265,23 @@ def _email_from_token(token: str) -> str:
     except Exception:
         return ""
 
-_lakebase_host_cache: dict = {"host": None}
 _lakebase_cred_cache: dict = {"token": None, "expires_at": 0.0}
 
 def _get_lakebase_host() -> str:
-    """Resolve the Lakebase autoscaling endpoint hostname via the Databricks SDK.
+    """Return the Lakebase endpoint hostname.
 
-    The hostname (ep-xxx.databricks.com) is dynamically assigned when the endpoint
-    is provisioned, so it cannot be hardcoded. We query it once per process and
-    cache it — the hostname does not change for the lifetime of an endpoint.
+    PGHOST env var takes precedence (can be overridden at runtime).
+    Falls back to LAKEBASE_HOST from _bundle_config.py, which is written by
+    deploy.sh after lakebase_setup.py resolves and confirms the hostname.
     """
-    if _lakebase_host_cache["host"]:
-        return _lakebase_host_cache["host"]
-    w = _get_workspace_client()
-    if w is None:
-        return ""
-    try:
-        # Endpoint resource path: projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}
-        data = w.api_client.do("GET", f"/api/2.0/postgres/{LAKEBASE_ENDPOINT_PATH}")
-        host = data.get("status", {}).get("hosts", {}).get("host", "")
-        if host:
-            _lakebase_host_cache["host"] = host
-        return host
-    except Exception:
-        return ""
+    return os.environ.get("PGHOST") or _BC_LAKEBASE_HOST
 
 def _get_lakebase_credential() -> tuple:
     """Return (client_id, token) for the app SP via generate_database_credential.
 
-    Lakebase Autoscaling authenticates via Databricks OAuth — the credential token
-    is used directly as the Postgres password. Credentials have a short TTL and
-    are cached until 60 s before expiry.
+    Uses w.postgres.generate_database_credential() (Databricks SDK >= 0.81.0).
+    The token is used as the Postgres password — Lakebase Autoscaling validates it
+    via the databricks_auth extension. Credentials are cached until 60 s before expiry.
 
     DATABRICKS_CLIENT_ID is injected at runtime by the Databricks Apps platform.
     """
@@ -278,18 +295,26 @@ def _get_lakebase_credential() -> tuple:
     if w is None:
         return client_id, None
     try:
-        cred = w.api_client.do(
-            "POST",
-            "/api/2.0/postgres/generateDatabaseCredential",
-            body={"endpoint": LAKEBASE_ENDPOINT_PATH},
-        )
-        token = cred.get("token", "")
-        # Credentials typically expire in 1 hour; cache conservatively
-        _lakebase_cred_cache["token"] = token
-        _lakebase_cred_cache["expires_at"] = now + 3300  # 55 min
-        return client_id, token
+        # SDK >= 0.81.0: w.postgres.generate_database_credential(endpoint=<resource_path>)
+        cred = w.postgres.generate_database_credential(endpoint=LAKEBASE_ENDPOINT_PATH)
+        token = cred.token
+    except AttributeError:
+        # Fallback: low-level API call (older SDK versions without w.postgres)
+        try:
+            cred = w.api_client.do(
+                "POST",
+                "/api/2.0/postgres/generateDatabaseCredential",
+                body={"endpoint": LAKEBASE_ENDPOINT_PATH},
+            )
+            token = cred.get("token", "") if isinstance(cred, dict) else ""
+        except Exception:
+            return client_id, None
     except Exception:
         return client_id, None
+    # Credentials typically expire in 1 hour; cache conservatively
+    _lakebase_cred_cache["token"] = token
+    _lakebase_cred_cache["expires_at"] = now + 3300  # 55 min
+    return client_id, token
 
 
 def get_lakebase_conn():
@@ -311,7 +336,11 @@ def get_lakebase_conn():
 
     host = _get_lakebase_host()
     if not host:
-        raise RuntimeError("Could not resolve Lakebase endpoint hostname — is the endpoint provisioned?")
+        raise RuntimeError(
+            "Lakebase hostname not configured. "
+            "Re-run deploy.sh to regenerate app/_bundle_config.py with LAKEBASE_HOST, "
+            "or set the PGHOST environment variable."
+        )
 
     sp_user, sp_token = _get_lakebase_credential()
     if not sp_token:
@@ -422,16 +451,16 @@ with st.sidebar:
 
     st.markdown("**Source Data**")
     st.markdown("""
-Synthetic insurance claims time series across **20 segments**
-(product line × Canadian province):
+Synthetic insurance claims time series across **52 segments**
+(product line × Canadian province/territory):
 
 | Dimension | Values |
 |---|---|
-| Product lines | Commercial Auto, Commercial Property, Personal Auto, Liability |
-| Provinces | Alberta, Atlantic, BC, Ontario, Quebec |
+| Product lines | Commercial Auto, Commercial Property, Personal Auto, Homeowners |
+| Provinces/Territories | Ontario, Quebec, BC, Alberta, Atlantic, Manitoba, Saskatchewan, Nova Scotia, New Brunswick, Newfoundland, PEI, NWT, Yukon |
 | History | Jan 2019 – Dec 2024 |
 | Granularity | Monthly claims counts |
-| Observations | ~72 months × 20 segments = 1,440 rows |
+| Observations | 72 months × 52 segments = 3,744 rows |
 
 Each row records the monthly **claims count** for one segment.
 Rolling features (3/6/12-month means and volatility) are
@@ -443,9 +472,9 @@ pre-computed in the Feature Store for model training.
     st.markdown("""
 | Model | What it does |
 |---|---|
-| **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. |
+| **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. Served via REST endpoint (On-Demand Forecast tab). |
 | **GARCH(1,1)** | Models time-varying volatility in loss ratios. Useful for risk capital estimation when variance is not constant. |
-| **Monte Carlo** | 100,000 correlated lognormal scenarios across three lines (Property, Auto, Liability). Parallelised with Ray-on-Spark (100 tasks × 1,000 paths); produces the full loss distribution for VaR/CVaR. |
+| **Monte Carlo** | 100,000 scenarios using a **t-Copula (df=4) + lognormal marginals** across three lines (Property, Auto, Liability). Parallelised with Ray-on-Spark GPU (100 tasks × 1,000 paths); captures tail dependence for more realistic VaR/CVaR under common shocks. Served as parameterised endpoint (Scenario Analysis tab). |
 """)
 
     st.divider()
@@ -460,6 +489,8 @@ Raw CDC events
   → SARIMA / GARCH per segment
   → Monte Carlo portfolio simulation
   → UC Model Registry (@Champion)
+     ├── SARIMA endpoint (Forecasts tab)
+     └── Monte Carlo endpoint (Scenario tab)
   → This App
 ```
 All assets are version-controlled and reproducible.
@@ -475,7 +506,7 @@ the Unity Catalog Model Registry.
 st.title("📊 Actuarial Risk Dashboard")
 st.caption("Powered by Databricks | SARIMA Forecasting + Monte Carlo Portfolio Risk")
 
-tab1, tab2, tab3 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast", "🎲 Scenario Analysis"])
 
 # ── Tab 1: Segment Forecasts ──────────────────────────────────────────────────
 with tab1:
@@ -673,7 +704,7 @@ Use the annotation tool below to flag such assumptions.
 # ── Tab 2: Portfolio Risk ─────────────────────────────────────────────────────
 with tab2:
     st.subheader("Monte Carlo Portfolio Risk Summary")
-    st.caption("100,000 correlated lognormal scenarios | Property + Auto + Liability")
+    st.caption("100,000 scenarios | t-Copula (df=4) + Lognormal | Property + Auto + Liability")
 
     with st.expander("ℹ️ How the simulation works", expanded=False):
         st.markdown("""
@@ -695,11 +726,17 @@ widespread weather event affecting both Property and Auto simultaneously).
 - Correlation matrix is assumed (not estimated), with moderate positive correlation (ρ ≈ 0.3–0.5)
   between lines — conservative for a standard formula approach.
 
+**Dependence model — t-Copula (Student-t, df=4):**
+Insurance portfolios face *common shocks* — catastrophes, judicial inflation, and
+macro-economic stress scenarios that affect multiple lines simultaneously. A Gaussian
+copula (normal distribution) has *no tail dependence* and **understates VaR** for
+these events. The **t-Copula with df=4** captures tail co-movement, producing
+higher — and more realistic — VaR estimates at the 99th and 99.5th percentiles.
+
 **Distributed execution (Module 4):**
-The simulation is task-parallelised using **Ray-on-Spark**: 100 `@ray.remote` tasks
-each generate 1,000 correlated scenarios, running concurrently on the Spark cluster.
-On serverless runtimes without Ray, an equivalent single-node NumPy fallback produces
-identical results.
+The simulation is task-parallelised using **Ray-on-Spark** on GPU workers (`@ray.remote(num_gpus=0.25)`):
+100 tasks each generate 1,000 scenarios (100,000 paths total). On serverless runtimes
+without Ray, a single-node scipy/NumPy fallback produces equivalent results.
 
 **Output:** 100,000 total portfolio loss values. The empirical distribution of these
 values produces the risk metrics shown below.
@@ -915,3 +952,211 @@ forecasts with the full historical context, use the **Forecasts** tab.
                 )
             else:
                 st.warning("Endpoint not available — start the Model Serving endpoint from Module 5")
+
+# ── Tab 4: Scenario Analysis ──────────────────────────────────────────────────
+with tab4:
+    st.subheader("On-Demand Monte Carlo Scenario Analysis")
+    st.caption("Run custom stress scenarios via the t-Copula Monte Carlo REST endpoint")
+
+    with st.expander("ℹ️ How scenario analysis works", expanded=False):
+        st.markdown("""
+**What this does:**
+
+This tab calls a live **Monte Carlo Model Serving endpoint** that wraps the t-Copula simulation
+(Module 6) as a stateless REST API. Unlike the SARIMA endpoint, all model assumptions are passed
+in the request — enabling analysts to run stress scenarios without modifying or retraining the model.
+
+**When to use it:**
+- **Hard market analysis:** raise means by 15–25% to estimate capital impact of deteriorating loss ratios
+- **Cat scenario:** increase inter-line correlations (corr_prop_auto ≥ 0.6) to simulate a widespread
+  catastrophe event affecting Property and Auto simultaneously
+- **Parameter uncertainty (ORSA):** increase CVs to represent estimation uncertainty in your loss picks
+- **Solvency II sensitivity:** test how VaR(99.5%) changes under different assumption sets
+
+**Input parameters:**
+
+| Group | Parameter | Actuarial meaning |
+|---|---|---|
+| **Means** | `mean_property_M` / `mean_auto_M` / `mean_liability_M` | Expected annual loss per line ($M) — calibrated from pricing or reserving |
+| **CVs** | `cv_property` / `cv_auto` / `cv_liability` | Coefficient of variation — higher values = fatter tails, wider loss distribution |
+| **Correlations** | `corr_prop_auto` / `corr_prop_liab` / `corr_auto_liab` | Inter-line correlation — higher values = more capital required for diversification |
+| **Simulation** | `n_scenarios`, `copula_df` | Paths (precision vs speed) and t-copula degrees of freedom (lower = heavier tail dependence) |
+
+**Output:** VaR and CVaR risk metrics for the stressed portfolio, compared to the baseline calibration.
+""")
+
+    # ── Parameter inputs ──────────────────────────────────────────────────────
+    st.markdown("#### Scenario Parameters")
+
+    col_means, col_cv, col_corr = st.columns(3)
+
+    with col_means:
+        st.markdown("**Expected Annual Losses ($M)**")
+        mean_prop = st.number_input("Commercial Property", value=12.5, min_value=0.1, max_value=500.0, step=0.5,
+                                    help="Baseline: $12.5M. Raise to simulate hard market or increased exposure.")
+        mean_auto = st.number_input("Commercial Auto",     value=8.3,  min_value=0.1, max_value=500.0, step=0.5,
+                                    help="Baseline: $8.3M.")
+        mean_liab = st.number_input("Liability",           value=5.7,  min_value=0.1, max_value=500.0, step=0.5,
+                                    help="Baseline: $5.7M. Long-tail; higher means reflect adverse development.")
+
+    with col_cv:
+        st.markdown("**Coefficients of Variation**")
+        cv_prop = st.slider("Property CV", min_value=0.05, max_value=2.0, value=0.35, step=0.05,
+                            help="Baseline: 0.35. Higher CV → fatter loss distribution → higher VaR.")
+        cv_auto = st.slider("Auto CV",     min_value=0.05, max_value=2.0, value=0.28, step=0.05,
+                            help="Baseline: 0.28.")
+        cv_liab = st.slider("Liability CV", min_value=0.05, max_value=2.0, value=0.42, step=0.05,
+                            help="Baseline: 0.42. Liability tends to have higher CV due to long-tail uncertainty.")
+
+    with col_corr:
+        st.markdown("**Inter-Line Correlations**")
+        corr_pa = st.slider("Property ↔ Auto",      min_value=0.0, max_value=0.95, value=0.40, step=0.05,
+                            help="Baseline: 0.40. Raise to 0.6–0.8 for cat scenarios (e.g., widespread storm).")
+        corr_pl = st.slider("Property ↔ Liability", min_value=0.0, max_value=0.95, value=0.20, step=0.05,
+                            help="Baseline: 0.20. Lower — these lines are less correlated in normal conditions.")
+        corr_al = st.slider("Auto ↔ Liability",     min_value=0.0, max_value=0.95, value=0.30, step=0.05,
+                            help="Baseline: 0.30.")
+
+    col_sim1, col_sim2 = st.columns(2)
+    with col_sim1:
+        n_scen = st.select_slider(
+            "Number of scenarios",
+            options=[1_000, 5_000, 10_000, 25_000, 50_000],
+            value=10_000,
+            help="More scenarios = more precise estimates but slower (~1–5s per 10,000 paths).",
+        )
+    with col_sim2:
+        copula_df_val = st.select_slider(
+            "t-Copula degrees of freedom",
+            options=[3, 4, 5, 10, 20, 30],
+            value=4,
+            help="Lower df → heavier tail dependence. df=4 is the actuarial calibration. df=30 ≈ Gaussian copula.",
+        )
+
+    # ── Baseline reference (read from Delta table, cached) ────────────────────
+    _baseline_summary = load_monte_carlo_summary()
+
+    # ── Run button ────────────────────────────────────────────────────────────
+    if st.button("Run Scenario", type="primary"):
+        _scenario = {
+            "mean_property_M":  mean_prop,
+            "mean_auto_M":      mean_auto,
+            "mean_liability_M": mean_liab,
+            "cv_property":      cv_prop,
+            "cv_auto":          cv_auto,
+            "cv_liability":     cv_liab,
+            "corr_prop_auto":   corr_pa,
+            "corr_prop_liab":   corr_pl,
+            "corr_auto_liab":   corr_al,
+            "n_scenarios":      n_scen,
+            "copula_df":        copula_df_val,
+        }
+        with st.spinner(f"Running Monte Carlo ({n_scen:,} scenarios)..."):
+            _result = call_monte_carlo_endpoint(_scenario)
+
+        if _result:
+            st.success("Simulation complete")
+            st.divider()
+
+            # ── Risk metrics comparison ───────────────────────────────────────
+            st.markdown("#### Results: Scenario vs Baseline")
+
+            _b = _baseline_summary  # Series from load_monte_carlo_summary()
+
+            def _delta(scenario_val, baseline_val):
+                """Return delta string (e.g., '+$2.3M') for metric display."""
+                if baseline_val and baseline_val != 0:
+                    d = scenario_val - float(baseline_val)
+                    return f"{'+' if d >= 0 else ''}${d:.1f}M"
+                return None
+
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric(
+                "Expected Loss",
+                f"${_result['expected_loss_M']:.1f}M",
+                delta=_delta(_result['expected_loss_M'], _b.get('expected_loss', 0)),
+                help="Mean portfolio loss across all simulated scenarios.",
+            )
+            rc2.metric(
+                "VaR (99%)",
+                f"${_result['var_99_M']:.1f}M",
+                delta=_delta(_result['var_99_M'], _b.get('var_99', 0)),
+                help="1-in-100 year loss level.",
+            )
+            rc3.metric(
+                "VaR (99.5%) — SCR",
+                f"${_result['var_995_M']:.1f}M",
+                delta=_delta(_result['var_995_M'], _b.get('var_995', 0)),
+                help="Solvency II SCR calibration point (1-in-200 year).",
+            )
+            rc4.metric(
+                "CVaR (99%)",
+                f"${_result['cvar_99_M']:.1f}M",
+                delta=_delta(_result['cvar_99_M'], _b.get('cvar_99', 0)),
+                help="Expected loss in the worst 1% of scenarios.",
+            )
+
+            # ── Waterfall chart: Scenario vs Baseline ─────────────────────────
+            import plotly.graph_objects as go
+
+            _metrics_labels = ["E[Loss]", "VaR 95%", "VaR 99%", "VaR 99.5%\n(SCR)", "CVaR 99%"]
+            _baseline_vals = [
+                float(_b.get("expected_loss", 0)),
+                float(_b.get("var_99", 0)) * 0.85,   # approximate VaR95 from VaR99
+                float(_b.get("var_99", 0)),
+                float(_b.get("var_995", 0)),
+                float(_b.get("cvar_99", 0)),
+            ]
+            _scenario_vals = [
+                _result["expected_loss_M"],
+                _result["var_95_M"],
+                _result["var_99_M"],
+                _result["var_995_M"],
+                _result["cvar_99_M"],
+            ]
+
+            _fig_cmp = go.Figure()
+            _fig_cmp.add_trace(go.Bar(
+                name="Baseline (pre-computed)",
+                x=_metrics_labels,
+                y=_baseline_vals,
+                marker_color="rgba(31,119,180,0.7)",
+                hovertemplate="%{x}<br>Baseline: $%{y:.1f}M<extra></extra>",
+            ))
+            _fig_cmp.add_trace(go.Bar(
+                name="Scenario (on-demand)",
+                x=_metrics_labels,
+                y=_scenario_vals,
+                marker_color="rgba(214,39,40,0.7)",
+                hovertemplate="%{x}<br>Scenario: $%{y:.1f}M<extra></extra>",
+            ))
+            _fig_cmp.update_layout(
+                title="Scenario vs Baseline Risk Metrics",
+                yaxis_title="Annual Portfolio Loss ($M)",
+                barmode="group",
+                height=380,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(_fig_cmp, use_container_width=True)
+
+            # ── Raw metrics table ──────────────────────────────────────────────
+            with st.expander("📋 Full scenario metrics"):
+                _display = {
+                    "Metric": ["Expected Loss", "VaR (95%)", "VaR (99%)", "VaR (99.5% SCR)", "CVaR (99%)", "Max Loss"],
+                    "Scenario ($M)": [
+                        f"${_result['expected_loss_M']:.2f}",
+                        f"${_result['var_95_M']:.2f}",
+                        f"${_result['var_99_M']:.2f}",
+                        f"${_result['var_995_M']:.2f}",
+                        f"${_result['cvar_99_M']:.2f}",
+                        f"${_result['max_loss_M']:.2f}",
+                    ],
+                    "Copula": [_result.get("copula", ""), "", "", "", "", ""],
+                    "Scenarios": [f"{int(_result.get('n_scenarios_used', n_scen)):,}", "", "", "", "", ""],
+                }
+                st.dataframe(pd.DataFrame(_display), use_container_width=True, hide_index=True)
+        else:
+            st.warning(
+                "Monte Carlo endpoint not available. "
+                "Start it from Module 6 or wait for the setup job to complete."
+            )

@@ -25,12 +25,14 @@
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
 dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP client ID")
-dbutils.widgets.text("endpoint_name",    "actuarial-workshop-sarima-forecaster", "Model Serving endpoint name")
+dbutils.widgets.text("endpoint_name",    "actuarial-workshop-sarima-forecaster", "SARIMA endpoint name")
+dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-monte-carlo",       "Monte Carlo endpoint name")
 
 CATALOG          = dbutils.widgets.get("catalog")
 SCHEMA           = dbutils.widgets.get("schema")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 ENDPOINT_NAME    = dbutils.widgets.get("endpoint_name")
+MC_ENDPOINT_NAME = dbutils.widgets.get("mc_endpoint_name")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os, requests
@@ -49,12 +51,13 @@ if not TOKEN:
 
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
-print(f"Workspace:        {WORKSPACE_URL}")
-print(f"Catalog/Schema:   {CATALOG}.{SCHEMA}")
-print(f"Endpoint:         {ENDPOINT_NAME}")
-print(f"App SP client ID: {APP_SP_CLIENT_ID or '(not provided)'}")
-print(f"Running as:       {CURRENT_USER}")
-print(f"Token:            {'present' if TOKEN else 'MISSING'} ({len(TOKEN)} chars)")
+print(f"Workspace:          {WORKSPACE_URL}")
+print(f"Catalog/Schema:     {CATALOG}.{SCHEMA}")
+print(f"SARIMA endpoint:    {ENDPOINT_NAME}")
+print(f"MC endpoint:        {MC_ENDPOINT_NAME}")
+print(f"App SP client ID:   {APP_SP_CLIENT_ID or '(not provided)'}")
+print(f"Running as:         {CURRENT_USER}")
+print(f"Token:              {'present' if TOKEN else 'MISSING'} ({len(TOKEN)} chars)")
 
 # COMMAND ----------
 
@@ -87,25 +90,30 @@ print("\nUC grants complete.")
 
 # COMMAND ----------
 
-# ─── 2. Grant CAN_QUERY on the serving endpoint to the app SP ──────────────────
-# The serving endpoint is created by the setup job (Task 6) before this task runs.
-endpoint_resp = requests.get(
-    f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-)
-assert endpoint_resp.status_code == 200, \
-    f"Could not find endpoint '{ENDPOINT_NAME}': {endpoint_resp.text[:200]}"
-endpoint_id = endpoint_resp.json()["id"]
+# ─── 2. Grant CAN_QUERY on serving endpoints to the app SP ────────────────────
+# Both endpoints are created by Tasks 6a/6b before this task runs.
+_endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME] if ep]
 
-perms_resp = requests.patch(
-    f"https://{WORKSPACE_URL}/api/2.0/permissions/serving-endpoints/{endpoint_id}",
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-    json={"access_control_list": [
-        {"service_principal_name": APP_SP_CLIENT_ID, "permission_level": "CAN_QUERY"},
-    ]},
-)
-assert perms_resp.status_code == 200, \
-    f"Failed to grant CAN_QUERY on endpoint: {perms_resp.text[:200]}"
-print(f"[OK] Granted CAN_QUERY on endpoint '{ENDPOINT_NAME}' to SP: {APP_SP_CLIENT_ID}")
+for ep_name in _endpoints_to_grant:
+    endpoint_resp = requests.get(
+        f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ep_name}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    if endpoint_resp.status_code != 200:
+        print(f"[WARN] Could not find endpoint '{ep_name}': {endpoint_resp.text[:200]}")
+        continue
+    endpoint_id = endpoint_resp.json()["id"]
+
+    perms_resp = requests.patch(
+        f"https://{WORKSPACE_URL}/api/2.0/permissions/serving-endpoints/{endpoint_id}",
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        json={"access_control_list": [
+            {"service_principal_name": APP_SP_CLIENT_ID, "permission_level": "CAN_QUERY"},
+        ]},
+    )
+    if perms_resp.status_code == 200:
+        print(f"[OK] Granted CAN_QUERY on endpoint '{ep_name}' to SP: {APP_SP_CLIENT_ID}")
+    else:
+        print(f"[WARN] Failed CAN_QUERY on '{ep_name}': {perms_resp.text[:200]}")
 
 print("\nApp setup complete.")
