@@ -37,10 +37,30 @@ APP_SP_CLIENT_ID      = dbutils.widgets.get("app_sp_client_id")
 ENDPOINT_NAME         = dbutils.widgets.get("endpoint_name")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-TOKEN = (
-    dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-    .apiToken().get()
-)
+import os
+
+# Serverless-compatible token acquisition.
+# Method 1: notebook context (classic clusters and most job runs).
+# Method 2: Databricks SDK authenticate() (serverless one-time runs where
+#           the notebook context token is unavailable).
+TOKEN = None
+try:
+    TOKEN = (
+        dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        .apiToken().get()
+    )
+except Exception:
+    TOKEN = None
+
+if not TOKEN:
+    try:
+        from databricks.sdk import WorkspaceClient as _WC
+        _h = {}
+        _WC().config.authenticate(_h)
+        TOKEN = _h.get("Authorization", "").replace("Bearer ", "")
+    except Exception:
+        TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
 print(f"Workspace:        {WORKSPACE_URL}")
@@ -94,7 +114,7 @@ print("Host:", HOST)
 # as the Postgres password. No separate credential API is required.
 # The connecting user (CURRENT_USER) is automatically a superuser on the project.
 PG_TOKEN = TOKEN
-print(f"Using notebook context token for Postgres authentication (user: {CURRENT_USER})")
+print(f"Using Databricks access token for Postgres authentication (user: {CURRENT_USER})")
 
 # COMMAND ----------
 
