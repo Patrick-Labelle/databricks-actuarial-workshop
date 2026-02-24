@@ -571,6 +571,7 @@ else:
         setup_ray_cluster(
             max_worker_nodes=4,
             num_cpus_worker_node=4,
+            num_gpus_worker_node=0,      # required alongside num_cpus_worker_node in Ray >= 2.30
             collect_log_to_path="/tmp/ray_logs",
         )
 
