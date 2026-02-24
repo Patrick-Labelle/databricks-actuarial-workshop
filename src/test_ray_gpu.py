@@ -33,8 +33,8 @@ except Exception:
 spark.conf.set("spark.task.resource.gpu.amount", "0")
 
 setup_ray_cluster(
-    max_worker_nodes=2,
-    num_cpus_worker_node=8,
+    max_worker_nodes=1,
+    num_cpus_worker_node=2,      # leave 2 of 4 vCPUs free for Spark (g4dn.xlarge)
     num_gpus_worker_node=1,
     collect_log_to_path="/tmp/ray_logs",
 )
@@ -109,7 +109,7 @@ def _get_gpu_tensors(device, dtype):
         )
     return _GPU_TENSOR_CACHE[key]
 
-@ray.remote(num_gpus=0.25)
+@ray.remote(num_gpus=0.25, num_cpus=0.5)
 def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
     import numpy as np
     import torch

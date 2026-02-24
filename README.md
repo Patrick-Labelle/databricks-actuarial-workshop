@@ -108,31 +108,38 @@ Monte Carlo simulation. By default, the setup job skips the Ray section (`run_ra
 so the full pipeline runs on serverless. To demonstrate Ray + GPU, use the Ray-enabled variant:
 
 ```bash
-./deploy-ray.sh        # deploys to e2-demo-ray target (~30 min, includes ~5-10 min cluster spin-up)
+./deploy-ray.sh        # deploys to e2-demo-ray target (~20 min, includes ~5-10 min cluster spin-up)
 ./destroy-ray.sh       # full teardown for the e2-demo-ray deployment
 ```
 
 `deploy-ray.sh` and `destroy-ray.sh` are thin wrappers around `deploy.sh` / `destroy.sh` that pass
 `--target e2-demo-ray`. The `e2-demo-ray` target (defined in `databricks.local.yml`) inherits all
 workspace settings from `e2-demo` and adds one override: Task 5 (`fit_statistical_models`) is moved
-from serverless to a **DBR 17.3-gpu-ml** job cluster (2 × `g4dn.2xlarge`, NVIDIA Tesla T4),
+from serverless to a **DBR 17.3-gpu-ml** job cluster (1 × `g4dn.xlarge`, NVIDIA Tesla T4),
 and `run_ray: "auto"` + `job_mode: "false"` are passed to the notebook.
 
-### GPU Monte Carlo (t-Copula, hybrid CPU/GPU)
+### GPU Monte Carlo (t-Copula, SARIMA-driven time-series VaR)
 
-Module 4 uses Ray-on-Spark with PyTorch for GPU-accelerated Monte Carlo:
-- **4 tasks × 1M scenarios = 4M total paths** on two T4 GPUs
+Module 4 uses Ray-on-Spark with PyTorch for GPU-accelerated Monte Carlo — two runs dispatched
+together in a single Ray batch:
+
+1. **Baseline** (static means): 4 tasks × 1M = **4M paths** → `monte_carlo_results` (used by Module 5/app)
+2. **12-month VaR evolution** (SARIMA-driven means): 12 months × 4 tasks × 1M = **48M paths**
+   → `portfolio_risk_timeline` showing how capital requirements evolve along the SARIMA forecast path
+
 - **t-Copula (df=4)** captures tail dependence between Property, Auto, and Liability lines
 - **Hybrid path:** correlated sampling, chi² mixing, and lognormal inverse CDF on GPU (torch);
   t-CDF (`betainc`) on CPU via scipy (absent from PyTorch's stable API in 2.7.x)
-- Ray workers use `num_gpus=0.25` fractional allocation: 4 concurrent tasks per T4 = full utilization
+- Ray workers use `num_gpus=0.25` + `num_cpus=0.5` fractional allocation: **4 concurrent tasks
+  per T4 = full GPU utilization**; 52 total tasks complete in ~65 seconds
+- Regional claims breakdown written to `regional_claims_forecast` (SARIMA aggregated by region × month)
 
 ### Ray CPU Reservation
 
-`setup_ray_cluster` is called with `num_cpus_worker_node=6` (not 8) to leave 2 vCPUs per worker
-free for Spark. Without this, Ray occupies all task slots and subsequent `saveAsTable` calls stall
-at "0 tasks started". After Monte Carlo completes, `shutdown_ray_cluster()` is called before the
-Spark write to release all resources immediately.
+`setup_ray_cluster` is called with `num_cpus_worker_node=2` on the 4-vCPU `g4dn.xlarge` worker,
+leaving 2 vCPUs free for Spark. `num_cpus=0.5` per Ray task allows 4 tasks to run concurrently
+(4 × 0.5 = 2.0 CPUs ≤ 2 available), keeping the T4 fully utilized. After Monte Carlo completes,
+`shutdown_ray_cluster()` is called before any Spark write to release all resources immediately.
 
 > **Note:** Classic/GPU ML clusters are not available on serverless-only workspaces (e.g. FEVM).
 > The Ray variant targets the `e2-demo-field-eng` workspace.
@@ -145,7 +152,7 @@ Spark write to release all resources immediately.
 |--------|-----------|-------|
 | `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
 | _(your target)_ | Defined in `databricks.local.yml` | gitignored; auto-merged by bundle |
-| `e2-demo-ray` | e2-demo-field-eng | Same as e2-demo + Task 5 on DBR 17.3-gpu-ml cluster (2×g4dn.2xlarge, Tesla T4, Ray+GPU) |
+| `e2-demo-ray` | e2-demo-field-eng | Same as e2-demo + Task 5 on DBR 17.3-gpu-ml cluster (1×g4dn.xlarge, Tesla T4, Ray+GPU) |
 
 The bundle's `include:` glob (`databricks.local*.yml`) automatically merges your
 local target definitions when present, and silently skips if the file is absent.
@@ -200,7 +207,7 @@ permissions), then deploys the app source code last so it starts with full permi
 | 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API |
 | 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
 | 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
-| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, t-Copula Monte Carlo, Ray+GPU, MLflow |
+| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, t-Copula Monte Carlo (SARIMA-driven VaR evolution), Ray+GPU, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |

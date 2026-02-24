@@ -630,15 +630,16 @@ else:
         # Prevent Spark from reserving GPUs for its own tasks so Ray can use them all.
         spark.conf.set("spark.task.resource.gpu.amount", "0")
 
-        # Reserve 2 vCPUs per worker for Spark so that createDataFrame/saveAsTable
-        # can schedule tasks even while Ray is running. Without this, Ray occupies
-        # all 8 vCPUs on each g4dn.2xlarge worker and subsequent Spark SQL jobs
-        # stall at "0 tasks started" because no task slots are available.
-        # (ref: Databricks Ray-on-Spark docs — reserve CPUs for hybrid Spark+Ray)
+        # Reserve 2 of 4 vCPUs on the g4dn.xlarge worker for Spark so that
+        # createDataFrame/saveAsTable can schedule tasks after Ray finishes.
+        # Without this, Ray occupies all CPUs and subsequent Spark jobs stall
+        # at "0 tasks started". (ref: Databricks Ray-on-Spark docs)
+        # num_cpus=0.5 per Ray task (see @ray.remote below) allows 4 concurrent
+        # tasks on the 2 Ray CPU slots: 4 × 0.5 = 2.0 CPUs ≤ 2 available.
         setup_ray_cluster(
-            max_worker_nodes=2,
-            num_cpus_worker_node=6,      # leave 2 vCPUs/worker free for Spark tasks
-            num_gpus_worker_node=1,      # g4dn.2xlarge: 1 NVIDIA T4 GPU per worker
+            max_worker_nodes=1,
+            num_cpus_worker_node=2,      # leave 2 of 4 vCPUs free for Spark
+            num_gpus_worker_node=1,      # g4dn.xlarge: 1 NVIDIA T4 GPU per node
             collect_log_to_path="/tmp/ray_logs",
         )
 
@@ -721,6 +722,112 @@ if RAY_AVAILABLE:
 
 # COMMAND ----------
 
+# ── SARIMA → Monte Carlo Bridge ──────────────────────────────────────────────
+# Connects SARIMA segment-level forecasts to the Monte Carlo simulation:
+# for each of the 12 forecast months the product-line claims growth factor
+# (forecast / trailing-12-month actual average) is used to scale the baseline
+# PORTFOLIO means.  This gives VaR a forward-looking dimension — capital
+# requirements evolve in line with the SARIMA predictions rather than staying
+# at static calibration values.
+#
+# Product-line → MC-segment mapping (weighted by BASE_CLAIMS volume):
+#   Property  = Homeowners (320) + Commercial_Property (90)
+#   Auto      = Personal_Auto (450) + Commercial_Auto (180)
+#   Liability = 0.5×Property + 0.5×Auto growth (proxied; no direct SARIMA data)
+#
+# Regional dimension: SARIMA forecasts are also aggregated by region → saved to
+# `regional_claims_forecast` Delta table, giving a region × line breakdown of
+# expected claims over the 12-month horizon without requiring a 52-dim MC.
+try:
+    _sarima_pd = sarima_results_df.toPandas()
+    _sarima_pd["product_line"] = _sarima_pd["segment_id"].str.split("__").str[0]
+    _sarima_pd["region"]       = _sarima_pd["segment_id"].str.split("__").str[1]
+
+    # Trailing-12-month average of region-aggregated actuals per product line
+    _baseline_monthly = (
+        _sarima_pd[_sarima_pd["record_type"] == "actual"]
+        .groupby(["product_line", "month"])["claims_count"]
+        .sum()
+        .reset_index()
+        .sort_values(["product_line", "month"])
+    )
+    _baseline_by_line = (
+        _baseline_monthly
+        .groupby("product_line")
+        .apply(lambda g: g.tail(12)["claims_count"].mean())
+    )
+
+    # Monthly aggregate forecast: sum across all regions per product line
+    _forecast_agg = (
+        _sarima_pd[_sarima_pd["record_type"] == "forecast"]
+        .groupby(["product_line", "month"])["forecast_mean"]
+        .sum()
+        .reset_index()
+        .sort_values(["product_line", "month"])
+    )
+
+    # Growth factor: forecast / baseline, clipped to [0.5, 2.0] to dampen outliers
+    _baseline_lookup = _baseline_by_line.to_dict()
+    _forecast_agg["growth"] = _forecast_agg.apply(
+        lambda row: float(np.clip(
+            row["forecast_mean"] / max(_baseline_lookup.get(row["product_line"], 1.0), 1e-6),
+            0.5, 2.0,
+        )),
+        axis=1,
+    )
+
+    # Build nested dict: {product_line: {month: growth_factor}}
+    _growth_by_line = {
+        line: grp.set_index("month")["growth"].to_dict()
+        for line, grp in _forecast_agg.groupby("product_line")
+    }
+    _forecast_months = sorted(_forecast_agg["month"].unique())  # 12 datetime.date values
+
+    # Weights for product-line → MC segment blending
+    _W_PROP = {"Homeowners": 320, "Commercial_Property": 90}
+    _W_AUTO = {"Personal_Auto": 450, "Commercial_Auto": 180}
+
+    def _sarima_growth_for_month(month_date) -> np.ndarray:
+        """Return growth vector [property, auto, liability] for a forecast month."""
+        def _wblend(weights):
+            total = sum(weights.values())
+            return sum(w * _growth_by_line[line].get(month_date, 1.0)
+                       for line, w in weights.items()) / total
+        prop_g = _wblend(_W_PROP)
+        auto_g = _wblend(_W_AUTO)
+        liab_g = 0.5 * (prop_g + auto_g)
+        return np.array([prop_g, auto_g, liab_g], dtype=np.float32)
+
+    print(f"SARIMA bridge ready | {len(_forecast_months)} forecast months")
+    if not JOB_MODE and _forecast_months:
+        g1  = _sarima_growth_for_month(_forecast_months[0])
+        g12 = _sarima_growth_for_month(_forecast_months[-1])
+        print(f"  Growth +1 mo:  Property={g1[0]:.3f}  Auto={g1[1]:.3f}  Liability={g1[2]:.3f}")
+        print(f"  Growth +12 mo: Property={g12[0]:.3f}  Auto={g12[1]:.3f}  Liability={g12[2]:.3f}")
+
+    # Regional breakdown preview (top 5 regions by share of month-12 forecast)
+    if not JOB_MODE and _forecast_months:
+        _reg_agg = (
+            _sarima_pd[_sarima_pd["record_type"] == "forecast"]
+            .groupby(["region", "month"])["forecast_mean"]
+            .sum()
+            .reset_index()
+        )
+        _last_month = _forecast_months[-1]
+        _reg_last = _reg_agg[_reg_agg["month"] == _last_month].copy()
+        _reg_last["share_pct"] = (_reg_last["forecast_mean"] / _reg_last["forecast_mean"].sum() * 100).round(1)
+        print(f"\n  Regional claims share (month +12):")
+        for _, row in _reg_last.sort_values("share_pct", ascending=False).head(5).iterrows():
+            print(f"    {row['region']:<25} {row['share_pct']:>5.1f}%")
+
+except NameError:
+    # sarima_results_df not in scope (running section 4 in isolation)
+    _forecast_months = []
+    def _sarima_growth_for_month(_): return np.ones(3, dtype=np.float32)
+    print("SARIMA bridge: sarima_results_df not available — using static means (growth=1.0)")
+
+# COMMAND ----------
+
 import numpy as np
 import pandas as pd
 
@@ -756,30 +863,46 @@ _MC_SIGMA_LN   = np.sqrt(_MC_SIGMA2)
 _MC_CORR       = np.asarray(PORTFOLIO["corr_matrix"], dtype=np.float32)
 
 # Per-worker GPU tensor cache: populated on first GPU call, reused by all subsequent
-# tasks on the same worker process. Avoids re-allocating and re-computing Cholesky
-# (an O(n³) op on a 3×3 matrix) for every task call.
+# tasks on the same worker process.
+# sig_t (from CV) and chol_t (from corr matrix) are fixed → always cached.
+# mu_t (from means) varies when means_override is supplied (SARIMA time-series runs)
+# → computed on the fly from mu_ln_arr; static version is also cached separately.
 _GPU_TENSOR_CACHE: dict = {}
 
-def _get_gpu_tensors(device, dtype):
-    """Return (mu_t, sig_t, chol_t) tensors, computing only on first call per worker."""
+def _get_gpu_tensors(device, dtype, mu_ln_arr=None):
+    """Return (mu_t, sig_t, chol_t) tensors.
+
+    sig_t and chol_t are cached per (device, dtype) — they depend only on the
+    fixed CV vector and correlation matrix.  mu_t is computed from mu_ln_arr
+    when provided (SARIMA time-series runs) or from cached _MC_MU_LN otherwise.
+    """
     import torch
-    key = (str(device), str(dtype))
-    if key not in _GPU_TENSOR_CACHE:
-        _GPU_TENSOR_CACHE[key] = (
-            torch.tensor(_MC_MU_LN,   dtype=dtype, device=device),
-            torch.tensor(_MC_SIGMA_LN, dtype=dtype, device=device),
-            torch.linalg.cholesky(torch.tensor(_MC_CORR, dtype=dtype, device=device)),
+    cache_key = (str(device), str(dtype))
+    if cache_key not in _GPU_TENSOR_CACHE:
+        _GPU_TENSOR_CACHE[cache_key] = (
+            torch.tensor(_MC_SIGMA_LN, dtype=dtype, device=device),   # sig_t
+            torch.linalg.cholesky(torch.tensor(_MC_CORR, dtype=dtype, device=device)),  # chol_t
         )
-    return _GPU_TENSOR_CACHE[key]
+    sig_t, chol_t = _GPU_TENSOR_CACHE[cache_key]
+
+    if mu_ln_arr is not None:
+        mu_t = torch.tensor(mu_ln_arr, dtype=dtype, device=device)
+    else:
+        static_key = cache_key + ('mu_static',)
+        if static_key not in _GPU_TENSOR_CACHE:
+            _GPU_TENSOR_CACHE[static_key] = torch.tensor(_MC_MU_LN, dtype=dtype, device=device)
+        mu_t = _GPU_TENSOR_CACHE[static_key]
+
+    return mu_t, sig_t, chol_t
 
 # Define the Ray task function (only if Ray is available)
-# @ray.remote(num_gpus=0.25): fractional GPU allocation allows 4 concurrent tasks
-# per T4 GPU on a g4dn.2xlarge worker (8 tasks total across 2 workers × 1 GPU each).
-# GPU path (hybrid): random sampling + Cholesky + lognormal on GPU; betainc on CPU
-# (torch.special.betainc may not have a CUDA kernel in all PyTorch builds).
+# @ray.remote(num_gpus=0.25, num_cpus=0.5): 4 concurrent tasks on 1 T4 GPU
+# (4 × 0.25 = 1.0 GPU); num_cpus=0.5 allows all 4 to fit within the 2 Ray CPU
+# slots reserved on g4dn.xlarge (4 × 0.5 = 2.0 CPUs).
+# GPU path (hybrid): random sampling + Cholesky + lognormal on GPU; betainc on CPU.
 if RAY_AVAILABLE:
-    @ray.remote(num_gpus=0.25)
-    def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
+    @ray.remote(num_gpus=0.25, num_cpus=0.5)
+    def simulate_portfolio_losses(n_scenarios: int, seed: int, means_override=None) -> dict:
         """
         t-Copula + lognormal marginals Monte Carlo (Sklar's theorem).
 
@@ -813,6 +936,14 @@ if RAY_AVAILABLE:
         import numpy as np
         import torch
 
+        # When means_override is supplied (SARIMA time-series runs), compute mu_ln
+        # from those means; otherwise use the cached module-level _MC_MU_LN.
+        if means_override is not None:
+            _mo = np.array(means_override, dtype=np.float32)
+            _mu_ln_arr = np.log(_mo) - np.log(1.0 + _MC_CV**2) / 2.0
+        else:
+            _mu_ln_arr = None
+
         # ── GPU path via PyTorch (hybrid: sampling on GPU, betainc on CPU) ──────
         # torch.device('cuda') lets CUDA_VISIBLE_DEVICES pick the right GPU index
         # (safer than hardcoding 'cuda:0' in multi-GPU or containerised setups).
@@ -831,8 +962,9 @@ if RAY_AVAILABLE:
             if seed == 42:
                 print(f"[Ray seed=42] GPU smoke-test ok ({torch.cuda.get_device_name(0)}, sum={_s:.1f})")
 
-            # Retrieve precomputed tensors (Cholesky, mu, sigma) — cached per worker
-            mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype)
+            # Retrieve precomputed tensors; mu_t computed from _mu_ln_arr when
+            # means_override is set, otherwise uses the cached static tensor.
+            mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype, mu_ln_arr=_mu_ln_arr)
 
             # Steps 1-2: correlated standard normals + chi2 mixing variable
             # chi2(df) = sum of df² independent standard normals (exact, GPU-native)
@@ -869,14 +1001,15 @@ if RAY_AVAILABLE:
             # ── CPU fallback (Serverless, non-GPU workers, torch.cuda unavailable) ─
             print(f"[Ray task seed={seed}] GPU path failed ({type(e_gpu).__name__}: {e_gpu}) — using CPU")
             from scipy.stats import t as tdist, norm as scipy_norm
-            chol  = np.linalg.cholesky(_MC_CORR)
-            rng   = np.random.default_rng(seed)
-            z     = rng.standard_normal((n_scenarios, 3))
-            chi2  = rng.chisquare(_MC_COPULA_DF, n_scenarios)
-            t_cor = (z @ chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
-            u     = tdist.cdf(t_cor, df=_MC_COPULA_DF)
-            q     = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
-            losses = np.exp(_MC_MU_LN + _MC_SIGMA_LN * q)
+            chol     = np.linalg.cholesky(_MC_CORR)
+            rng      = np.random.default_rng(seed)
+            z        = rng.standard_normal((n_scenarios, 3))
+            chi2     = rng.chisquare(_MC_COPULA_DF, n_scenarios)
+            t_cor    = (z @ chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
+            u        = tdist.cdf(t_cor, df=_MC_COPULA_DF)
+            q        = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
+            _cpu_mu  = _mu_ln_arr if _mu_ln_arr is not None else _MC_MU_LN
+            losses   = np.exp(_cpu_mu + _MC_SIGMA_LN * q)
             total  = losses.sum(axis=1)
             backend = 'numpy-cpu'
 
@@ -897,61 +1030,94 @@ if RAY_AVAILABLE:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Launch 10 Ray Tasks — 1,000,000 Scenarios (GPU-accelerated)
+# MAGIC ### Monte Carlo — Baseline + 12-Month VaR Evolution (GPU-accelerated)
+# MAGIC
+# MAGIC Two complementary simulations dispatched in a single Ray batch:
+# MAGIC
+# MAGIC 1. **Baseline** (static `PORTFOLIO` means) — current-period capital position;
+# MAGIC    written to `monte_carlo_results` for downstream use in Modules 5–7.
+# MAGIC 2. **12-month time series** (SARIMA-driven means) — for each forecast month
+# MAGIC    the means are scaled by the SARIMA growth factor from the bridge above,
+# MAGIC    giving a **VaR evolution table** that shows how capital requirements change
+# MAGIC    as claims grow along the SARIMA forecast path.
+# MAGIC
+# MAGIC All `(1 + 12) × 4 = 52` tasks are dispatched before any are collected.
+# MAGIC Ray queues them and runs 4 concurrently (4 × 0.25 GPU = 1.0 GPU), so
+# MAGIC wall time is roughly **65 seconds for 52M total paths**.
 
 # COMMAND ----------
 
-# GPU batching: 1M scenarios/task gives the T4 GPU strong occupancy.
-# 4 tasks × 1M = 4M total paths. With num_gpus=0.25, all 4 tasks run
-# concurrently on a single GPU (4 × 0.25 = 1.0 GPU), keeping it fully utilized.
-N_TASKS     = 4
-N_PER_TASK  = 1_000_000
-TOTAL_PATHS = N_TASKS * N_PER_TASK   # 4,000,000 scenarios
+# 4 tasks per run, 1M scenarios each → T4 GPU fully occupied (4 × 0.25 = 1.0 GPU).
+N_TASKS    = 4
+N_PER_TASK = 1_000_000
+N_RUNS     = 1 + len(_forecast_months)  # baseline + 12 SARIMA months
 
 if RAY_AVAILABLE:
-    print(f'Launching {N_TASKS} Ray tasks x {N_PER_TASK:,} scenarios = {TOTAL_PATHS:,} total paths')
+    print(f'Launching {N_RUNS} runs × {N_TASKS} tasks × {N_PER_TASK:,} paths '
+          f'= {N_RUNS * N_TASKS * N_PER_TASK:,} total paths')
 
     with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
         mlflow.log_input(_claims_dataset, context="training")
         mlflow.set_tags({
             'workshop_module': '4',
-            'model_type':      'Monte Carlo - t-Copula + Lognormal Marginals',
-            'n_scenarios':     str(TOTAL_PATHS),
+            'model_type':      'Monte Carlo - t-Copula + Lognormal Marginals (SARIMA-driven)',
+            'n_scenarios':     str(N_RUNS * N_TASKS * N_PER_TASK),
             'n_segments':      '3',
             'framework':       'Ray + PyTorch GPU',
             'audience':        'actuarial-workshop',
         })
         mlflow.log_params({
-            'n_tasks':            N_TASKS,
-            'scenarios_per_task': N_PER_TASK,
-            'total_scenarios':    TOTAL_PATHS,
-            'copula':             't-copula',
-            'copula_df':          4,
-            'marginals':          'lognormal',
-            'correlation_P_A':    0.40,
-            'correlation_P_L':    0.20,
-            'correlation_A_L':    0.30,
+            'n_tasks':              N_TASKS,
+            'scenarios_per_task':   N_PER_TASK,
+            'total_scenarios':      N_RUNS * N_TASKS * N_PER_TASK,
+            'n_forecast_months':    len(_forecast_months),
+            'copula':               't-copula',
+            'copula_df':            4,
+            'marginals':            'lognormal',
+            'correlation_P_A':      0.40,
+            'correlation_P_L':      0.20,
+            'correlation_A_L':      0.30,
         })
-        futures = [
+
+        # ── Dispatch all tasks before collecting any ───────────────────────────
+        # Baseline: static PORTFOLIO means (seeds 42–45)
+        baseline_futures = [
             simulate_portfolio_losses.remote(N_PER_TASK, seed=42 + i)
             for i in range(N_TASKS)
         ]
-        results = ray.get(futures)
+        # Time-series: 12 months with SARIMA-adjusted means (seeds 100+)
+        ts_futures: dict = {}
+        for _mi, _month in enumerate(_forecast_months):
+            _growth   = _sarima_growth_for_month(_month)
+            _means_t  = (_MC_MEANS * _growth).tolist()
+            ts_futures[_month] = [
+                simulate_portfolio_losses.remote(
+                    N_PER_TASK,
+                    seed=100 + _mi * N_TASKS + i,
+                    means_override=_means_t,
+                )
+                for i in range(N_TASKS)
+            ]
 
-        # Shut down Ray cluster immediately after all futures resolve so that
-        # Spark executors are released back to the cluster. Without this,
-        # the subsequent saveAsTable Spark job cannot acquire executor slots
-        # (Ray workers hold them) and stalls indefinitely.
+        # Collect (Ray blocks until all tasks finish)
+        baseline_results = ray.get(baseline_futures)
+        ts_results       = {m: ray.get(futs) for m, futs in ts_futures.items()}
+
+        # Shut down Ray immediately so Spark can reclaim executor slots for the
+        # saveAsTable calls below. Ray workers hold all CPUs while alive.
         try:
             shutdown_ray_cluster()
             ray.shutdown()
         except Exception:
             pass
 
-        aggregate_var99  = float(sum(r['var_99']  for r in results) / len(results))
-        aggregate_var995 = float(sum(r['var_995'] for r in results) / len(results))
-        aggregate_cvar99 = float(sum(r['cvar_99'] for r in results) / len(results))
-        aggregate_mean   = float(sum(r['total_loss_mean'] for r in results) / len(results))
+        # ── Baseline portfolio summary ─────────────────────────────────────────
+        def _agg(res, key): return float(sum(r[key] for r in res) / len(res))
+
+        aggregate_var99  = _agg(baseline_results, 'var_99')
+        aggregate_var995 = _agg(baseline_results, 'var_995')
+        aggregate_cvar99 = _agg(baseline_results, 'cvar_99')
+        aggregate_mean   = _agg(baseline_results, 'total_loss_mean')
 
         mlflow.log_metrics({
             'expected_annual_loss_M':  round(aggregate_mean, 2),
@@ -961,9 +1127,9 @@ if RAY_AVAILABLE:
             'implied_risk_margin_pct': round((aggregate_cvar99 / aggregate_mean - 1) * 100, 1),
         })
 
-        backends = set(r.get('backend', 'unknown') for r in results)
+        backends = set(r.get('backend', 'unknown') for r in baseline_results)
         print(f'\n' + '='*55)
-        print(f'  PORTFOLIO RISK SUMMARY ({TOTAL_PATHS:,} scenarios)')
+        print(f'  PORTFOLIO RISK SUMMARY ({N_TASKS * N_PER_TASK:,} scenarios)')
         print(f'  Backend: {", ".join(sorted(backends))}')
         print('='*55)
         print(f'  Expected Annual Loss:   ${aggregate_mean:.1f}M')
@@ -974,6 +1140,7 @@ if RAY_AVAILABLE:
         print('='*55)
         print(f'\nMLflow run: {run.info.run_id}')
 
+        # Baseline rows → monte_carlo_results (backward-compatible with Module 5/app)
         results_pdf = pd.DataFrame([{
             'task_id':        r['seed'] - 42,
             'n_scenarios':    r['n_scenarios'],
@@ -984,7 +1151,7 @@ if RAY_AVAILABLE:
             'cvar_99_M':      r['cvar_99'],
             'max_loss_M':     r['max_loss'],
             'mlflow_run_id':  run.info.run_id,
-        } for r in results])
+        } for r in baseline_results])
 
         mc_df = spark.createDataFrame(results_pdf)
         (mc_df.write
@@ -992,7 +1159,69 @@ if RAY_AVAILABLE:
             .mode('overwrite')
             .option('overwriteSchema', 'true')
             .saveAsTable(f'{CATALOG}.{SCHEMA}.monte_carlo_results'))
-        print(f'\nResults saved to {CATALOG}.{SCHEMA}.monte_carlo_results')
+        print(f'\nBaseline saved → {CATALOG}.{SCHEMA}.monte_carlo_results')
+
+        # ── 12-month VaR evolution (SARIMA-driven) ─────────────────────────────
+        timeline_rows = []
+        for _mi, _month in enumerate(_forecast_months):
+            _month_res = ts_results[_month]
+            _growth    = _sarima_growth_for_month(_month)
+            _means_t   = _MC_MEANS * _growth
+            _row = {
+                'forecast_month':      str(_month),
+                'month_idx':           _mi + 1,
+                'property_mean_M':     float(_means_t[0]),
+                'auto_mean_M':         float(_means_t[1]),
+                'liability_mean_M':    float(_means_t[2]),
+                'total_mean_M':        _agg(_month_res, 'total_loss_mean'),
+                'var_99_M':            _agg(_month_res, 'var_99'),
+                'var_995_M':           _agg(_month_res, 'var_995'),
+                'cvar_99_M':           _agg(_month_res, 'cvar_99'),
+                'var_995_vs_baseline': (_agg(_month_res, 'var_995') / aggregate_var995 - 1.0) * 100,
+            }
+            timeline_rows.append(_row)
+            mlflow.log_metric(f'VaR_99_5_month_{_mi + 1:02d}', round(_row['var_995_M'], 2))
+
+        # Print VaR evolution table
+        print(f'\n  VaR EVOLUTION  (SARIMA-driven, {len(_forecast_months)}-month horizon)')
+        print('  ' + '─'*70)
+        print(f'  {"Month":<12} {"Exp.Loss":>10} {"VaR(99%)":>10} {"VaR(99.5%)":>12} {"Δ VaR(99.5%)":>14}')
+        print('  ' + '─'*70)
+        print(f'  {"[baseline]":<12} ${aggregate_mean:>8.1f}M ${aggregate_var99:>8.1f}M ${aggregate_var995:>10.1f}M  {"—":>12}')
+        for _row in timeline_rows:
+            print(
+                f'  {_row["forecast_month"]:<12} '
+                f'${_row["total_mean_M"]:>8.1f}M '
+                f'${_row["var_99_M"]:>8.1f}M '
+                f'${_row["var_995_M"]:>10.1f}M  '
+                f'{_row["var_995_vs_baseline"]:>+11.1f}%'
+            )
+        print('  ' + '─'*70)
+
+        ts_df = spark.createDataFrame(pd.DataFrame(timeline_rows))
+        (ts_df.write
+            .format('delta')
+            .mode('overwrite')
+            .option('overwriteSchema', 'true')
+            .saveAsTable(f'{CATALOG}.{SCHEMA}.portfolio_risk_timeline'))
+        print(f'\nVaR time-series saved → {CATALOG}.{SCHEMA}.portfolio_risk_timeline')
+
+        # Regional claims forecast (SARIMA breakdown by region × month)
+        if '_sarima_pd' in dir():
+            _reg_df = spark.createDataFrame(
+                _sarima_pd[_sarima_pd["record_type"] == "forecast"]
+                .groupby(["region", "month"])["forecast_mean"]
+                .sum()
+                .reset_index()
+                .rename(columns={"forecast_mean": "total_forecast_claims",
+                                  "month": "forecast_month"})
+            )
+            (_reg_df.write
+                .format('delta')
+                .mode('overwrite')
+                .option('overwriteSchema', 'true')
+                .saveAsTable(f'{CATALOG}.{SCHEMA}.regional_claims_forecast'))
+            print(f'Regional breakdown saved → {CATALOG}.{SCHEMA}.regional_claims_forecast')
 
 else:
     # Fallback: single-node t-Copula simulation without Ray (Serverless / no GPU)
@@ -1065,6 +1294,7 @@ else:
 # MAGIC |---|---|---|---|
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments × 72 months | Claim volume forecasting |
 # MAGIC | GARCH(1,1) | arch + applyInPandas | 52 segments | Loss ratio volatility, risk capital |
-# MAGIC | Monte Carlo (t-Copula + Lognormal) | Ray + PyTorch GPU | 4M scenarios (4 tasks × 1M paths) | VaR, CVaR, SCR calculation |
+# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 4M paths (4 tasks × 1M) | VaR(99.5%), CVaR, SCR — current period |
+# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMA-driven) | 48M paths (12 months × 4 × 1M) | Forward VaR, regional breakdown |
 # MAGIC
 # MAGIC **Next:** Module 5 — Log the best SARIMA model to MLflow, register in UC, and deploy a Model Serving endpoint.
