@@ -414,23 +414,33 @@ print("Skipping wait for demo — calling endpoint assumes it's already ready.\n
 
 # ── Sample call ───────────────────────────────────────────────────────────────
 def call_forecasting_endpoint(horizon: int) -> dict:
-    """Call the SARIMA forecasting endpoint."""
+    """Call the SARIMA forecasting endpoint.
+
+    Returns an error dict (instead of raising) on timeout or HTTP errors so the
+    notebook cell doesn't fail when the endpoint is still warming up after creation.
+    """
     payload = {
         "dataframe_records": [{"horizon": horizon}]
     }
-    resp = requests.post(
-        f"https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations",
-        headers={
-            "Authorization":  f"Bearer {TOKEN}",
-            "Content-Type":   "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code == 200:
-        return resp.json()
-    else:
-        return {"error": resp.text, "status_code": resp.status_code}
+    try:
+        resp = requests.post(
+            f"https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations",
+            headers={
+                "Authorization":  f"Bearer {TOKEN}",
+                "Content-Type":   "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            return {"error": resp.text, "status_code": resp.status_code}
+    except requests.exceptions.Timeout:
+        return {"note": "Endpoint is still warming up — it takes ~5 min to reach READY state. "
+                        "Re-run this cell once the endpoint is READY."}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 # Request a 6-month forecast
 print("Requesting 6-month forecast from Model Serving endpoint...\n")
