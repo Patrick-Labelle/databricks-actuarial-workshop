@@ -42,6 +42,29 @@ import time
 import urllib.request
 import urllib.error
 
+
+def _pg_connect_with_retry(max_retries: int = 4, base_delay: float = 30.0, **kwargs):
+    """psycopg2.connect with exponential backoff for Lakebase rate-limit errors.
+
+    Lakebase Autoscaling enforces a per-endpoint connection-attempt rate limit.
+    Multiple rapid retries (e.g. from repeated deploy.sh invocations) exhaust
+    the limit; waiting between attempts lets the window reset.
+    """
+    for attempt in range(max_retries):
+        try:
+            return psycopg2.connect(**kwargs)
+        except psycopg2.OperationalError as exc:
+            msg = str(exc).lower()
+            is_rate_limit = "rate limit" in msg
+            is_last = attempt == max_retries - 1
+            if is_rate_limit and not is_last:
+                delay = base_delay * (2 ** attempt)   # 30s, 60s, 120s …
+                print(f"    [RETRY] Rate limit — waiting {delay:.0f}s "
+                      f"(attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise
+
 try:
     import psycopg2
     import psycopg2.extensions
@@ -154,7 +177,7 @@ def main() -> None:
 
     # ── 2–3. Connect to admin DB and create workshop DB ──────────────────────
     print(f"==> Connecting to databricks_postgres ...")
-    conn = psycopg2.connect(
+    conn = _pg_connect_with_retry(
         host=host, port=5432, database="databricks_postgres",
         user=current_user, password=token, sslmode="require",
         connect_timeout=30,
@@ -175,8 +198,11 @@ def main() -> None:
     # NOTE: GRANT CONNECT must happen AFTER databricks_create_role() creates the
     # Postgres role.  The role is created inside the workshop DB, but GRANT
     # CONNECT on a database can be executed from any connection.
+    # Brief pause between the two connections to stay below the per-endpoint
+    # rate limit (rapid sequential connections from repeated deploys can trip it).
+    time.sleep(5)
     print(f"==> Connecting to {args.pg_database} ...")
-    conn = psycopg2.connect(
+    conn = _pg_connect_with_retry(
         host=host, port=5432, database=args.pg_database,
         user=current_user, password=token, sslmode="require",
         connect_timeout=30,
