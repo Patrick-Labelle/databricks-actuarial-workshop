@@ -105,30 +105,17 @@ print("Host:", HOST)
 # COMMAND ----------
 
 # ─── 2. Get an endpoint credential for Postgres authentication ─────────────────
-# Lakebase Autoscaling's databricks_auth extension requires a Databricks PAT.
-# On serverless compute DATABRICKS_TOKEN is an OAuth token (not a PAT), so we
-# create a short-lived PAT via the Token API to use as the Postgres password.
+# On classic clusters, apiToken().get() returns a PAT accepted by Lakebase's
+# databricks_auth extension. On serverless, this task must run on a classic
+# cluster (see job_cluster_key override in databricks.local.yml).
 PG_TOKEN = TOKEN
-_pat_resp = requests.post(
-    f"https://{WORKSPACE_URL}/api/2.0/token/create",
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-    json={"lifetime_seconds": 600, "comment": "actuarial-workshop-setup temp token"},
-    timeout=15,
-)
-if _pat_resp.status_code == 200:
-    PG_TOKEN = _pat_resp.json().get("token_value", TOKEN)
-    print(f"[OK] Created short-lived PAT for Lakebase Postgres authentication")
-else:
-    print(f"[WARN] Could not create temp PAT ({_pat_resp.status_code}): {_pat_resp.text[:100]}")
-    print("[WARN] Falling back to DATABRICKS_TOKEN (may fail if not a PAT)")
-print(f"Using token for Postgres authentication (user: {CURRENT_USER})")
+print(f"Using Databricks token for Postgres authentication (user: {CURRENT_USER})")
 
 # COMMAND ----------
 
 # ─── 3. Create database if it doesn't exist ────────────────────────────────────
 # Connect to the default 'databricks_postgres' database first, then create
 # the custom workshop database.
-print(f"[DEBUG] Connecting to Lakebase: host={HOST}, user={CURRENT_USER}, db=databricks_postgres")
 conn = psycopg2.connect(
     host=HOST, port=5432, database="databricks_postgres",
     user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
