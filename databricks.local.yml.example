@@ -22,3 +22,46 @@ targets:
       warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
       pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional
+
+  # ── Optional: Ray-enabled variant (classic ML cluster for Module 4) ──────────
+  # Identical to my-workspace above, except Task 5 (fit_statistical_models) runs
+  # on a classic DBR 17.4 ML job cluster so that Ray-on-Spark can execute.
+  # All other tasks remain on serverless.  Use ./deploy-ray.sh to deploy.
+  #
+  # Note: classic cluster spin-up adds ~5-10 min to the setup job.
+  # Only supported on non-serverless workspaces (classic clusters not available
+  # on serverless-only workspaces such as FEVM).
+  my-workspace-ray:                                               # ← rename this (convention: add -ray suffix)
+    workspace:
+      host: https://your-workspace.cloud.databricks.com          # ← same as above
+      profile: your-profile                                       # ← same as above
+    variables:
+      catalog: your_catalog                                       # ← same as above
+      schema: actuarial_workshop
+      endpoint_name: actuarial-workshop-sarima-forecaster
+      warehouse_id: "your_warehouse_id"                           # ← same as above
+      pg_database: actuarial_workshop_db
+      notification_email: your.email@example.com
+    resources:
+      jobs:
+        actuarial_workshop_setup:
+          # Add a classic ML cluster used only by the fit_statistical_models task.
+          job_clusters:
+            - job_cluster_key: ray_ml_cluster
+              new_cluster:
+                spark_version: "17.4.x-cpu-ml-scala2.12"
+                node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
+                num_workers: 2
+                aws_attributes:
+                  first_on_demand: 1
+                  availability: SPOT_WITH_FALLBACK
+          tasks:
+            # Override task 5 to use the classic ML cluster instead of serverless,
+            # and enable Ray (run_ray: "auto") and applyInPandas (job_mode: "false").
+            - task_key: fit_statistical_models
+              environment_key: null   # remove serverless env — cluster is provided by job_cluster_key
+              job_cluster_key: ray_ml_cluster
+              notebook_task:
+                base_parameters:
+                  run_ray: "auto"    # Ray-on-Spark works on classic ML clusters
+                  job_mode: "false"  # use applyInPandas (works on classic cluster)

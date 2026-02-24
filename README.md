@@ -74,12 +74,35 @@ The setup job runs the following modules in sequence:
 
 ---
 
+## Ray-Enabled Deployment (Module 4 on classic ML cluster)
+
+Module 4 (`04_classical_stats_at_scale.py`) includes optional Ray-on-Spark code that requires
+a classic ML runtime cluster. By default, the setup job skips the Ray section (`run_ray: "skip"`)
+so the full pipeline runs on serverless. If you want to demonstrate Ray, use the Ray-enabled variant:
+
+```bash
+./deploy-ray.sh        # deploys to e2-demo-ray target (~25-30 min, allows ~5-10 min for cluster spin-up)
+./destroy-ray.sh       # full teardown for the e2-demo-ray deployment
+```
+
+`deploy-ray.sh` and `destroy-ray.sh` are thin wrappers around `deploy.sh` / `destroy.sh` that pass
+`--target e2-demo-ray`. The `e2-demo-ray` target (defined in `databricks.local.yml`) inherits all
+workspace settings from `e2-demo` and adds one override: Task 5 (`fit_statistical_models`) is moved
+from serverless to a classic DBR 17.4 ML job cluster, and `run_ray: "auto"` + `job_mode: "false"`
+are passed to the notebook so the full Ray and `applyInPandas` paths execute.
+
+> **Note:** Classic ML clusters are not available on serverless-only workspaces (e.g. FEVM).
+> The Ray variant targets the `e2-demo-field-eng` workspace.
+
+---
+
 ## Targets
 
 | Target | Workspace | Notes |
 |--------|-----------|-------|
 | `dev` (default) | Your configured profile | Adds `[dev <user>]` prefix to resource names |
 | _(your target)_ | Defined in `databricks.local.yml` | gitignored; auto-merged by bundle |
+| `e2-demo-ray` | e2-demo-field-eng | Same as e2-demo + Task 5 on classic DBR 17.4 ML cluster (Ray enabled) |
 
 The bundle's `include:` glob (`databricks.local*.yml`) automatically merges your
 local target definitions when present, and silently skips if the file is absent.
