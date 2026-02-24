@@ -37,31 +37,33 @@ APP_SP_CLIENT_ID      = dbutils.widgets.get("app_sp_client_id")
 ENDPOINT_NAME         = dbutils.widgets.get("endpoint_name")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-import os
+import os, sys
 
 # Serverless-compatible token acquisition.
-# Method 1: notebook context (works on classic clusters and scheduled job runs).
-# Method 2: DATABRICKS_TOKEN env var (set automatically on serverless compute).
-TOKEN = None
-try:
-    TOKEN = (
-        dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-        .apiToken().get()
-    )
-except Exception:
-    TOKEN = None
-
+# Try DATABRICKS_TOKEN env var first — set automatically on all serverless
+# compute, and avoids apiToken().get() which can block indefinitely on
+# serverless one-time runs.  Fall back to the notebook context for classic
+# clusters where the env var is not present.
+TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 if not TOKEN:
-    TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+    try:
+        TOKEN = (
+            dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+            .apiToken().get()
+        )
+    except Exception:
+        TOKEN = ""
 
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
-print(f"Workspace:        {WORKSPACE_URL}")
-print(f"Catalog/Schema:   {CATALOG}.{SCHEMA}")
-print(f"Lakebase path:    {LAKEBASE_ENDPOINT_PATH} / {PG_DATABASE}")
-print(f"Endpoint:         {ENDPOINT_NAME}")
-print(f"App SP client ID: {APP_SP_CLIENT_ID or '(not provided)'}")
-print(f"Running as:       {CURRENT_USER}")
+import sys
+print(f"Workspace:        {WORKSPACE_URL}", flush=True)
+print(f"Catalog/Schema:   {CATALOG}.{SCHEMA}", flush=True)
+print(f"Lakebase path:    {LAKEBASE_ENDPOINT_PATH} / {PG_DATABASE}", flush=True)
+print(f"Endpoint:         {ENDPOINT_NAME}", flush=True)
+print(f"App SP client ID: {APP_SP_CLIENT_ID or '(not provided)'}", flush=True)
+print(f"Running as:       {CURRENT_USER}", flush=True)
+print(f"Token source:     {'notebook-context' if TOKEN else 'MISSING'} ({len(TOKEN)} chars)", flush=True)
 
 # COMMAND ----------
 
@@ -114,9 +116,11 @@ print(f"Using Databricks access token for Postgres authentication (user: {CURREN
 # ─── 3. Create database if it doesn't exist ────────────────────────────────────
 # Connect to the default 'databricks_postgres' database first, then create
 # the custom workshop database.
+print(f"[DEBUG] Connecting to Lakebase: host={HOST}, user={CURRENT_USER}, db=databricks_postgres")
 conn = psycopg2.connect(
     host=HOST, port=5432, database="databricks_postgres",
     user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
+    connect_timeout=30,
 )
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 cur = conn.cursor()
