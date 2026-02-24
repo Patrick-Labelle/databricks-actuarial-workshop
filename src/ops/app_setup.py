@@ -40,9 +40,8 @@ WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os
 
 # Serverless-compatible token acquisition.
-# Method 1: notebook context (classic clusters and most job runs).
-# Method 2: Databricks SDK authenticate() (serverless one-time runs where
-#           the notebook context token is unavailable).
+# Method 1: notebook context (works on classic clusters and scheduled job runs).
+# Method 2: DATABRICKS_TOKEN env var (set automatically on serverless compute).
 TOKEN = None
 try:
     TOKEN = (
@@ -53,13 +52,7 @@ except Exception:
     TOKEN = None
 
 if not TOKEN:
-    try:
-        from databricks.sdk import WorkspaceClient as _WC
-        _h = {}
-        _WC().config.authenticate(_h)
-        TOKEN = _h.get("Authorization", "").replace("Bearer ", "")
-    except Exception:
-        TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+    TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
