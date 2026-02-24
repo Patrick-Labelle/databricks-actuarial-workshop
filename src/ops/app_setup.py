@@ -116,18 +116,25 @@ print("Host:", HOST)
 # databricks_auth extension. On serverless, this task must run on a classic
 # cluster (see job_cluster_key override in databricks.local.yml).
 PG_TOKEN = TOKEN
-print(f"Using Databricks token for Postgres authentication (user: {CURRENT_USER})")
+_pg_prefix = PG_TOKEN[:6] if PG_TOKEN else "EMPTY"
+print(f"Using token for Postgres auth: source={_token_source}, len={len(PG_TOKEN)}, prefix={_pg_prefix}")
 
 # COMMAND ----------
 
 # ─── 3. Create database if it doesn't exist ────────────────────────────────────
 # Connect to the default 'databricks_postgres' database first, then create
 # the custom workshop database.
-conn = psycopg2.connect(
-    host=HOST, port=5432, database="databricks_postgres",
-    user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
-    connect_timeout=30,
-)
+try:
+    conn = psycopg2.connect(
+        host=HOST, port=5432, database="databricks_postgres",
+        user=CURRENT_USER, password=PG_TOKEN, sslmode="require",
+        connect_timeout=30,
+    )
+except Exception as _e:
+    raise RuntimeError(
+        f"Lakebase auth failed — token source={_token_source}, "
+        f"len={len(PG_TOKEN)}, prefix={_pg_prefix}, user={CURRENT_USER}: {_e}"
+    ) from _e
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 cur = conn.cursor()
 
