@@ -30,11 +30,10 @@ env:
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
 
-  # Lakebase (Postgres) — PGHOST injected at runtime from the 'database' app resource.
-  # The app's service principal is granted CAN_CONNECT_AND_CREATE (see app.yml).
-  # PGHOST is empty → Lakebase features are gracefully disabled if resource is absent.
-  - name: PGHOST
-    valueFrom: database
+  # Lakebase (Postgres) — PGHOST is resolved at runtime by the app via the SDK
+  # (w.api_client.do GET on the endpoint resource). LAKEBASE_ENDPOINT_PATH comes
+  # from app/_bundle_config.py (written by deploy.sh after bundle deploy).
+  # The app SP is granted access via databricks_create_role() in app_setup.py.
   - name: PGPORT
     value: "5432"
   - name: PGSSLMODE

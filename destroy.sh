@@ -23,6 +23,16 @@
 
 set -euo pipefail
 
+# ── Minimum CLI version check ─────────────────────────────────────────────────
+_CLI_VER=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
+_CLI_MAJOR=$(echo "$_CLI_VER" | cut -d. -f1)
+_CLI_MINOR=$(echo "$_CLI_VER" | cut -d. -f2)
+if [ "$_CLI_MAJOR" -lt 1 ] && [ "$_CLI_MINOR" -lt 287 ]; then
+    echo "ERROR: Databricks CLI >= 0.287.0 required (found ${_CLI_VER})." >&2
+    echo "       Install: https://docs.databricks.com/aws/en/dev-tools/cli/install" >&2
+    exit 1
+fi
+
 BUNDLE_ARGS=("$@")
 
 # Extract only the flags that `bundle validate` accepts (--target, --profile, --var)
@@ -176,7 +186,41 @@ MODEL_NAME="${CATALOG}.${SCHEMA}.sarima_claims_forecaster"
 api_delete "UC model ${MODEL_NAME}" \
     "/api/2.1/unity-catalog/models/${MODEL_NAME}"
 
-# ── 2e. Delete MLflow experiments
+# ── 2e. Delete Lakebase Autoscaling project
+# `bundle destroy` cannot delete read-write endpoints via the Terraform provider,
+# so we delete the project explicitly here (this cascades to all branches and
+# endpoints). The subsequent bundle destroy will see 404s and treat them as
+# already-deleted, completing cleanly.
+echo ""
+echo "    Deleting Lakebase project actuarial-workshop-lakebase..."
+python3 - <<PYEOF
+import urllib.request, urllib.error, json, time, sys
+
+host    = "${WORKSPACE_HOST}"
+token   = "${TOKEN}"
+headers = {"Authorization": f"Bearer {token}"}
+
+def req(method, path, body=None):
+    url  = f"{host}{path}"
+    data = json.dumps(body).encode() if body else None
+    r = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(r) as resp:
+            return resp.status, json.loads(resp.read() or b'{}')
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b'{}')
+
+# Delete the entire project (cascades to branches and endpoints)
+status, data = req("DELETE", "/api/2.0/postgres/projects/actuarial-workshop-lakebase")
+if status in (200, 202, 204):
+    print("    [OK]       Lakebase project deleted (async deletion may continue in background)")
+elif status == 404:
+    print("    [SKIP]     Lakebase project not found")
+else:
+    print(f"    [WARN]     Lakebase project delete returned HTTP {status}: {data}", file=sys.stderr)
+PYEOF
+
+# ── 2f. Delete MLflow experiments
 # The setup job creates two experiments under /Users/<user>/actuarial_workshop_*
 echo ""
 echo "    Deleting MLflow experiments for ${CURRENT_USER}..."

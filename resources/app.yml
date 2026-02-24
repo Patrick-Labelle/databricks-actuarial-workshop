@@ -24,9 +24,7 @@ resources:
             id: "${var.warehouse_id}"
             permission: CAN_USE
 
-        - name: database
-          description: "Lakebase (managed Postgres) for persistent scenario annotations"
-          database:
-            instance_name: "${resources.database_instances.actuarial_workshop_lakebase.name}"
-            database_name: "postgres"
-            permission: CAN_CONNECT_AND_CREATE
+        # Lakebase Autoscaling projects do not support the 'database' app resource
+        # type — there is no valueFrom injection for postgres_projects. The app
+        # resolves PGHOST at runtime via the SDK and authenticates via
+        # generate_database_credential. Permissions are granted in app_setup.py.

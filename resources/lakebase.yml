@@ -1,15 +1,35 @@
-# ─── Lakebase: Managed PostgreSQL ────────────────────────────────────────────
-# Provisions a Databricks-managed Postgres instance for the Actuarial Workshop.
-# Used by the Streamlit app to persist scenario annotations across sessions.
+# ─── Lakebase: Autoscaling PostgreSQL Project ────────────────────────────────
+# Provisions a Databricks Lakebase Autoscaling project (scale-to-zero Postgres)
+# for the Actuarial Workshop app to persist scenario annotations across sessions.
 #
-# capacity CU_1 is the smallest sku (1 compute unit) — sufficient for a demo.
-# The app's service principal is granted access via the app resource in app.yml.
+# Three resources form a hierarchy: Project → Branch → Endpoint.
+# A single read-write endpoint on the 'main' branch is sufficient for the demo.
+#
+# autoscaling_limit_min_cu: 0.5 enables scale-to-zero (pauses when idle).
+# autoscaling_limit_max_cu: 2 caps compute for demo cost control.
+#
+# NOTE: `databricks bundle destroy` cannot delete read-write endpoints via the
+# Terraform provider. destroy.sh handles Lakebase project deletion explicitly
+# via the REST API before calling bundle destroy.
 
 resources:
-  database_instances:
+  postgres_projects:
     actuarial_workshop_lakebase:
-      name: "actuarial-workshop-lakebase"
-      capacity: CU_1
-      # Allow Databricks tokens (PAT / notebook context token) to authenticate as a
-      # Postgres role. Required for psycopg2 connections from notebooks and the app.
-      enable_pg_native_login: true
+      project_id: "actuarial-workshop-lakebase"
+      display_name: "Actuarial Workshop"
+      pg_version: 17
+
+  postgres_branches:
+    actuarial_workshop_branch:
+      parent: ${resources.postgres_projects.actuarial_workshop_lakebase.id}
+      branch_id: main
+      no_expiry: true
+      is_protected: true
+
+  postgres_endpoints:
+    actuarial_workshop_endpoint:
+      parent: ${resources.postgres_branches.actuarial_workshop_branch.id}
+      endpoint_id: primary
+      endpoint_type: ENDPOINT_TYPE_READ_WRITE
+      autoscaling_limit_min_cu: 0.5
+      autoscaling_limit_max_cu: 2
