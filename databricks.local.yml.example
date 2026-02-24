@@ -49,7 +49,7 @@ targets:
           job_clusters:
             - job_cluster_key: ray_ml_cluster
               new_cluster:
-                spark_version: "17.4.x-cpu-ml-scala2.12"
+                spark_version: "16.4.x-cpu-ml-scala2.12"
                 node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
                 num_workers: 2
                 aws_attributes:

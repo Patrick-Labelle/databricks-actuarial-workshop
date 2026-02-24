@@ -191,8 +191,14 @@ api_delete "UC model ${MODEL_NAME}" \
 # so we delete the project explicitly here (this cascades to all branches and
 # endpoints). The subsequent bundle destroy will see 404s and treat them as
 # already-deleted, completing cleanly.
+#
+# Limitation: if the branch was deployed with is_protected=true, the Lakebase
+# REST API will refuse to delete the project (HTTP 400). In that case we print
+# a warning and proceed; bundle destroy will also fail for the same resource,
+# and a note about manual cleanup is printed at the end.
 echo ""
 echo "    Deleting Lakebase project actuarial-workshop-lakebase..."
+_LAKEBASE_DELETED=0
 python3 - <<PYEOF
 import urllib.request, urllib.error, json, time, sys
 
@@ -202,23 +208,54 @@ headers = {"Authorization": f"Bearer {token}"}
 
 def req(method, path, body=None):
     url  = f"{host}{path}"
-    data = json.dumps(body).encode() if body else None
-    r = urllib.request.Request(url, data=data, headers=headers, method=method)
+    hdrs = dict(headers)
+    if body is not None:
+        hdrs["Content-Type"] = "application/json"
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(r) as resp:
             return resp.status, json.loads(resp.read() or b'{}')
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b'{}')
 
-# Delete the entire project (cascades to branches and endpoints)
-status, data = req("DELETE", "/api/2.0/postgres/projects/actuarial-workshop-lakebase")
-if status in (200, 202, 204):
-    print("    [OK]       Lakebase project deleted (async deletion may continue in background)")
-elif status == 404:
-    print("    [SKIP]     Lakebase project not found")
-else:
-    print(f"    [WARN]     Lakebase project delete returned HTTP {status}: {data}", file=sys.stderr)
+PROJECT = "actuarial-workshop-lakebase"
+
+# Try deleting the project (cascades to branches and endpoints).
+# Retry a few times in case endpoint reconciliation is in progress (HTTP 409).
+deleted = False
+for attempt in range(4):
+    status, data = req("DELETE", f"/api/2.0/postgres/projects/{PROJECT}")
+    if status in (200, 202, 204):
+        print("    [OK]       Lakebase project deleted (async deletion may continue in background)")
+        deleted = True
+        break
+    elif status == 404:
+        print("    [SKIP]     Lakebase project not found")
+        deleted = True
+        break
+    elif status == 409:
+        wait = 15 * (attempt + 1)
+        print(f"    [WAIT]     Endpoint reconciliation in progress, retrying in {wait}s...")
+        time.sleep(wait)
+    elif status == 400 and "protected" in data.get("message", ""):
+        # Branch is is_protected=true — the REST API cannot unprotect it.
+        # bundle destroy (via the Terraform provider) handles protected branches
+        # correctly during its own destroy lifecycle; allow it to proceed.
+        print("    [WARN]     Protected branch detected — bundle destroy will handle Lakebase cleanup",
+              file=sys.stderr)
+        print("    [WARN]     If bundle destroy also fails, delete the project manually in the workspace UI",
+              file=sys.stderr)
+        break
+    else:
+        print(f"    [WARN]     Lakebase project delete returned HTTP {status}: {data}", file=sys.stderr)
+        break
+
+if not deleted:
+    # Signal to the outer shell that Lakebase was not pre-deleted.
+    sys.exit(1)
 PYEOF
+_LAKEBASE_DELETED=$?
 
 # ── 2f. Delete MLflow experiments
 # The setup job creates two experiments under /Users/<user>/actuarial_workshop_*
@@ -264,7 +301,22 @@ echo ""
 
 # ── Step 3: bundle destroy ────────────────────────────────────────────────────
 echo "==> Running databricks bundle destroy ${BUNDLE_ARGS[*]}"
-databricks bundle destroy "${BUNDLE_ARGS[@]}"
+_BUNDLE_EXIT=0
+databricks bundle destroy "${BUNDLE_ARGS[@]}" || _BUNDLE_EXIT=$?
+if [ "$_BUNDLE_EXIT" -ne 0 ] && [ "$_LAKEBASE_DELETED" -ne 0 ]; then
+    # bundle destroy failed AND Lakebase was not pre-deleted (protected branch).
+    # The failure is expected for the Lakebase endpoint. All other resources
+    # (jobs, DLT pipeline, app) were still deleted. Warn and continue.
+    echo ""
+    echo "    [WARN] bundle destroy reported errors (likely the Lakebase read-write endpoint)."
+    echo "    [WARN] To complete Lakebase cleanup, delete the project manually:"
+    echo "    [WARN]   Workspace UI → Catalog → Lakebase → actuarial-workshop-lakebase → Delete"
+    echo "    [WARN] Or run: databricks postgres delete-project projects/actuarial-workshop-lakebase --profile ${PROFILE}"
+elif [ "$_BUNDLE_EXIT" -ne 0 ]; then
+    # Lakebase was deleted but bundle destroy still failed — unexpected error.
+    echo "ERROR: bundle destroy failed (exit code ${_BUNDLE_EXIT})." >&2
+    exit "$_BUNDLE_EXIT"
+fi
 
 # ── Step 4: remove workspace bundle folder ────────────────────────────────────
 # bundle destroy does not clean up the workspace file sync directories.
