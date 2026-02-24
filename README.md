@@ -10,16 +10,19 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 .
 ├── databricks.yml            # Bundle config — variables, sync, includes
 ├── databricks.local.yml.example  # Template for your workspace-specific target
-├── deploy.sh                 # End-to-end deploy: bundle deploy → setup job → app deploy
+├── deploy.sh                 # End-to-end deploy: bundle deploy → Lakebase setup → setup job → app deploy
+├── deploy-ray.sh             # Thin wrapper: deploys to the Ray-enabled target
 ├── destroy.sh                # Full teardown: workspace assets + bundle destroy
 ├── resources/
 │   ├── pipeline.yml          # DLT pipeline (Bronze → Silver → Gold)
 │   ├── jobs.yml              # Orchestration jobs (setup + monthly refresh)
 │   ├── app.yml               # Databricks App resource + SP authorizations
 │   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
+├── scripts/
+│   └── lakebase_setup.py     # Local Lakebase setup script (runs from deploy.sh using CLI OAuth JWT)
 ├── src/
 │   ├── ops/
-│   │   ├── app_setup.py      # App setup: Lakebase DB, table, UC + PG grants
+│   │   ├── app_setup.py      # UC grants + model serving CAN_QUERY (runs as job task)
 │   │   └── cleanup.py        # Post-workshop teardown notebook
 │   └── 01–07_*.py            # Workshop notebooks (Modules 1–6 + Bonus)
 ├── app/
@@ -41,13 +44,30 @@ Edit `databricks.local.yml` — fill in your workspace host, CLI profile, catalo
 and warehouse ID. This file is gitignored and auto-merged by the bundle, so your
 sensitive values never touch version control.
 
-### 2. Validate
+### 2. Install prerequisites
+
+`deploy.sh` requires **Databricks CLI >= 0.287.0** (Lakebase resource support) and
+**`psycopg2-binary`** (local Lakebase database setup):
+
+```bash
+pip install psycopg2-binary
+```
+
+To upgrade the CLI if needed:
+```bash
+# macOS (download from GitHub releases):
+curl -fsSL https://github.com/databricks/cli/releases/latest/download/databricks_cli_darwin_arm64.zip \
+  -o /tmp/databricks_cli.zip && unzip -p /tmp/databricks_cli.zip databricks > ~/.local/bin/databricks \
+  && chmod +x ~/.local/bin/databricks
+```
+
+### 3. Validate
 
 ```bash
 databricks bundle validate --target my-workspace
 ```
 
-### 3. Deploy
+### 4. Deploy
 
 ```bash
 ./deploy.sh --target my-workspace
@@ -63,6 +83,13 @@ databricks bundle validate --target my-workspace
 >    app's service principal permissions on all UC catalog/schema/tables, Lakebase, and the model-serving endpoint.
 > 5. Deploys the app source code only after all permissions are in place, so the app starts without permission errors.
 
+Between steps 2 and 4, `deploy.sh` runs `scripts/lakebase_setup.py` locally to
+provision the PostgreSQL database, create the `scenario_annotations` table, and
+grant the app service principal access. This runs locally (not on a Databricks
+cluster) because Lakebase Autoscaling's `databricks_auth` extension only accepts
+standard OAuth JWTs issued by the workspace OIDC endpoint — internal cluster tokens
+are not accepted (see [Lakebase authentication](#lakebase-authentication) below).
+
 The setup job runs the following modules in sequence:
 1. Generate synthetic policy CDC data
 2. Run the DLT pipeline (Bronze → Silver → Gold)
@@ -70,7 +97,7 @@ The setup job runs the following modules in sequence:
 4. Register the Feature Store + Online Table (Module 3)
 5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
 6. Register model to UC Registry + create Model Serving endpoint (Module 5)
-7. **App setup** — create Lakebase DB, `scenario_annotations` table, grant UC permissions and PostgreSQL privileges to the app service principal, and grant `CAN_QUERY` on the serving endpoint to the app SP
+7. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on the serving endpoint to the app service principal
 
 ---
 
@@ -182,7 +209,7 @@ After running `./deploy.sh`, the following resources will be created:
 | Resource | Name |
 |----------|------|
 | Lakebase instance | `actuarial-workshop-lakebase` (provisioned by bundle deploy) |
-| Lakebase database | `actuarial_workshop_db` (created by setup job Task 7) |
+| Lakebase database | `actuarial_workshop_db` (created by `scripts/lakebase_setup.py` in `deploy.sh`) |
 | DLT Pipeline | `actuarial-workshop-medallion` |
 | Setup Job | `Actuarial Workshop — Full Setup` |
 | Monthly Refresh Job | `Actuarial Workshop — Monthly Model Refresh` |
@@ -190,6 +217,29 @@ After running `./deploy.sh`, the following resources will be created:
 | Databricks App | `actuarial-workshop` |
 | Feature Table | `{catalog}.{schema}.segment_monthly_features` |
 | UC Model | `{catalog}.{schema}.sarima_claims_forecaster` |
+
+---
+
+## Lakebase Authentication
+
+Lakebase Autoscaling endpoints authenticate via the `databricks_auth` PostgreSQL
+extension. This extension validates **standard OAuth JWTs** (RFC 7519 tokens issued
+by the workspace OIDC endpoint), which it receives as the PostgreSQL password. It
+validates the token's signature against the workspace OIDC public keys and maps the
+`sub` claim to the PostgreSQL username.
+
+**What works:** OAuth JWTs from `databricks auth token` (eyJ... prefix, ~850 chars,
+includes `sub`, `iss`, `aud`, `scope` claims).
+
+**What does NOT work:**
+- Internal Databricks cluster tokens (`apiToken()`, ~36 chars, opaque, no JWT claims)
+- PATs (`dapi...`, also opaque tokens rejected by JWT validation)
+- Serverless `DATABRICKS_TOKEN` (also an opaque internal token)
+
+This is why `scripts/lakebase_setup.py` runs **locally from `deploy.sh`** using the
+CLI's OAuth JWT, rather than from a Databricks job task. The app itself uses
+`generate_database_credential` (which does produce a valid OAuth credential for
+service principals) to authenticate at runtime.
 
 ---
 
