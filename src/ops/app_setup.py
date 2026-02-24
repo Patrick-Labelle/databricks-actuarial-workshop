@@ -40,21 +40,11 @@ WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os, sys
 
 # Serverless-compatible token acquisition.
-# Use mlflow's databricks_utils which returns the correct token type (PAT or
-# OAuth) across all Databricks compute: interactive notebooks, classic job
-# clusters, and serverless.  Fall back to the DATABRICKS_TOKEN env var
-# (set automatically on serverless) and finally the notebook context.
-TOKEN = ""
-try:
-    from mlflow.utils.databricks_utils import get_databricks_host_creds
-    _creds = get_databricks_host_creds()
-    TOKEN = _creds.token or ""
-except Exception:
-    pass
-
-if not TOKEN:
-    TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
-
+# Try DATABRICKS_TOKEN env var first — set automatically on all serverless
+# compute, and avoids apiToken().get() which can block indefinitely on
+# serverless one-time runs.  Fall back to the notebook context for classic
+# clusters where the env var is not present.
+TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 if not TOKEN:
     try:
         TOKEN = (
@@ -115,11 +105,23 @@ print("Host:", HOST)
 # COMMAND ----------
 
 # ─── 2. Get an endpoint credential for Postgres authentication ─────────────────
-# For Lakebase Autoscaling, the standard Databricks access token is used directly
-# as the Postgres password. No separate credential API is required.
-# The connecting user (CURRENT_USER) is automatically a superuser on the project.
+# Lakebase Autoscaling's databricks_auth extension requires a Databricks PAT.
+# On serverless compute DATABRICKS_TOKEN is an OAuth token (not a PAT), so we
+# create a short-lived PAT via the Token API to use as the Postgres password.
 PG_TOKEN = TOKEN
-print(f"Using Databricks access token for Postgres authentication (user: {CURRENT_USER})")
+_pat_resp = requests.post(
+    f"https://{WORKSPACE_URL}/api/2.0/token/create",
+    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+    json={"lifetime_seconds": 600, "comment": "actuarial-workshop-setup temp token"},
+    timeout=15,
+)
+if _pat_resp.status_code == 200:
+    PG_TOKEN = _pat_resp.json().get("token_value", TOKEN)
+    print(f"[OK] Created short-lived PAT for Lakebase Postgres authentication")
+else:
+    print(f"[WARN] Could not create temp PAT ({_pat_resp.status_code}): {_pat_resp.text[:100]}")
+    print("[WARN] Falling back to DATABRICKS_TOKEN (may fail if not a PAT)")
+print(f"Using token for Postgres authentication (user: {CURRENT_USER})")
 
 # COMMAND ----------
 
