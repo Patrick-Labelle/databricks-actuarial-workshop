@@ -455,6 +455,14 @@ _CAT_PRESETS = {
         "means_mult": [2.0, 1.5, 2.2], "cv_mult": [1.3, 1.2, 1.4], "corr_add": 0.18,
         "desc": "Explosion, chemical spill, or structural collapse. High liability.",
     },
+    "Zombies": {
+        "means_mult": [144.0, 217.0, 316.0], "cv_mult": [7.71, 9.64, 6.43], "corr_add": 0.50,
+        "desc": "Societal collapse — 90% of maximum possible loss across all lines.",
+    },
+    "Asteroid": {
+        "means_mult": [200.0, 300.0, 500.0], "cv_mult": [9.0, 11.0, 8.0], "corr_add": 1.0,
+        "desc": "Extinction-level event — total portfolio loss (100% of maximum) across all lines.",
+    },
 }
 
 _RETURN_PERIOD_MULT = {
@@ -1390,8 +1398,8 @@ with tab5:
     _preset   = _CAT_PRESETS[_cat_type]
     _rp_mult  = _RETURN_PERIOD_MULT[_return_period]
     _bm, _bc, _bco = [12.5, 8.3, 5.7], [0.35, 0.28, 0.42], [0.40, 0.20, 0.30]
-    _def_means = [round(m * mu * _rp_mult, 1) for m, mu in zip(_bm, _preset["means_mult"])]
-    _def_cvs   = [round(c * cu, 2) for c, cu in zip(_bc, _preset["cv_mult"])]
+    _def_means = [min(round(m * mu * _rp_mult, 1), 2000.0) for m, mu in zip(_bm, _preset["means_mult"])]
+    _def_cvs   = [min(round(c * cu, 2), 3.0) for c, cu in zip(_bc, _preset["cv_mult"])]
     _def_corrs = [min(c + _preset["corr_add"], 0.95) for c in _bco]
 
     with st.expander("⚙️ Adjust scenario parameters", expanded=False):
