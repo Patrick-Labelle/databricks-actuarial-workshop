@@ -44,22 +44,28 @@ import urllib.error
 
 
 def _pg_connect_with_retry(max_retries: int = 4, base_delay: float = 30.0, **kwargs):
-    """psycopg2.connect with exponential backoff for Lakebase rate-limit errors.
+    """psycopg2.connect with exponential backoff for transient Lakebase auth errors.
 
-    Lakebase Autoscaling enforces a per-endpoint connection-attempt rate limit.
-    Multiple rapid retries (e.g. from repeated deploy.sh invocations) exhaust
-    the limit; waiting between attempts lets the window reset.
+    Two transient failures are handled:
+    - "Connection attempt rate limit exceeded": rapid repeated deploys exhaust
+      the per-endpoint limit; waiting lets the window reset.
+    - "password authentication failed": the databricks_auth extension's JWT
+      verification service can take a moment to warm up on a cold/idle endpoint;
+      the first connection attempt may fail but subsequent ones succeed after a
+      brief wait.
+
+    Backoff schedule: 30s, 60s, 120s (3 retries, up to ~4 min total).
     """
     for attempt in range(max_retries):
         try:
             return psycopg2.connect(**kwargs)
         except psycopg2.OperationalError as exc:
             msg = str(exc).lower()
-            is_rate_limit = "rate limit" in msg
+            is_transient = "rate limit" in msg or "password authentication failed" in msg
             is_last = attempt == max_retries - 1
-            if is_rate_limit and not is_last:
+            if is_transient and not is_last:
                 delay = base_delay * (2 ** attempt)   # 30s, 60s, 120s …
-                print(f"    [RETRY] Rate limit — waiting {delay:.0f}s "
+                print(f"    [RETRY] Transient auth error — waiting {delay:.0f}s "
                       f"(attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
