@@ -74,6 +74,8 @@ SCHEMA=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('schema',{}).get('value',''))")
 ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('endpoint_name',{}).get('value',''))")
+MC_ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('mc_endpoint_name',{}).get('value',''))")
 WAREHOUSE_ID=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('warehouse_id',{}).get('value',''))")
 
@@ -177,14 +179,19 @@ fi
 api_delete "Online Table ${CATALOG}.${SCHEMA}.segment_features_online" \
     "/api/2.0/online-tables/${CATALOG}.${SCHEMA}.segment_features_online"
 
-# ── 2c. Delete Model Serving endpoint
+# ── 2c. Delete Model Serving endpoints (SARIMA + Monte Carlo)
 api_delete "Serving endpoint ${ENDPOINT_NAME}" \
     "/api/2.0/serving-endpoints/${ENDPOINT_NAME}"
+api_delete "Serving endpoint ${MC_ENDPOINT_NAME}" \
+    "/api/2.0/serving-endpoints/${MC_ENDPOINT_NAME}"
 
-# ── 2d. Delete UC registered model (and all versions)
+# ── 2d. Delete UC registered models (SARIMA + Monte Carlo, all versions)
 MODEL_NAME="${CATALOG}.${SCHEMA}.sarima_claims_forecaster"
 api_delete "UC model ${MODEL_NAME}" \
     "/api/2.1/unity-catalog/models/${MODEL_NAME}"
+MC_MODEL_NAME="${CATALOG}.${SCHEMA}.monte_carlo_portfolio"
+api_delete "UC model ${MC_MODEL_NAME}" \
+    "/api/2.1/unity-catalog/models/${MC_MODEL_NAME}"
 
 # ── 2e. Delete Lakebase Autoscaling project
 # `bundle destroy` cannot delete read-write endpoints via the Terraform provider,
@@ -277,6 +284,7 @@ headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json
 prefixes = [
     f"/Users/{user}/actuarial_workshop_sarima_claims_forecaster",
     f"/Users/{user}/actuarial_workshop_claims_sarima",
+    f"/Users/{user}/actuarial_workshop_monte_carlo_portfolio",
 ]
 
 def req(method, path, body=None):
