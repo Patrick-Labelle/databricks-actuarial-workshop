@@ -67,15 +67,16 @@ print(f"Model name:       {MODEL_NAME}")
 
 # COMMAND ----------
 
-# Load from Delta (written in Module 4)
+# Load from DLT gold layer (written by the DLT pipeline in Module 1)
 try:
     claims_pdf = (
-        spark.table(f"{CATALOG}.{SCHEMA}.claims_time_series")
+        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
         .filter("segment_id = 'Personal_Auto__Ontario'")
         .orderBy("month")
+        .select("month", "claims_count")
         .toPandas()
     )
-    print(f"Loaded {len(claims_pdf)} months from Delta table")
+    print(f"Loaded {len(claims_pdf)} months from gold_claims_monthly")
 except Exception:
     # Regenerate if Module 4 hasn't been run
     print("Generating sample data (run Module 4 first for full dataset)")
@@ -169,13 +170,18 @@ _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster")
 
 # Dataset reference for UC lineage — connects this model to its source table
-_claims_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.claims_time_series",
-    name="claims_time_series",
-)
+try:
+    _claims_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+        name="gold_claims_monthly",
+    )
+    _log_dataset = True
+except Exception:
+    _log_dataset = False
 
 with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as run:
-    mlflow.log_input(_claims_dataset, context="training")
+    if _log_dataset:
+        mlflow.log_input(_claims_dataset, context="training")
 
     # ── Fit model ────────────────────────────────────────────────────────────
     model = SARIMAX(
@@ -489,7 +495,7 @@ print(json.dumps(result, indent=2))
 # MAGIC Every step is captured in UC lineage automatically:
 # MAGIC
 # MAGIC ```
-# MAGIC claims_time_series (Delta table)
+# MAGIC gold_claims_monthly (DLT gold layer)
 # MAGIC        ↓ (training data)
 # MAGIC MLflow Run [sarima_personal_auto_ontario_champion]
 # MAGIC        ↓ (registered model)

@@ -30,14 +30,32 @@ resources:
               notification_email: "${var.notification_email}"
           environment_key: default_env
 
+        # Task 1b — Fetch real macro data from Statistics Canada
+        # Runs in parallel with nothing — depends only on generate_source_data creating
+        # the schema. Must complete before run_dlt_pipeline so that macro_indicators_raw
+        # exists and is populated when the DLT bronze_macro_indicators streaming table runs.
+        - task_key: fetch_macro_data
+          description: "Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw"
+          depends_on:
+            - task_key: generate_source_data
+          notebook_task:
+            notebook_path: ../scripts/fetch_macro_data.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+          environment_key: default_env
+
         # Task 2 — Run the DLT pipeline (Bronze → Silver → Gold)
         # full_refresh: true because generate_source_data recreates policy_cdc_raw via
         # CREATE OR REPLACE TABLE, which invalidates any existing streaming checkpoint.
         # A full refresh clears DLT checkpoints and re-reads the source from scratch.
+        # Depends on fetch_macro_data so macro_indicators_raw is populated before
+        # bronze_macro_indicators → silver_macro_indicators → gold_macro_features run.
         - task_key: run_dlt_pipeline
-          description: "DLT: Bronze → Silver (SCD Type 2) → Gold aggregates"
+          description: "DLT: Bronze → Silver (SCD Type 2) → Gold aggregates (policy + claims + macro)"
           depends_on:
             - task_key: generate_source_data
+            - task_key: fetch_macro_data
           pipeline_task:
             pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
             full_refresh: true
@@ -72,11 +90,12 @@ resources:
               job_mode: "true"
           environment_key: default_env
 
-        # Task 5 — Fit SARIMA / GARCH / Monte Carlo (Module 4)
+        # Task 5 — Fit SARIMAX / GARCH / Monte Carlo (Module 4)
+        # Reads gold_claims_monthly (DLT) and gold_macro_features (DLT, populated by fetch_macro_data).
         # run_ray=skip: setup_ray_cluster is not supported on Serverless (Spark Connect
         # does not expose the Ray-on-Spark RPC interface). The single-node NumPy fallback
         # produces identical outputs and is sufficient for the workshop and model registration.
-        # job_mode=true: use driver-side pandas groupby.apply() for SARIMA/GARCH instead of
+        # job_mode=true: use driver-side pandas groupby.apply() for SARIMAX/GARCH instead of
         # applyInPandas. On Serverless, %pip install only reaches the notebook kernel (client),
         # not the remote compute (server) where applyInPandas UDFs execute. Driver-side fitting
         # produces identical outputs and works reliably on all Serverless runtimes.
@@ -85,7 +104,7 @@ resources:
         # Classic-cluster targets (e2-demo-ray) add job_cluster_key via target override;
         # environment_key cannot coexist with job_cluster_key on classic compute.
         - task_key: fit_statistical_models
-          description: "SARIMA per segment, GARCH volatility, Monte Carlo simulation"
+          description: "SARIMAX per segment (+ macro exog), GARCH volatility, Monte Carlo simulation"
           depends_on:
             - task_key: build_feature_store
           notebook_task:
@@ -177,14 +196,24 @@ resources:
 
       tasks:
 
+        - task_key: fetch_macro_data
+          description: "Fetch latest StatCan macro indicators → macro_indicators_raw"
+          notebook_task:
+            notebook_path: ../scripts/fetch_macro_data.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+
         - task_key: refresh_dlt_pipeline
-          description: "Refresh Bronze→Silver→Gold via DLT Apply Changes"
+          description: "Refresh Bronze→Silver→Gold via DLT Apply Changes (incl. macro SCD2)"
+          depends_on:
+            - task_key: fetch_macro_data
           pipeline_task:
             pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
             full_refresh: false
 
         - task_key: refit_statistical_models
-          description: "Re-fit SARIMA/GARCH models on refreshed data"
+          description: "Re-fit SARIMAX/GARCH models on refreshed data with updated macro signals"
           depends_on:
             - task_key: refresh_dlt_pipeline
           notebook_task:

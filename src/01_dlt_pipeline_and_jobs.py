@@ -109,7 +109,11 @@ def generate_bronze_cdc_data(spark, catalog: str, schema: str, n_policies: int =
     np.random.seed(2024)
 
     PRODUCT_LINES  = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
-    REGIONS        = ["Ontario", "Quebec", "British_Columbia", "Alberta", "Atlantic"]
+    REGIONS        = [
+        "Ontario", "Quebec", "British_Columbia", "Alberta",
+        "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
+        "Prince_Edward_Island", "Newfoundland",
+    ]
     EVENT_TYPES    = ["NEW", "ENDORSEMENT", "CANCELLATION", "REINSTATEMENT"]
     EVENT_WEIGHTS  = [0.50,   0.30,          0.12,            0.08]
 
@@ -182,10 +186,159 @@ def generate_bronze_cdc_data(spark, catalog: str, schema: str, n_policies: int =
     print(f"Generated {count:,} CDC events for {n_policies} policies → {catalog}.{schema}.policy_cdc_raw")
     return sdf
 
+# ── Helper: generate synthetic claim incident data ────────────────────────────
+def generate_claims_events_data(spark, catalog: str, schema: str):
+    """
+    Generate individual claim incident records for Jan 2019 – Dec 2024.
+
+    Volume calibrated to Alberta Open Data 2013 loss ratios and IBC provincial
+    market shares. Each row is one claim event. Writes to claims_events_raw,
+    which feeds the DLT bronze_claims → gold_claims_monthly pipeline.
+
+    Returns the Spark DataFrame.
+    """
+    import numpy as np
+    import pandas as pd
+    from itertools import product as iterproduct
+
+    np.random.seed(2025)
+
+    PRODUCT_LINES = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
+    REGIONS = [
+        "Ontario", "Quebec", "British_Columbia", "Alberta",
+        "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
+        "Prince_Edward_Island", "Newfoundland",
+    ]
+    MONTHS = pd.date_range("2019-01-01", periods=72, freq="MS")
+
+    # Monthly claim counts for Alberta (region multiplier = 1.00)
+    BASE_CLAIMS = {
+        "Personal_Auto":       450,
+        "Commercial_Auto":     180,
+        "Homeowners":          320,
+        "Commercial_Property":  90,
+    }
+    # Alberta Open Data 2013: loss ratio calibration
+    LOSS_RATIO_TARGET = {
+        "Personal_Auto":       0.70,
+        "Commercial_Auto":     0.67,
+        "Homeowners":          0.62,
+        "Commercial_Property": 0.65,
+    }
+    # Average claim severity by product line
+    AVG_SEVERITY = {
+        "Personal_Auto":       6_500.0,
+        "Commercial_Auto":     9_200.0,
+        "Homeowners":          8_400.0,
+        "Commercial_Property": 14_000.0,
+    }
+    # IBC provincial market shares (relative volume multiplier)
+    REGION_MULTIPLIER = {
+        "Ontario":              1.40,
+        "Quebec":               1.10,
+        "British_Columbia":     1.20,
+        "Alberta":              1.00,
+        "Manitoba":             0.85,
+        "Saskatchewan":         0.80,
+        "New_Brunswick":        0.70,
+        "Nova_Scotia":          0.75,
+        "Prince_Edward_Island": 0.60,
+        "Newfoundland":         0.65,
+    }
+    CLAIM_TYPES = {
+        "Personal_Auto":       ["Collision", "Comprehensive", "Bodily_Injury"],
+        "Commercial_Auto":     ["Collision", "Comprehensive", "Bodily_Injury"],
+        "Homeowners":          ["Fire", "Water", "Theft", "Wind"],
+        "Commercial_Property": ["Fire", "Water", "Wind", "Equipment"],
+    }
+
+    segment_frames = []
+    for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
+        base       = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
+        loss_ratio = LOSS_RATIO_TARGET[prod]
+        avg_sev    = AVG_SEVERITY[prod]
+        ctypes     = CLAIM_TYPES[prod]
+
+        # Poisson number of claims per month (vectorized for all 72 months at once)
+        n_per_month = np.random.poisson(base, size=len(MONTHS))
+        total_n     = int(n_per_month.sum())
+        if total_n == 0:
+            continue
+
+        # Lognormal claim amounts (CV ≈ 0.5)
+        sigma2  = np.log(1.0 + 0.5 ** 2)
+        mu_ln   = np.log(avg_sev) - sigma2 / 2.0
+        amounts = np.random.lognormal(mu_ln, np.sqrt(sigma2), size=total_n)
+
+        # Premium exposure derived from amount and loss ratio (with small noise)
+        prems    = amounts / loss_ratio * np.random.uniform(0.85, 1.15, size=total_n)
+        type_idx = np.random.randint(0, len(ctypes), size=total_n)
+
+        # Assign loss_date = first of the claim's month
+        loss_dates = np.repeat([m.strftime("%Y-%m-%d") for m in MONTHS], n_per_month)
+
+        segment_frames.append(pd.DataFrame({
+            "product_line":          prod,
+            "region":                region,
+            "loss_date":             loss_dates,
+            "claim_amount":          np.round(amounts, 2),
+            "monthly_prem_exposure": np.round(prems, 2),
+            "claim_type":            [ctypes[i] for i in type_idx],
+            "ingested_at":           pd.Timestamp.now().isoformat(),
+        }))
+
+    pdf = pd.concat(segment_frames, ignore_index=True)
+    pdf.insert(0, "claim_id", range(1, len(pdf) + 1))
+
+    claims_schema = StructType([
+        StructField("claim_id",              IntegerType(), False),
+        StructField("product_line",          StringType(),  False),
+        StructField("region",                StringType(),  False),
+        StructField("loss_date",             StringType(),  False),
+        StructField("claim_amount",          DoubleType(),  True),
+        StructField("monthly_prem_exposure", DoubleType(),  True),
+        StructField("claim_type",            StringType(),  True),
+        StructField("ingested_at",           StringType(),  False),
+    ])
+
+    sdf = spark.createDataFrame(pdf, schema=claims_schema)
+    (sdf.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{catalog}.{schema}.claims_events_raw"))
+
+    count = sdf.count()
+    print(f"Generated {count:,} claim events → {catalog}.{schema}.claims_events_raw")
+    return sdf
+
+
 # Run OUTSIDE the DLT context to seed data
 if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessible DLT spark conf)
     raw_df = generate_bronze_cdc_data(spark, CATALOG, SCHEMA)
     display(raw_df.limit(20))
+    # Generate claims events data (feeds bronze_claims → gold_claims_monthly DLT tables)
+    generate_claims_events_data(spark, CATALOG, SCHEMA)
+    # Create empty macro_indicators_raw landing zone if not yet present.
+    # fetch_macro_data.py populates it before the DLT pipeline runs (see jobs.yml).
+    # Creating the schema here ensures DLT streaming sources don't fail on first run
+    # when this notebook is executed interactively without running fetch_macro_data first.
+    _macro_table = f"{CATALOG}.{SCHEMA}.macro_indicators_raw"
+    if not spark.catalog.tableExists(_macro_table):
+        _empty_macro_schema = StructType([
+            StructField("source_table",   StringType(), False),
+            StructField("province",       StringType(), False),
+            StructField("ref_date",       StringType(), False),
+            StructField("indicator_name", StringType(), False),
+            StructField("value",          DoubleType(), True),
+            StructField("unit",           StringType(), True),
+            StructField("ingested_at",    StringType(), False),
+            StructField("batch_id",       StringType(), False),
+        ])
+        (spark.createDataFrame([], _empty_macro_schema).write
+             .format("delta")
+             .saveAsTable(_macro_table))
+        print(f"Created empty macro_indicators_raw → {_macro_table}")
 
 # COMMAND ----------
 
@@ -315,6 +468,206 @@ if IN_DLT:
             )
             .withColumn("claims_estimate", (F.col("avg_loss_ratio") * F.col("total_premium") / 12).cast("int"))
             .orderBy("segment_id", "month")
+        )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Step 5 — Claims Events: Bronze → Gold
+# MAGIC
+# MAGIC A second streaming medallion pipeline ingests individual **claim incidents** (one row per claim)
+# MAGIC generated by `generate_claims_events_data()` and aggregates them to a monthly grain.
+# MAGIC
+# MAGIC | Table | Layer | Pattern |
+# MAGIC |---|---|---|
+# MAGIC | `bronze_claims` | Bronze | Append-only, streaming, data quality expectations |
+# MAGIC | `gold_claims_monthly` | Gold | Materialized view — segment × month aggregate |
+# MAGIC
+# MAGIC `gold_claims_monthly` is the **primary input for Module 4** (SARIMAX, GARCH, Monte Carlo).
+# MAGIC It provides real `claims_count`, `loss_ratio`, and `earned_premium` columns that replace
+# MAGIC Module 4's former synthetic data generation loop.
+
+# COMMAND ----------
+
+if IN_DLT:
+    @dlt.table(
+        name="bronze_claims",
+        comment="Raw claim incidents stream. Append-only — one row per claim event.",
+        table_properties={
+            "quality":      "bronze",
+            "delta.enableChangeDataFeed": "true",
+        },
+    )
+    @dlt.expect_or_drop("valid_amount",  "claim_amount >= 0")
+    @dlt.expect_or_drop("valid_product", "product_line IN ('Personal_Auto','Commercial_Auto','Homeowners','Commercial_Property')")
+    def bronze_claims():
+        return (
+            spark.readStream
+                 .format("delta")
+                 .table(f"{CATALOG}.{SCHEMA}.claims_events_raw")
+        )
+
+# COMMAND ----------
+
+if IN_DLT:
+    @dlt.table(
+        name="gold_claims_monthly",
+        comment="Monthly claims aggregate by product line × province. Primary input for SARIMAX/GARCH in Module 4.",
+        table_properties={"quality": "gold"},
+    )
+    def gold_claims_monthly():
+        """
+        Gold: Aggregate claim events to segment × month grain.
+        Computes claims_count, total incurred, average severity, earned premium, and loss ratio.
+        """
+        return (
+            dlt.read("bronze_claims")
+            .withColumn("segment_id", F.concat_ws("__", "product_line", "region"))
+            .withColumn("month", F.date_trunc("month", F.to_date(F.col("loss_date"))))
+            .groupBy("segment_id", "product_line", "region", "month")
+            .agg(
+                F.count("*").alias("claims_count"),
+                F.sum("claim_amount").alias("total_incurred"),
+                F.avg("claim_amount").alias("avg_severity"),
+                F.sum("monthly_prem_exposure").alias("earned_premium"),
+            )
+            # Guard against divide-by-zero (Photon + ANSI mode on Serverless)
+            .withColumn("loss_ratio",
+                F.when(F.col("earned_premium") > 0,
+                       F.col("total_incurred") / F.col("earned_premium"))
+                 .otherwise(F.lit(0.0)))
+            .orderBy("segment_id", "month")
+        )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Step 6 — Macro Indicators: Bronze → Silver (SCD2) → Gold
+# MAGIC
+# MAGIC Real macroeconomic data from Statistics Canada flows through the same medallion pattern,
+# MAGIC demonstrating that the architecture applies equally to external reference data:
+# MAGIC
+# MAGIC - **`bronze_macro_indicators`** — append-only raw ingestion from `macro_indicators_raw`
+# MAGIC - **`silver_macro_indicators`** — SCD Type 2 via `apply_changes` (captures StatCan revisions)
+# MAGIC - **`gold_macro_features`** — pivoted wide table, current versions only, adds `hpi_growth`
+# MAGIC
+# MAGIC `gold_macro_features` is joined to claims data in Module 4 to provide exogenous variables
+# MAGIC for SARIMAX: **unemployment_rate** and **hpi_growth** (month-over-month HPI change).
+# MAGIC
+# MAGIC **Demo narrative:** *"The DLT pipeline processes your incoming claims stream. The gold layer
+# MAGIC feeds directly into our SARIMAX models, which improve their forecasts using real macro
+# MAGIC signals from Statistics Canada — watch the MAPE drop when we add provincial unemployment rates."*
+
+# COMMAND ----------
+
+if IN_DLT:
+    @dlt.table(
+        name="bronze_macro_indicators",
+        comment="Raw StatCan macro indicator ingestion (append-only). One row per province × ref_date × indicator × batch.",
+        table_properties={
+            "quality":      "bronze",
+            "delta.enableChangeDataFeed": "true",
+        },
+    )
+    @dlt.expect_or_drop("valid_value",     "value IS NOT NULL")
+    @dlt.expect_or_drop("valid_indicator", "indicator_name IN ('unemployment_rate','hpi_index','housing_starts')")
+    def bronze_macro_indicators():
+        return (
+            spark.readStream
+                 .format("delta")
+                 .table(f"{CATALOG}.{SCHEMA}.macro_indicators_raw")
+        )
+
+# COMMAND ----------
+
+if IN_DLT:
+    # SCD Type 2 target table: tracks every StatCan revision over time.
+    # A StatCan release that revises a prior month's unemployment figure creates a new version.
+    dlt.create_streaming_table(
+        name="silver_macro_indicators",
+        comment="StatCan macro indicators with SCD Type 2 revision tracking. Current records have __END_AT IS NULL.",
+        table_properties={"quality": "silver"},
+    )
+
+    dlt.apply_changes(
+        target             = "silver_macro_indicators",
+        source             = "bronze_macro_indicators",
+        keys               = ["province", "ref_date", "indicator_name"],  # natural key
+        sequence_by        = F.col("ingested_at"),                         # latest ingestion wins
+        stored_as_scd_type = 2,                                            # retain all revisions
+    )
+
+# COMMAND ----------
+
+# Macro province → workshop region mapping (StatCan uses spaces; workshop uses underscores)
+_PROVINCE_MAP = {
+    "Ontario":                   "Ontario",
+    "Quebec":                    "Quebec",
+    "British Columbia":          "British_Columbia",
+    "Alberta":                   "Alberta",
+    "Manitoba":                  "Manitoba",
+    "Saskatchewan":              "Saskatchewan",
+    "New Brunswick":             "New_Brunswick",
+    "Nova Scotia":               "Nova_Scotia",
+    "Prince Edward Island":      "Prince_Edward_Island",
+    "Newfoundland and Labrador": "Newfoundland",
+}
+
+if IN_DLT:
+    from pyspark.sql import Window as _Window
+
+    @dlt.table(
+        name="gold_macro_features",
+        comment="Pivoted macro features for SARIMAX — current SCD2 versions only. Columns: region, month, unemployment_rate, hpi_index, hpi_growth, housing_starts.",
+        table_properties={"quality": "gold"},
+    )
+    def gold_macro_features():
+        """
+        Gold: Current-version macro features pivoted to a wide format.
+        - Filters silver to current SCD2 records (__END_AT IS NULL)
+        - Pivots indicator_name rows → columns (unemployment_rate, hpi_index, housing_starts)
+        - Maps StatCan province names to workshop region names
+        - Adds hpi_growth = month-over-month HPI % change (ANSI-safe division)
+        """
+        from pyspark.sql import Window
+
+        # Current SCD2 records only (end timestamp is NULL for active rows)
+        current = (
+            dlt.read("silver_macro_indicators")
+               .filter(F.col("__END_AT").isNull())
+        )
+
+        # Pivot: one row per (province, ref_date), columns = indicator values
+        pivoted = (
+            current
+            .groupBy("province", "ref_date")
+            .pivot("indicator_name", ["unemployment_rate", "hpi_index", "housing_starts"])
+            .agg(F.first("value"))
+            # Convert "YYYY-MM" ref_date to a proper date column
+            .withColumn("month", F.to_date(F.concat(F.col("ref_date"), F.lit("-01"))))
+        )
+
+        # Map province names to workshop region names using a Spark map literal
+        _prov_pairs = [item for pair in _PROVINCE_MAP.items() for item in pair]
+        _map_expr   = F.create_map(*[F.lit(x) for x in _prov_pairs])
+        pivoted = pivoted.withColumn("region", _map_expr[F.col("province")])
+
+        # hpi_growth = month-over-month HPI % change
+        # ANSI-safe: guard against lag = 0 with F.when
+        w = Window.partitionBy("province").orderBy("month")
+        hpi_lag = F.lag("hpi_index", 1).over(w)
+        pivoted = pivoted.withColumn(
+            "hpi_growth",
+            F.when(hpi_lag > 0,
+                   (F.col("hpi_index") - hpi_lag) / hpi_lag * 100.0)
+             .otherwise(F.lit(None).cast("double"))
+        )
+
+        return (
+            pivoted
+            .select("region", "month", "unemployment_rate", "hpi_index", "hpi_growth", "housing_starts")
+            .filter(F.col("region").isNotNull())   # exclude non-province GEO rows
+            .orderBy("region", "month")
         )
 
 # COMMAND ----------
@@ -537,12 +890,21 @@ except Exception:
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC | Layer | Table | Pattern |
-# MAGIC |---|---|---|
-# MAGIC | Bronze | `bronze_policy_cdc` | Append-only, full CDC history, Auto Loader in production |
-# MAGIC | Silver | `silver_policies` | SCD Type 2 via Apply Changes; expectations enforced |
-# MAGIC | Gold | `gold_segment_monthly_stats` | Materialized view; monthly segment stats for SARIMA |
+# MAGIC Three medallion pipelines run in a single DLT notebook:
 # MAGIC
-# MAGIC The Gold table now feeds directly into Module 4's SARIMA/GARCH pipeline with `segment_id` and `claims_estimate` columns matching exactly.
+# MAGIC | Layer | Table | Pattern | Consumer |
+# MAGIC |---|---|---|---|
+# MAGIC | Bronze | `bronze_policy_cdc` | Append-only CDC stream | Silver SCD2 |
+# MAGIC | Silver | `silver_policies` | SCD Type 2 via Apply Changes | Gold aggregates |
+# MAGIC | Gold | `gold_segment_monthly_stats` | Materialized view; monthly policy stats | Module 2, 3 |
+# MAGIC | Bronze | `bronze_claims` | Append-only claim events stream | Gold claims |
+# MAGIC | Gold | `gold_claims_monthly` | Materialized view; segment × month claims | **Module 4** |
+# MAGIC | Bronze | `bronze_macro_indicators` | Append-only StatCan macro stream | Silver SCD2 |
+# MAGIC | Silver | `silver_macro_indicators` | SCD Type 2; tracks StatCan revisions | Gold features |
+# MAGIC | Gold | `gold_macro_features` | Pivoted macro features; current versions | **Module 4 exog** |
+# MAGIC
+# MAGIC `gold_claims_monthly` and `gold_macro_features` feed directly into Module 4's SARIMAX pipeline.
+# MAGIC Real macro signals from Statistics Canada (unemployment, HPI growth) improve forecast accuracy
+# MAGIC over baseline SARIMA — watch the MAPE improvement in the MLflow experiment comparison.
 # MAGIC
 # MAGIC **Next:** Module 2 — making decisions about compute and scale before we fit those models.

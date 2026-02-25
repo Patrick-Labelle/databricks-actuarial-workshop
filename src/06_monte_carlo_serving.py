@@ -235,10 +235,14 @@ _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_monte_carlo_portfolio")
 
 # Dataset reference for UC lineage
-_claims_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.claims_time_series",
-    name="claims_time_series",
-)
+try:
+    _claims_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+        name="gold_claims_monthly",
+    )
+    _log_dataset = True
+except Exception:
+    _log_dataset = False
 
 # ── Define MLflow signature ───────────────────────────────────────────────────
 input_schema = mlflow.types.Schema([
@@ -268,7 +272,8 @@ signature = mlflow.models.ModelSignature(inputs=input_schema, outputs=output_sch
 
 # ── Train run ─────────────────────────────────────────────────────────────────
 with mlflow.start_run(run_name="monte_carlo_portfolio_champion") as run:
-    mlflow.log_input(_claims_dataset, context="training")
+    if _log_dataset:
+        mlflow.log_input(_claims_dataset, context="training")
 
     mlflow.set_tags({
         "model_class":     "MonteCarloPyFunc",
@@ -498,7 +503,7 @@ for label, result in [("Baseline", _b), ("Stressed (+20% / cat correlations)", _
 # MAGIC | Step | What Happened |
 # MAGIC |---|---|
 # MAGIC | PyFunc | t-Copula + Lognormal simulation wrapped as a stateless `predict()` function |
-# MAGIC | Lineage | `claims_time_series` → MLflow run → `monte_carlo_portfolio@Champion` |
+# MAGIC | Lineage | `gold_claims_monthly` → MLflow run → `monte_carlo_portfolio@Champion` |
 # MAGIC | Endpoint | CPU REST endpoint — `actuarial-workshop-monte-carlo` |
 # MAGIC | Scenario API | 11 parameters: means, CVs, correlations, n_scenarios, copula_df |
 # MAGIC | Use cases | Hard market analysis, cat scenario stress testing, ORSA capital sensitivity |

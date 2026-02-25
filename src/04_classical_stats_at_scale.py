@@ -1,28 +1,30 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Module 4: Classical Statistical Models at Scale
-# MAGIC ## SARIMA/GARCH per Segment + Monte Carlo with Ray
+# MAGIC ## SARIMAX/GARCH per Segment + Monte Carlo with Ray
 # MAGIC
 # MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
 # MAGIC *Audience: Actuaries, Data Scientists, Financial Analysts*
 # MAGIC
 # MAGIC ---
 # MAGIC ### What We'll Cover
-# MAGIC 1. **Data Setup** — Synthetic monthly claims time series (20 product × region segments)
-# MAGIC 2. **SARIMA at Scale** — Per-segment forecasting with `applyInPandas` + statsmodels
-# MAGIC 3. **GARCH at Scale** — Per-segment volatility modeling with the `arch` library
-# MAGIC 4. **Monte Carlo with Ray** — Task-parallel portfolio loss simulation (100k+ paths)
-# MAGIC 5. **MLflow Integration** — Experiment tracking, metrics, artifacts
+# MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the DLT pipeline (40 segments × 72 months)
+# MAGIC 2. **Macro Integration** — Join real StatCan macro data; visualize claims vs unemployment
+# MAGIC 3. **SARIMAX at Scale** — Per-segment SARIMA + SARIMAX fit; compare MAPE with/without exog
+# MAGIC 4. **GARCH at Scale** — Per-segment volatility modeling with the `arch` library
+# MAGIC 5. **Monte Carlo with Ray** — Task-parallel portfolio loss simulation (100k+ paths)
+# MAGIC 6. **MLflow Integration** — Experiment tracking, metrics, artifacts
 # MAGIC
 # MAGIC ---
 # MAGIC ### Why `applyInPandas`?
 # MAGIC
-# MAGIC We have **20 segments**, each needing its own ARIMA/GARCH fit. These are **independent** per-group operations.
-# MAGIC `applyInPandas` lets Spark distribute this work: each executor receives a pandas DataFrame for one segment,
-# MAGIC runs standard Python/statsmodels code, and returns results. No Spark ML required — just familiar Python libraries.
+# MAGIC We have **40 segments** (4 product lines × 10 provinces), each needing its own SARIMAX/GARCH fit.
+# MAGIC These are **independent** per-group operations. `applyInPandas` lets Spark distribute this work:
+# MAGIC each executor receives a pandas DataFrame for one segment, runs standard Python/statsmodels code,
+# MAGIC and returns results. No Spark ML required — just familiar Python libraries.
 # MAGIC
 # MAGIC ```
-# MAGIC df.groupby("segment_id").applyInPandas(fit_sarima_fn, schema=output_schema)
+# MAGIC df.groupby("segment_id").applyInPandas(fit_sarimax_fn, schema=output_schema)
 # MAGIC ```
 
 # COMMAND ----------
@@ -46,11 +48,15 @@
 # PyTorch (pre-installed on DBR GPU ML) is used for GPU Monte Carlo simulation.
 # No extra pip install needed — torch.cuda is available on all GPU ML nodes.
 import subprocess as _subprocess
-_gpu_check = _subprocess.run(
-    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-    capture_output=True, text=True, timeout=5,
-)
-HAS_GPU = _gpu_check.returncode == 0 and bool(_gpu_check.stdout.strip())
+try:
+    _gpu_check = _subprocess.run(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=5,
+    )
+    HAS_GPU = _gpu_check.returncode == 0 and bool(_gpu_check.stdout.strip())
+except (FileNotFoundError, OSError):
+    # nvidia-smi not in PATH on this node (CPU-only driver; GPU workers have it via Ray)
+    HAS_GPU = False
 if HAS_GPU:
     print(f"GPU detected on driver: {_gpu_check.stdout.strip().splitlines()[0]}")
 else:
@@ -59,20 +65,22 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Generate Synthetic Insurance Claims Time Series
+# MAGIC ## 1. Load Claims Data from DLT Gold Layer
 # MAGIC
-# MAGIC We simulate **60 months** (5 years) of monthly claims for **20 segments** (4 product lines × 5 regions).
-# MAGIC Each segment has its own:
-# MAGIC - **Level** (expected monthly claims)
-# MAGIC - **Seasonality** (winter peak — higher claims in Q1)
-# MAGIC - **Trend** (slow upward drift in loss ratios)
-# MAGIC - **Volatility** (GARCH-style clustering)
+# MAGIC Data flows directly from the DLT pipeline (Module 1) — no synthetic generation needed.
+# MAGIC The `gold_claims_monthly` table provides **real** claim counts, loss ratios, and premium
+# MAGIC exposures for **40 segments** (4 product lines × 10 provinces) × **72 months** (Jan 2019 – Dec 2024).
+# MAGIC
+# MAGIC ```
+# MAGIC DLT Pipeline (Module 1)
+# MAGIC   claims_events_raw  →  bronze_claims  →  gold_claims_monthly  ← This module reads here
+# MAGIC   macro_indicators_raw → bronze_macro → silver_macro → gold_macro_features  ← exog vars
+# MAGIC ```
 
 # COMMAND ----------
 
 import numpy as np
 import pandas as pd
-from itertools import product as iterproduct
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
 
@@ -81,7 +89,7 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 dbutils.widgets.text("catalog",  "my_catalog",         "UC Catalog")
 dbutils.widgets.text("schema",   "actuarial_workshop", "UC Schema")
 dbutils.widgets.text("run_ray",  "skip",               "Run Ray (auto/skip)")
-# job_mode=true: use driver-side pandas groupby.apply() for SARIMA/GARCH instead of
+# job_mode=true: use driver-side pandas groupby.apply() for SARIMAX/GARCH instead of
 # applyInPandas. On Serverless (Spark Connect), applyInPandas UDFs run on the remote
 # compute which has a separate Python environment — packages installed via %pip only
 # reach the notebook kernel (client side), not the remote compute (server side).
@@ -100,121 +108,120 @@ np.random.seed(42)
 # ─── Segment definitions ─────────────────────────────────────────────────────
 PRODUCT_LINES = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
 REGIONS       = [
-    "Ontario", "Quebec", "British_Columbia", "Alberta", "Atlantic",
-    "Manitoba", "Saskatchewan", "Nova_Scotia", "New_Brunswick", "Newfoundland",
-    "Prince_Edward_Island", "Northwest_Territories", "Yukon",
+    "Ontario", "Quebec", "British_Columbia", "Alberta",
+    "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
+    "Prince_Edward_Island", "Newfoundland",
 ]
 MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")  # Jan 2019 – Dec 2024
 
-# Base claim levels (expected monthly claims per segment)
+# Base claim levels (monthly, Alberta reference — used by Monte Carlo bridge weight blending)
 BASE_CLAIMS = {
-    "Personal_Auto":         450,
-    "Commercial_Auto":       180,
-    "Homeowners":            320,
-    "Commercial_Property":   90,
+    "Personal_Auto":       450,
+    "Commercial_Auto":     180,
+    "Homeowners":          320,
+    "Commercial_Property":  90,
 }
 
-REGION_MULTIPLIER = {
-    "Ontario":              1.40,
-    "Quebec":               1.10,
-    "British_Columbia":     1.20,
-    "Alberta":              1.00,
-    "Atlantic":             0.70,   # composite Atlantic region
-    "Manitoba":             0.85,
-    "Saskatchewan":         0.80,
-    "Nova_Scotia":          0.75,
-    "New_Brunswick":        0.70,
-    "Newfoundland":         0.65,
-    "Prince_Edward_Island": 0.60,
-    "Northwest_Territories":0.55,
-    "Yukon":                0.50,
-}
-
-# Winter seasonality factors by month (1=Jan, 12=Dec)
-SEASONALITY = {1: 1.25, 2: 1.20, 3: 1.10, 4: 0.95, 5: 0.90, 6: 0.88,
-               7: 0.85, 8: 0.87, 9: 0.92, 10: 1.00, 11: 1.10, 12: 1.20}
-
-rows = []
-for (prod, region), seg_idx in zip(
-    iterproduct(PRODUCT_LINES, REGIONS),
-    range(len(PRODUCT_LINES) * len(REGIONS))
-):
-    segment_id = f"{prod}__{region}"
-    base = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
-
-    # Simulate GARCH-like volatility clustering (one innovation per month in MONTHS)
-    vol = 0.08  # base volatility
-    innovations = []
-    h = vol ** 2
-    for _ in range(len(MONTHS)):
-        e = np.random.normal(0, np.sqrt(h))
-        innovations.append(e)
-        h = 0.02 + 0.15 * e**2 + 0.80 * h  # GARCH(1,1) parameters
-
-    for i, (month, innov) in enumerate(zip(MONTHS, innovations)):
-        trend    = 1.0 + 0.003 * i            # 0.3% monthly upward trend in loss ratio
-        seasonal = SEASONALITY[month.month]
-        claims   = max(0, base * trend * seasonal * (1 + innov))
-
-        rows.append({
-            "segment_id":   segment_id,
-            "product_line": prod,
-            "region":       region,
-            "month":        month.date(),
-            "claims_count": int(round(claims)),
-            "earned_premium": round(base * trend * seasonal * np.random.uniform(3.2, 3.8), 2),
-        })
-
-pdf = pd.DataFrame(rows)
-pdf["loss_ratio"] = pdf["claims_count"] / pdf["earned_premium"]
-
-# Convert to Spark DataFrame
-schema = StructType([
-    StructField("segment_id",     StringType(),  False),
-    StructField("product_line",   StringType(),  False),
-    StructField("region",         StringType(),  False),
-    StructField("month",          DateType(),    False),
-    StructField("claims_count",   IntegerType(), False),
-    StructField("earned_premium", DoubleType(),  False),
-    StructField("loss_ratio",     DoubleType(),  False),
-])
-
-claims_df = spark.createDataFrame(pdf, schema=schema)
+# ─── Read from DLT gold layer ─────────────────────────────────────────────────
+# gold_claims_monthly is produced by the DLT pipeline (task: run_dlt_pipeline in jobs.yml).
+# Expected: 40 segments × 72 months = 2,880 rows with claims_count, loss_ratio, earned_premium.
+claims_df = (
+    spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+    .filter(F.col("month").between("2019-01-01", "2024-12-01"))
+)
 claims_df.createOrReplaceTempView("claims_ts")
 
-print(f"Segments: {claims_df.select('segment_id').distinct().count()}")
-print(f"Rows:     {claims_df.count()}")
-display(claims_df.orderBy("segment_id", "month").limit(30))
+n_segments = claims_df.select("segment_id").distinct().count()
+n_rows     = claims_df.count()
+print(f"Segments: {n_segments} (expected 40 = 4 product lines × 10 provinces)")
+print(f"Rows:     {n_rows} (expected 2,880 = 40 × 72 months)")
+if not JOB_MODE:
+    display(claims_df.orderBy("segment_id", "month").limit(30))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Persist to Unity Catalog (Silver Layer)
+# MAGIC ## 2. Macro Data Integration
+# MAGIC
+# MAGIC Real macroeconomic data from **Statistics Canada** is joined to the claims series.
+# MAGIC Three indicators (fetched by `scripts/fetch_macro_data.py`, processed through the DLT medallion):
+# MAGIC
+# MAGIC | Indicator | Source | Use in SARIMAX |
+# MAGIC |---|---|---|
+# MAGIC | `unemployment_rate` | StatCan 14-10-0090-01 | Leading indicator for auto/liability claims |
+# MAGIC | `hpi_growth` | Derived from StatCan 18-10-0205-01 | Housing market proxy for homeowners claims |
+# MAGIC | `housing_starts` | StatCan 34-10-0035-01 | New-exposure leading indicator |
+# MAGIC
+# MAGIC **Demo narrative:** *"Watch the MAPE drop when we add provincial unemployment rates as
+# MAGIC exogenous variables — the SARIMAX model captures the economic cycle that drives claims."*
 
 # COMMAND ----------
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+# Load gold_macro_features from the DLT pipeline and join to claims data
+try:
+    macro_df = spark.table(f"{CATALOG}.{SCHEMA}.gold_macro_features")
+    macro_count = macro_df.count()
+    print(f"gold_macro_features: {macro_count:,} rows (expected ~720 = 10 provinces × 72 months)")
 
-(claims_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.claims_time_series"))
+    claims_with_macro = (
+        claims_df
+        .join(
+            macro_df.select("region", "month", "unemployment_rate", "hpi_index",
+                            "hpi_growth", "housing_starts"),
+            on=["region", "month"],
+            how="left",
+        )
+    )
+    claims_with_macro.createOrReplaceTempView("claims_with_macro")
+    HAS_MACRO = macro_count > 0
 
-print(f"Saved to {CATALOG}.{SCHEMA}.claims_time_series")
+    if not JOB_MODE and HAS_MACRO:
+        # Correlation: claims_count vs macro indicators
+        corr_pdf = (
+            claims_with_macro
+            .select("claims_count", "unemployment_rate", "hpi_growth", "housing_starts")
+            .toPandas()
+            .corr()
+            .round(3)
+        )
+        print("\nCorrelation with claims_count:")
+        print(corr_pdf[["claims_count"]].sort_values("claims_count", ascending=False).to_string())
+
+        # Time-series preview: Ontario Personal_Auto vs unemployment
+        _preview = (
+            claims_with_macro
+            .filter(F.col("segment_id") == "Personal_Auto__Ontario")
+            .orderBy("month")
+            .select("month", "claims_count", "unemployment_rate")
+            .toPandas()
+        )
+        print(f"\nOntario Personal_Auto — first 6 rows with macro:")
+        print(_preview.head(6).to_string(index=False))
+
+except Exception as _e:
+    print(f"Note: gold_macro_features not available ({_e}).")
+    print("SARIMAX will fall back to baseline SARIMA (no exogenous variables).")
+    # Attach null exog columns so fit_sarimax_per_segment handles them gracefully
+    for _col in ["unemployment_rate", "hpi_index", "hpi_growth", "housing_starts"]:
+        claims_df = claims_df.withColumn(_col, F.lit(None).cast(DoubleType()))
+    claims_with_macro = claims_df
+    claims_with_macro.createOrReplaceTempView("claims_with_macro")
+    HAS_MACRO = False
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. SARIMA at Scale — Per-Segment Forecasting
+# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro Exogenous Variables
 # MAGIC
 # MAGIC ### Strategy
 # MAGIC We use `df.groupby("segment_id").applyInPandas(fit_fn, schema)`.
 # MAGIC
-# MAGIC Each Spark task receives **one segment's pandas DataFrame** and:
-# MAGIC 1. Fits `statsmodels.SARIMAX` with seasonal order `(1,0,1)(1,1,0,12)` — monthly seasonality
-# MAGIC 2. Produces a 12-month forecast with confidence intervals
-# MAGIC 3. Returns a standardized pandas DataFrame
+# MAGIC Each Spark task receives **one segment's pandas DataFrame** (claims + macro joined) and:
+# MAGIC 1. Fits baseline `SARIMA(1,0,1)(1,1,0,12)` — monthly seasonality, no exog
+# MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` as exog
+# MAGIC 3. Evaluates out-of-sample MAPE on held-out last 12 months (validation set)
+# MAGIC 4. Refits final model on all 72 months for the 12-month forecast
+# MAGIC 5. Returns a standardized pandas DataFrame with both MAPE metrics for comparison
 # MAGIC
 # MAGIC The output schema must be declared upfront so Spark can parallelize safely.
 
@@ -225,71 +232,122 @@ from pyspark.sql.types import (
 )
 import pyspark.sql.functions as F
 
-# Output schema for SARIMA results
+# Output schema for SARIMAX results
+# New fields vs baseline SARIMA: mape_baseline, mape_sarimax, exog_vars
 SARIMA_SCHEMA = StructType([
-    StructField("segment_id",   StringType(),  False),
-    StructField("month",        DateType(),    False),
-    StructField("record_type",  StringType(),  False),   # "actual" or "forecast"
-    StructField("claims_count", DoubleType(),  True),
-    StructField("forecast_mean",DoubleType(),  True),
-    StructField("forecast_lo95",DoubleType(),  True),
-    StructField("forecast_hi95",DoubleType(),  True),
-    StructField("aic",          DoubleType(),  True),
-    StructField("mape",         DoubleType(),  True),
+    StructField("segment_id",    StringType(), False),
+    StructField("month",         DateType(),   False),
+    StructField("record_type",   StringType(), False),   # "actual" or "forecast"
+    StructField("claims_count",  DoubleType(), True),
+    StructField("forecast_mean", DoubleType(), True),
+    StructField("forecast_lo95", DoubleType(), True),
+    StructField("forecast_hi95", DoubleType(), True),
+    StructField("aic",           DoubleType(), True),
+    StructField("mape",          DoubleType(), True),    # primary MAPE (SARIMAX if available)
+    StructField("mape_baseline", DoubleType(), True),    # SARIMA (no exog)
+    StructField("mape_sarimax",  DoubleType(), True),    # SARIMAX (with macro exog)
+    StructField("exog_vars",     StringType(), True),    # e.g. "unemployment_rate,hpi_growth"
 ])
 
-def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
+def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     """
-    Fit SARIMAX(1,0,1)(1,1,0,12) for one segment.
-    Called by Spark for each group — standard pandas/statsmodels code inside.
+    Fit baseline SARIMA and SARIMAX with macro exogenous variables for one segment.
+
+    Train/validation split: first 60 months for training, last 12 for out-of-sample MAPE.
+    Final model is refit on all 72 months for the 12-month forecast.
+
+    Exogenous forecast: last 3-month average held flat (appropriate for a 12-month horizon;
+    in production, use Bank of Canada / StatCan projections for the exog forecast).
     """
     from statsmodels.tsa.statespace.sarimax import SARIMAX
     import warnings
     warnings.filterwarnings("ignore")
 
     segment_id = pdf["segment_id"].iloc[0]
-    pdf = pdf.sort_values("month").reset_index(drop=True)
+    pdf        = pdf.sort_values("month").reset_index(drop=True)
 
-    y = pdf["claims_count"].astype(float).values
+    y      = pdf["claims_count"].astype(float).values
     months = pd.to_datetime(pdf["month"])
 
-    # ── Fit SARIMAX ──────────────────────────────────────────────────────────
+    exog_cols = ["unemployment_rate", "hpi_growth"]
+
+    # Fill NaN exog values (hpi_growth is NaN for the first month due to lag;
+    # forward-fill then back-fill covers edge cases at either end of the series)
+    exog_data = pdf[exog_cols].copy() if all(c in pdf.columns for c in exog_cols) \
+                else pd.DataFrame(np.nan, index=pdf.index, columns=exog_cols)
+    exog_data = exog_data.ffill().bfill()
+    has_exog  = not exog_data.isna().all().any()
+    exog_arr  = exog_data.values.astype(float) if has_exog else None
+
+    # Train/validation split (60 train, 12 validation)
+    n_train, n_val = 60, 12
+    y_train = y[:n_train]
+    y_val   = y[n_train:]
+
+    aic = mape_baseline = mape_sarimax = np.nan
+    fcast_mean = np.full(12, np.nan)
+    fcast_ci   = pd.DataFrame({"lower": np.full(12, np.nan), "upper": np.full(12, np.nan)})
+    exog_vars_str = ",".join(exog_cols) if has_exog else ""
+
     try:
-        model = SARIMAX(
-            y,
-            order=(1, 0, 1),
-            seasonal_order=(1, 1, 0, 12),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+        # ── Model 1: Baseline SARIMA (no exog) ───────────────────────────────
+        m_base   = SARIMAX(y_train, order=(1,0,1), seasonal_order=(1,1,0,12),
+                           enforce_stationarity=False, enforce_invertibility=False)
+        fit_base = m_base.fit(disp=False, maxiter=100)
+        aic      = fit_base.aic
+        fc_base  = fit_base.forecast(steps=n_val)
+        mape_baseline = float(
+            np.mean(np.abs((y_val - fc_base) / np.clip(y_val, 1, None))) * 100
         )
-        fit = model.fit(disp=False, maxiter=100)
-        aic = fit.aic
 
-        # In-sample MAPE (exclude first 12 months for seasonal differencing warmup)
-        fitted_vals = fit.fittedvalues[12:]
-        actual_vals = y[12:]
-        mape = np.mean(np.abs((actual_vals - fitted_vals) / np.clip(actual_vals, 1, None))) * 100
+        # ── Model 2: SARIMAX with macro exog (if data is available) ──────────
+        if has_exog:
+            exog_train = exog_arr[:n_train]
+            exog_val   = exog_arr[n_train:]
+            try:
+                m_sx   = SARIMAX(y_train, exog=exog_train, order=(1,0,1),
+                                 seasonal_order=(1,1,0,12),
+                                 enforce_stationarity=False, enforce_invertibility=False)
+                fit_sx = m_sx.fit(disp=False, maxiter=100)
+                fc_sx  = fit_sx.forecast(steps=n_val, exog=exog_val)
+                mape_sarimax = float(
+                    np.mean(np.abs((y_val - fc_sx) / np.clip(y_val, 1, None))) * 100
+                )
+            except Exception:
+                mape_sarimax = mape_baseline   # fall back gracefully
 
-        # 12-month forecast
-        forecast = fit.get_forecast(steps=12)
-        fcast_mean = forecast.predicted_mean
-        fcast_ci_raw = forecast.conf_int(alpha=0.05)
-        # Normalize to DataFrame regardless of statsmodels version
-        if hasattr(fcast_ci_raw, 'iloc'):
-            fcast_ci = fcast_ci_raw
+        # ── Final model: refit on full 72 months for forecasting ─────────────
+        if has_exog:
+            m_final = SARIMAX(y, exog=exog_arr, order=(1,0,1), seasonal_order=(1,1,0,12),
+                              enforce_stationarity=False, enforce_invertibility=False)
         else:
-            fcast_ci = pd.DataFrame(fcast_ci_raw, columns=["lower", "upper"])
+            m_final = SARIMAX(y, order=(1,0,1), seasonal_order=(1,1,0,12),
+                              enforce_stationarity=False, enforce_invertibility=False)
+        fit_final = m_final.fit(disp=False, maxiter=100)
 
-    except Exception as e:
-        # On failure, return NaN forecasts — allows the pipeline to continue
-        fcast_mean = np.full(12, np.nan)
-        fcast_ci   = pd.DataFrame({"lower claims_count": np.full(12, np.nan),
-                                   "upper claims_count": np.full(12, np.nan)})
-        aic, mape = np.nan, np.nan
+        # 12-month forecast; extrapolate exog as last 3-month average held flat
+        if has_exog:
+            exog_fcast = np.tile(exog_arr[-3:].mean(axis=0), (12, 1))
+            forecast   = fit_final.get_forecast(steps=12, exog=exog_fcast)
+        else:
+            forecast   = fit_final.get_forecast(steps=12)
+
+        fcast_mean   = forecast.predicted_mean
+        fcast_ci_raw = forecast.conf_int(alpha=0.05)
+        fcast_ci     = fcast_ci_raw if hasattr(fcast_ci_raw, 'iloc') \
+                       else pd.DataFrame(fcast_ci_raw, columns=["lower", "upper"])
+
+    except Exception:
+        # Return NaN forecasts — allows the pipeline to continue for all segments
+        pass
 
     # ── Build output DataFrame ────────────────────────────────────────────────
-    last_month = months.max()
-    forecast_months = pd.date_range(last_month + pd.offsets.MonthBegin(1), periods=12, freq="MS")
+    last_month     = months.max()
+    forecast_months = pd.date_range(
+        last_month + pd.offsets.MonthBegin(1), periods=12, freq="MS"
+    )
+    # Primary MAPE = SARIMAX when available, else baseline
+    _primary_mape = mape_sarimax if has_exog and not np.isnan(mape_sarimax) else mape_baseline
 
     actuals_rows = pd.DataFrame({
         "segment_id":    segment_id,
@@ -301,6 +359,9 @@ def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
         "forecast_hi95": [None] * len(y),
         "aic":           [None] * len(y),
         "mape":          [None] * len(y),
+        "mape_baseline": [None] * len(y),
+        "mape_sarimax":  [None] * len(y),
+        "exog_vars":     [None] * len(y),
     })
 
     forecast_rows = pd.DataFrame({
@@ -312,7 +373,10 @@ def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
         "forecast_lo95": list(np.asarray(fcast_ci)[:, 0]),
         "forecast_hi95": list(np.asarray(fcast_ci)[:, 1]),
         "aic":           [aic] * 12,
-        "mape":          [mape] * 12,
+        "mape":          [_primary_mape] * 12,
+        "mape_baseline": [mape_baseline] * 12,
+        "mape_sarimax":  [mape_sarimax]  * 12,
+        "exog_vars":     [exog_vars_str] * 12,
     })
 
     return pd.concat([actuals_rows, forecast_rows], ignore_index=True)
@@ -320,9 +384,10 @@ def fit_sarima_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Run SARIMA Across All 20 Segments
+# MAGIC ### Run SARIMAX Across All 40 Segments
 # MAGIC
-# MAGIC Spark distributes one segment per task. Each task runs pure Python/statsmodels independently.
+# MAGIC Spark distributes one segment per task. Each task fits two models (SARIMA + SARIMAX)
+# MAGIC and returns MAPE for both — enabling a direct accuracy comparison in MLflow.
 
 # COMMAND ----------
 
@@ -332,21 +397,26 @@ _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 # require the parent to pre-exist (fails on fresh workspaces).
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_claims_sarima")
 
-# Register input dataset for UC lineage — all three models (SARIMA, GARCH, Monte Carlo)
-# are trained from the same claims_time_series source table.  mlflow.log_input()
-# creates a lineage edge visible in the UC Explorer → Lineage tab.
-_claims_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.claims_time_series",
-    name="claims_time_series",
-)
+# Register input dataset for UC lineage — all models (SARIMAX, GARCH, Monte Carlo) are
+# trained from gold_claims_monthly (the DLT gold layer, not a synthetic table).
+try:
+    _claims_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+        name="gold_claims_monthly",
+    )
+    _log_input = True
+except Exception:
+    _log_input = False   # DLT table may not exist in interactive session before first pipeline run
 
-with mlflow.start_run(run_name="sarima_all_segments") as run:
-    mlflow.log_input(_claims_dataset, context="training")
+with mlflow.start_run(run_name="sarimax_all_segments") as run:
+    if _log_input:
+        mlflow.log_input(_claims_dataset, context="training")
     mlflow.set_tags({
         "workshop_module": "4",
         "model_type":      "SARIMAX(1,0,1)(1,1,0,12)",
-        "segments":        "20",
+        "segments":        "40",
         "horizon_months":  "12",
+        "exog_vars":       "unemployment_rate,hpi_growth" if HAS_MACRO else "none",
         "audience":        "actuarial-workshop",
     })
 
@@ -354,12 +424,12 @@ with mlflow.start_run(run_name="sarima_all_segments") as run:
         # Driver-side: collect to pandas, fit in a Python loop.
         # Avoids applyInPandas which requires statsmodels on the remote Serverless
         # compute — a separate Python environment that %pip install cannot reach.
-        print("job_mode=true: using driver-side pandas groupby.apply() for SARIMA")
-        claims_pdf = claims_df.toPandas()
+        print("job_mode=true: using driver-side pandas groupby.apply() for SARIMAX")
+        claims_pdf = claims_with_macro.toPandas()
         sarima_result_pdf = (
             claims_pdf
             .groupby("segment_id", group_keys=False)
-            .apply(fit_sarima_per_segment)
+            .apply(fit_sarimax_per_segment)
             .reset_index(drop=True)
         )
         sarima_results_df = spark.createDataFrame(sarima_result_pdf, schema=SARIMA_SCHEMA)
@@ -367,27 +437,42 @@ with mlflow.start_run(run_name="sarima_all_segments") as run:
         # Distributed: Spark sends one segment per task to applyInPandas workers.
         # Requires statsmodels on the compute environment (ml_env spec in bundle jobs).
         sarima_results_df = (
-            claims_df
+            claims_with_macro
             .groupby("segment_id")
-            .applyInPandas(fit_sarima_per_segment, schema=SARIMA_SCHEMA)
+            .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
         )
 
-    # Trigger execution and compute metrics
+    # Trigger execution and compute MAPE metrics
     total_rows = sarima_results_df.count()
 
-    # Compute average MAPE across segments
-    avg_mape = (
+    mape_row = (
         sarima_results_df
         .filter(F.col("record_type") == "forecast")
-        .agg(F.mean("mape").alias("avg_mape"))
-        .collect()[0]["avg_mape"]
+        .agg(
+            F.mean("mape").alias("avg_mape"),
+            F.mean("mape_baseline").alias("avg_mape_baseline"),
+            F.mean("mape_sarimax").alias("avg_mape_sarimax"),
+        )
+        .collect()[0]
     )
+    avg_mape          = mape_row["avg_mape"]          or 0.0
+    avg_mape_baseline = mape_row["avg_mape_baseline"] or avg_mape
+    avg_mape_sarimax  = mape_row["avg_mape_sarimax"]  or avg_mape
+    avg_mape_improve  = avg_mape_baseline - avg_mape_sarimax
 
-    mlflow.log_metric("avg_mape_pct", round(avg_mape, 2))
-    mlflow.log_metric("total_output_rows", total_rows)
-    mlflow.log_metric("segments_fitted", 20)
+    mlflow.log_metrics({
+        "avg_mape_pct":             round(avg_mape, 2),
+        "avg_mape_baseline_pct":    round(avg_mape_baseline, 2),
+        "avg_mape_sarimax_pct":     round(avg_mape_sarimax, 2),
+        "avg_mape_improvement_pct": round(avg_mape_improve, 2),
+        "total_output_rows":        total_rows,
+        "segments_fitted":          40,
+    })
 
-    print(f"SARIMA complete | Total rows: {total_rows} | Avg MAPE: {avg_mape:.1f}%")
+    print(f"SARIMAX complete | Total rows: {total_rows}")
+    print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
+    print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
+    print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
     print(f"MLflow run: {run.info.run_id}")
 
 if not JOB_MODE:
@@ -506,7 +591,8 @@ def fit_garch_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 # COMMAND ----------
 
 with mlflow.start_run(run_name="garch_all_segments") as run:
-    mlflow.log_input(_claims_dataset, context="training")
+    if _log_input:
+        mlflow.log_input(_claims_dataset, context="training")
     n_segments = claims_df.select("segment_id").distinct().count()
     mlflow.set_tags({
         "workshop_module": "4",
@@ -1094,10 +1180,11 @@ if RAY_AVAILABLE:
           f'= {N_RUNS * N_TASKS * N_PER_TASK:,} total paths')
 
     with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
-        mlflow.log_input(_claims_dataset, context="training")
+        if _log_input:
+            mlflow.log_input(_claims_dataset, context="training")
         mlflow.set_tags({
             'workshop_module': '4',
-            'model_type':      'Monte Carlo - t-Copula + Lognormal Marginals (SARIMA-driven)',
+            'model_type':      'Monte Carlo - t-Copula + Lognormal Marginals (SARIMAX-driven)',
             'n_scenarios':     str(N_RUNS * N_TASKS * N_PER_TASK),
             'n_segments':      '3',
             'framework':       'Ray + PyTorch GPU',
@@ -1342,7 +1429,8 @@ else:
     total        = losses.sum(axis=1)
 
     with mlflow.start_run(run_name='monte_carlo_portfolio_singlenode') as run:
-        mlflow.log_input(_claims_dataset, context="training")
+        if _log_input:
+            mlflow.log_input(_claims_dataset, context="training")
         mlflow.log_params({
             'n_scenarios': N_SCENARIOS, 'framework': 'numpy',
             'copula': 't-copula', 'copula_df': COPULA_DF, 'marginals': 'lognormal',
@@ -1388,10 +1476,11 @@ else:
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
-# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments × 72 months | Claim volume forecasting |
-# MAGIC | GARCH(1,1) | arch + applyInPandas | 52 segments | Loss ratio volatility, risk capital |
+# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 72 months | Baseline claim volume forecast |
+# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + 2 exog vars | Forecast with StatCan macro signals |
+# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility, risk capital |
 # MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — current period |
-# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMA-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
+# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
 # MAGIC | Monte Carlo — stress tests | Ray + PyTorch GPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
 # MAGIC
-# MAGIC **Next:** Module 5 — Log the best SARIMA model to MLflow, register in UC, and deploy a Model Serving endpoint.
+# MAGIC **Next:** Module 5 — Log the best SARIMAX model to MLflow, register in UC, and deploy a Model Serving endpoint.

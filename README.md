@@ -19,6 +19,7 @@ models, model serving, and a Streamlit dashboard — packaged as a single
 │   ├── app.yml               # Databricks App resource + SP authorizations
 │   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
 ├── scripts/
+│   ├── fetch_macro_data.py   # Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw
 │   └── lakebase_setup.py     # Local Lakebase setup script (runs from deploy.sh using CLI OAuth JWT)
 ├── src/
 │   ├── ops/
@@ -90,14 +91,58 @@ cluster) because Lakebase Autoscaling's `databricks_auth` extension only accepts
 standard OAuth JWTs issued by the workspace OIDC endpoint — internal cluster tokens
 are not accepted (see [Lakebase authentication](#lakebase-authentication) below).
 
-The setup job runs the following modules in sequence:
-1. Generate synthetic policy CDC data
-2. Run the DLT pipeline (Bronze → Silver → Gold)
-3. Build rolling features (Module 2)
-4. Register the Feature Store + Online Table (Module 3)
-5. Fit SARIMA / GARCH / Monte Carlo models (Module 4)
-6. Register model to UC Registry + create Model Serving endpoint (Module 5)
-7. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on the serving endpoint to the app service principal
+The setup job runs the following tasks in order:
+1. **Generate source data** — synthetic policy CDC events + claim incidents → `policy_cdc_raw`, `claims_events_raw`
+2. **Fetch macro data** (parallel after task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
+3. **Run DLT pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
+   - Policy: `bronze_policy_cdc` → `silver_policies` → `gold_segment_monthly_stats`
+   - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 72 months)
+   - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
+4. **Build rolling features** (Module 2)
+5. **Register Feature Store + Online Table** (Module 3)
+6. **Fit SARIMAX / GARCH / Monte Carlo** (Module 4) — reads `gold_claims_monthly` from DLT; joins real StatCan macro exogenous variables; compares SARIMA vs SARIMAX MAPE
+7a. **Register SARIMA model** + create Model Serving endpoint (Module 5)
+7b. **Register Monte Carlo model** + create CPU endpoint (Module 6) — parallel with 7a
+8. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal
+
+---
+
+## Statistics Canada Macro Data Integration
+
+Module 4 (`04_classical_stats_at_scale.py`) upgrades the baseline SARIMA model to
+**SARIMAX** by joining real macroeconomic data from Statistics Canada as exogenous
+variables. The data flows through the same DLT medallion pipeline as the claims data:
+
+```
+scripts/fetch_macro_data.py  →  macro_indicators_raw
+                                   ↓ (DLT streaming)
+                            bronze_macro_indicators
+                                   ↓ (DLT apply_changes, SCD Type 2)
+                            silver_macro_indicators     ← tracks StatCan revisions
+                                   ↓ (DLT materialized view)
+                            gold_macro_features         ← Module 4 reads here
+```
+
+**Three StatCan indicators fetched (public CSV API, no authentication):**
+
+| StatCan Table | Indicator | Use in SARIMAX |
+|---|---|---|
+| `14-10-0090-01` | `unemployment_rate` | Leading indicator for auto/liability claims |
+| `18-10-0205-01` | `hpi_index` → `hpi_growth` | Housing market proxy for homeowners claims |
+| `34-10-0035-01` | `housing_starts` | New-exposure leading indicator |
+
+**Coverage:** 10 provinces × 72 months (Jan 2019 – Dec 2024) = 720 rows per fetch.
+
+**Network-restricted workspaces:** `scripts/fetch_macro_data.py` is fault-tolerant.
+If `www150.statcan.gc.ca` is unreachable (firewall, restricted HTTPS), the script
+creates an empty `macro_indicators_raw` table and exits cleanly. The DLT pipeline
+runs on the empty table, and Module 4 falls back to baseline SARIMA (no exog).
+The full pipeline completes successfully in both cases.
+
+**Workshop narrative:** *"Watch the MAPE drop when we add provincial unemployment rates
+as exogenous variables — the SARIMAX model captures the economic cycle that drives claims."*
+MLflow logs `avg_mape_baseline_pct`, `avg_mape_sarimax_pct`, and `avg_mape_improvement_pct`
+for direct comparison in the experiment UI.
 
 ---
 
@@ -212,10 +257,10 @@ permissions), then deploys the app source code last so it starts with full permi
 
 | Module | Notebook | Key Concepts |
 |--------|----------|-------------|
-| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API |
+| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API; 3 data streams (policy, claims, macro) |
 | 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
 | 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
-| 4 | `04_classical_stats_at_scale.py` | SARIMA/GARCH, t-Copula Monte Carlo (SARIMA-driven VaR evolution), Ray+GPU, MLflow |
+| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (reads DLT gold layer + real StatCan macro exog), t-Copula Monte Carlo, Ray+GPU, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |
@@ -251,8 +296,16 @@ After running `./deploy.sh`, the following resources will be created:
 | Monte Carlo results | `{catalog}.{schema}.monte_carlo_results` (40M baseline paths) |
 | VaR timeline | `{catalog}.{schema}.portfolio_risk_timeline` (12-month SARIMA-driven) |
 | Stress scenarios | `{catalog}.{schema}.stress_test_scenarios` (CAT, systemic risk, inflation) |
-| Regional forecast | `{catalog}.{schema}.regional_claims_forecast` (SARIMA aggregated by region × month) |
+| Regional forecast | `{catalog}.{schema}.regional_claims_forecast` (SARIMAX aggregated by region × month) |
 | Monte Carlo endpoint | `actuarial-workshop-monte-carlo` (AI Gateway enabled: usage tracking, inference table, rate limits) |
+| Claims landing zone | `{catalog}.{schema}.claims_events_raw` (~1.5M synthetic claim incidents, Jan 2019–Dec 2024) |
+| Claims DLT bronze | `{catalog}.{schema}.bronze_claims` (streaming, validated) |
+| Claims DLT gold | `{catalog}.{schema}.gold_claims_monthly` (40 segments × 72 months, with loss_ratio) |
+| Macro landing zone | `{catalog}.{schema}.macro_indicators_raw` (StatCan CSV append batches; empty when network-restricted) |
+| Macro DLT bronze | `{catalog}.{schema}.bronze_macro_indicators` (streaming) |
+| Macro DLT silver | `{catalog}.{schema}.silver_macro_indicators` (SCD Type 2 — tracks StatCan revisions) |
+| Macro DLT gold | `{catalog}.{schema}.gold_macro_features` (pivoted: unemployment_rate, hpi_index, hpi_growth, housing_starts per province × month) |
+| SARIMAX forecasts | `{catalog}.{schema}.sarima_forecasts` (actuals + 12-month forecasts, mape_baseline, mape_sarimax) |
 
 ---
 
