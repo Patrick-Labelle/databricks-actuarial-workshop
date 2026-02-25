@@ -862,33 +862,49 @@ _MC_MU_LN      = np.log(_MC_MEANS) - _MC_SIGMA2 / 2
 _MC_SIGMA_LN   = np.sqrt(_MC_SIGMA2)
 _MC_CORR       = np.asarray(PORTFOLIO["corr_matrix"], dtype=np.float32)
 
+# Stress scenario correlation matrices (module-level for Ray worker closures).
+# stress_corr: systemic/contagion regime — correlations spike during market crises
+# cat_event:   post-catastrophe regime — geographic concentration amplifies co-movement
+_STRESS_CORR = np.array([[1.00, 0.75, 0.60],
+                          [0.75, 1.00, 0.65],
+                          [0.60, 0.65, 1.00]], dtype=np.float32)
+_CAT_CORR    = np.array([[1.00, 0.55, 0.40],
+                          [0.55, 1.00, 0.45],
+                          [0.40, 0.45, 1.00]], dtype=np.float32)
+
 # Per-worker GPU tensor cache: populated on first GPU call, reused by all subsequent
 # tasks on the same worker process.
-# sig_t (from CV) and chol_t (from corr matrix) are fixed → always cached.
-# mu_t (from means) varies when means_override is supplied (SARIMA time-series runs)
-# → computed on the fly from mu_ln_arr; static version is also cached separately.
+# (sig, corr) variants are cached by (device, dtype, sig_hash, corr_hash) so each
+# unique scenario combination is computed once per worker.
+# mu_t varies per SARIMA month / scenario → cached only for the static baseline case.
 _GPU_TENSOR_CACHE: dict = {}
 
-def _get_gpu_tensors(device, dtype, mu_ln_arr=None):
-    """Return (mu_t, sig_t, chol_t) tensors.
+def _get_gpu_tensors(device, dtype, mu_ln_arr=None, sig_ln_arr=None, corr_arr=None):
+    """Return (mu_t, sig_t, chol_t) GPU tensors.
 
-    sig_t and chol_t are cached per (device, dtype) — they depend only on the
-    fixed CV vector and correlation matrix.  mu_t is computed from mu_ln_arr
-    when provided (SARIMA time-series runs) or from cached _MC_MU_LN otherwise.
+    sig_t and chol_t are cached by (device, dtype, sig_hash, corr_hash) so each
+    unique (CV vector, correlation matrix) combination is computed once per worker
+    process.  sig_ln_arr / corr_arr override the module-level defaults for stress
+    scenarios.  mu_t is computed from mu_ln_arr (SARIMA / scenario overrides) or
+    the cached static baseline value.
     """
     import torch
-    cache_key = (str(device), str(dtype))
-    if cache_key not in _GPU_TENSOR_CACHE:
-        _GPU_TENSOR_CACHE[cache_key] = (
-            torch.tensor(_MC_SIGMA_LN, dtype=dtype, device=device),   # sig_t
-            torch.linalg.cholesky(torch.tensor(_MC_CORR, dtype=dtype, device=device)),  # chol_t
+    _sig_id  = 'base' if sig_ln_arr is None else hash(sig_ln_arr.tobytes())
+    _corr_id = 'base' if corr_arr is None else hash(corr_arr.tobytes())
+    sc_key   = (str(device), str(dtype), _sig_id, _corr_id)
+    if sc_key not in _GPU_TENSOR_CACHE:
+        _sig  = _MC_SIGMA_LN if sig_ln_arr is None else sig_ln_arr
+        _corr = _MC_CORR     if corr_arr is None else corr_arr
+        _GPU_TENSOR_CACHE[sc_key] = (
+            torch.tensor(_sig,  dtype=dtype, device=device),    # sig_t
+            torch.linalg.cholesky(torch.tensor(_corr, dtype=dtype, device=device)),  # chol_t
         )
-    sig_t, chol_t = _GPU_TENSOR_CACHE[cache_key]
+    sig_t, chol_t = _GPU_TENSOR_CACHE[sc_key]
 
     if mu_ln_arr is not None:
         mu_t = torch.tensor(mu_ln_arr, dtype=dtype, device=device)
     else:
-        static_key = cache_key + ('mu_static',)
+        static_key = (str(device), str(dtype), 'mu_static')
         if static_key not in _GPU_TENSOR_CACHE:
             _GPU_TENSOR_CACHE[static_key] = torch.tensor(_MC_MU_LN, dtype=dtype, device=device)
         mu_t = _GPU_TENSOR_CACHE[static_key]
@@ -902,18 +918,23 @@ def _get_gpu_tensors(device, dtype, mu_ln_arr=None):
 # GPU path (hybrid): random sampling + Cholesky + lognormal on GPU; betainc on CPU.
 if RAY_AVAILABLE:
     @ray.remote(num_gpus=0.25, num_cpus=0.5)
-    def simulate_portfolio_losses(n_scenarios: int, seed: int, means_override=None) -> dict:
+    def simulate_portfolio_losses(n_scenarios: int, seed: int, means_override=None,
+                                   scenario: str = 'baseline') -> dict:
         """
         t-Copula + lognormal marginals Monte Carlo (Sklar's theorem).
 
-        Upgrade over Gaussian copula: the t-Copula (Student-t, df=4) captures
-        *tail dependence* — extreme losses in multiple lines co-occur more
-        frequently than linear correlations alone imply. This reflects common
-        shocks: catastrophe events, judicial/social inflation trends, and
-        macro-economic stress scenarios (e.g. stagflation) that simultaneously
-        impact Property, Auto, and Liability books.
+        scenario options
+        ─────────────────────────────────────────────────────────────────
+        'baseline'        Standard portfolio with static means (or SARIMA means
+                          when means_override is supplied for time-series runs).
+        'stress_corr'     Systemic / contagion risk: correlations spike to 0.65–0.75,
+                          modelling financial crisis or industry-wide loss event.
+        'cat_event'       1-in-250yr catastrophe: elevated means (Property 3.5×,
+                          Auto 1.8×, Liability 1.4×), stressed correlations, and a
+                          Poisson(λ=0.05) jump process for discrete CAT hits.
+        'inflation_shock' Sustained 30 % loss-cost inflation with +15 % CV uncertainty.
 
-        Steps:
+        Steps (GPU hybrid path):
           1. Draw correlated standard normals Z ~ N(0, R) using Cholesky(R).   [GPU]
           2. Draw chi2 W ~ chi2(df)/df (mixing variable for t-distribution).   [GPU]
           3. T = Z / sqrt(W) gives multivariate t(df) with correlation R.      [GPU]
@@ -923,26 +944,53 @@ if RAY_AVAILABLE:
              (vectorized C); we convert to numpy for this step then move back.
           5. Apply lognormal inverse CDF via erfinv: Phi^-1(u) = sqrt(2)*erfinv(2u-1)
              torch.special.erfinv is CUDA-accelerated; compute back on GPU.   [GPU]
+          6. (cat_event only) Poisson jump shocks on GPU for discrete CAT events.
 
         GPU path uses PyTorch (pre-installed on DBR GPU ML) for all array ops.
         Uses float32 for throughput (T4 tensor cores optimised for fp32).
         Results are moved back to CPU via .cpu().numpy() before returning (Ray
         cannot serialize CUDA tensors across process boundaries).
 
-        Module-level constants (_MC_MU_LN, _MC_SIGMA_LN, _MC_CORR, _MC_COPULA_DF)
-        and _get_gpu_tensors() are captured in the closure and loaded once per
-        worker process, avoiding redundant computation on repeated calls.
+        Module-level constants and _get_gpu_tensors() are captured in the closure
+        and loaded once per worker process, avoiding redundant computation.
         """
         import numpy as np
         import torch
 
-        # When means_override is supplied (SARIMA time-series runs), compute mu_ln
-        # from those means; otherwise use the cached module-level _MC_MU_LN.
-        if means_override is not None:
-            _mo = np.array(means_override, dtype=np.float32)
-            _mu_ln_arr = np.log(_mo) - np.log(1.0 + _MC_CV**2) / 2.0
-        else:
-            _mu_ln_arr = None
+        # ── Scenario parameter resolution ─────────────────────────────────────
+        # Each scenario adjusts the effective means, CV, and/or correlation matrix.
+        _sc_means_mult = np.ones(3, dtype=np.float32)   # multiplier on top of base means
+        _sc_cv_mult    = np.ones(3, dtype=np.float32)   # multiplier on top of base CV
+        _sc_corr_arr   = None                            # None → use _MC_CORR (base)
+        _add_cat_jump  = False
+
+        if scenario == 'stress_corr':
+            # Systemic/contagion risk: correlations spike under market-wide stress
+            _sc_corr_arr = _STRESS_CORR
+        elif scenario == 'cat_event':
+            # 1-in-250yr catastrophe: major natural disaster (hurricane / earthquake)
+            # Property bears the brunt (3.5×), Auto elevated (1.8×), Liability (1.4×)
+            _sc_means_mult = np.array([3.5, 1.8, 1.4], dtype=np.float32)
+            _sc_cv_mult    = np.array([1.5, 1.3, 1.2], dtype=np.float32)
+            _sc_corr_arr   = _CAT_CORR
+            _add_cat_jump  = True   # Poisson jump process added after copula step
+        elif scenario == 'inflation_shock':
+            # +30 % loss-cost inflation with elevated uncertainty
+            _sc_means_mult = np.array([1.30, 1.30, 1.30], dtype=np.float32)
+            _sc_cv_mult    = np.array([1.15, 1.15, 1.15], dtype=np.float32)
+
+        # Apply scenario multipliers on top of means_override (SARIMA) or base means
+        _base_means = (np.array(means_override, dtype=np.float32)
+                       if means_override is not None else _MC_MEANS)
+        _eff_means  = _base_means * _sc_means_mult
+        _eff_cv     = _MC_CV * _sc_cv_mult
+        _eff_sig2   = np.log(1.0 + _eff_cv**2)
+        _eff_mu_ln  = np.log(_eff_means) - _eff_sig2 / 2.0
+        _eff_sig_ln = np.sqrt(_eff_sig2)
+
+        # Pass None for unchanged params to hit cached static tensors
+        _mu_override  = None if (means_override is None and np.all(_sc_means_mult == 1.0)) else _eff_mu_ln
+        _sig_override = None if np.all(_sc_cv_mult == 1.0) else _eff_sig_ln
 
         # ── GPU path via PyTorch (hybrid: sampling on GPU, betainc on CPU) ──────
         # torch.device('cuda') lets CUDA_VISIBLE_DEVICES pick the right GPU index
@@ -962,9 +1010,12 @@ if RAY_AVAILABLE:
             if seed == 42:
                 print(f"[Ray seed=42] GPU smoke-test ok ({torch.cuda.get_device_name(0)}, sum={_s:.1f})")
 
-            # Retrieve precomputed tensors; mu_t computed from _mu_ln_arr when
-            # means_override is set, otherwise uses the cached static tensor.
-            mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype, mu_ln_arr=_mu_ln_arr)
+            # Retrieve precomputed tensors; scenario-specific sig/corr variants are
+            # cached on first use per worker process.
+            mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype,
+                                                     mu_ln_arr=_mu_override,
+                                                     sig_ln_arr=_sig_override,
+                                                     corr_arr=_sc_corr_arr)
 
             # Steps 1-2: correlated standard normals + chi2 mixing variable
             # chi2(df) = sum of df² independent standard normals (exact, GPU-native)
@@ -994,6 +1045,20 @@ if RAY_AVAILABLE:
             u_clip = u.clamp(1e-6, 1 - 1e-6)
             q      = torch.special.erfinv(2.0 * u_clip - 1.0).mul(2.0 ** 0.5)
             losses = torch.exp(mu_t + sig_t * q)                       # (n, 3)
+
+            # Catastrophe jump process (cat_event scenario only).
+            # Poisson(λ=0.05): each scenario has a 5 % chance of a discrete CAT
+            # event.  When it hits, losses are amplified by line-specific factors
+            # (Property ×8, Auto ×3, Liability ×1.5) on top of the copula result.
+            if _add_cat_jump:
+                _cat_n   = torch.poisson(
+                    torch.full((n_scenarios,), 0.05, dtype=dtype, device=device)
+                )                                          # ≈95 % → 0,  ≈5 % → 1
+                _cat_amp = torch.stack(
+                    [_cat_n * 8.0, _cat_n * 3.0, _cat_n * 1.5], dim=1
+                )
+                losses = losses * (1.0 + _cat_amp)
+
             total  = losses.sum(dim=1).cpu().numpy().astype(np.float64)
             backend = 'torch-gpu-hybrid'   # sampling on GPU, betainc on CPU
 
@@ -1001,21 +1066,29 @@ if RAY_AVAILABLE:
             # ── CPU fallback (Serverless, non-GPU workers, torch.cuda unavailable) ─
             print(f"[Ray task seed={seed}] GPU path failed ({type(e_gpu).__name__}: {e_gpu}) — using CPU")
             from scipy.stats import t as tdist, norm as scipy_norm
-            chol     = np.linalg.cholesky(_MC_CORR)
+            _cpu_chol = np.linalg.cholesky(
+                _sc_corr_arr if _sc_corr_arr is not None else _MC_CORR
+            )
             rng      = np.random.default_rng(seed)
             z        = rng.standard_normal((n_scenarios, 3))
             chi2     = rng.chisquare(_MC_COPULA_DF, n_scenarios)
-            t_cor    = (z @ chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
+            t_cor    = (z @ _cpu_chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
             u        = tdist.cdf(t_cor, df=_MC_COPULA_DF)
             q        = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
-            _cpu_mu  = _mu_ln_arr if _mu_ln_arr is not None else _MC_MU_LN
-            losses   = np.exp(_cpu_mu + _MC_SIGMA_LN * q)
-            total  = losses.sum(axis=1)
-            backend = 'numpy-cpu'
+            losses   = np.exp(_eff_mu_ln + _eff_sig_ln * q)
+            if _add_cat_jump:
+                _cat_n   = rng.poisson(0.05, n_scenarios)
+                _cat_amp = np.stack(
+                    [_cat_n * 8.0, _cat_n * 3.0, _cat_n * 1.5], axis=1
+                ).astype(np.float32)
+                losses   = losses * (1.0 + _cat_amp)
+            total    = losses.sum(axis=1)
+            backend  = 'numpy-cpu'
 
         return {
             'seed':            seed,
             'n_scenarios':     n_scenarios,
+            'scenario':        scenario,
             'copula':          f't-copula(df={_MC_COPULA_DF})',
             'backend':         backend,
             'total_loss_mean': float(total.mean()),
@@ -1030,27 +1103,33 @@ if RAY_AVAILABLE:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Monte Carlo — Baseline + 12-Month VaR Evolution (GPU-accelerated)
+# MAGIC ### Monte Carlo — Baseline + VaR Evolution + Stress Tests (GPU-accelerated)
 # MAGIC
-# MAGIC Two complementary simulations dispatched in a single Ray batch:
+# MAGIC Three complementary simulations dispatched together in a single Ray batch:
 # MAGIC
-# MAGIC 1. **Baseline** (static `PORTFOLIO` means) — current-period capital position;
-# MAGIC    written to `monte_carlo_results` for downstream use in Modules 5–7.
-# MAGIC 2. **12-month time series** (SARIMA-driven means) — for each forecast month
-# MAGIC    the means are scaled by the SARIMA growth factor from the bridge above,
-# MAGIC    giving a **VaR evolution table** that shows how capital requirements change
-# MAGIC    as claims grow along the SARIMA forecast path.
+# MAGIC 1. **Baseline** (static `PORTFOLIO` means, 40M paths) — current-period capital
+# MAGIC    position; written to `monte_carlo_results` for downstream Modules 5–7.
+# MAGIC 2. **12-month VaR evolution** (SARIMA-driven means, 480M paths) — for each
+# MAGIC    forecast month means are scaled by the SARIMA growth factor, giving a
+# MAGIC    **forward capital requirement curve** aligned to claims expectations.
+# MAGIC 3. **Stress tests** (3 scenarios × 40M paths = 120M paths):
+# MAGIC    - `cat_event`: 1-in-250yr catastrophe — elevated means (Property 3.5×,
+# MAGIC      Auto 1.8×), stressed correlations, **Poisson(λ=0.05) jump shocks**
+# MAGIC    - `stress_corr`: systemic/contagion risk — correlations spike to 0.65–0.75
+# MAGIC    - `inflation_shock`: +30 % loss-cost inflation, +15 % CV uncertainty
 # MAGIC
-# MAGIC All `(1 + 12) × 4 = 52` tasks are dispatched before any are collected.
-# MAGIC Ray queues them and runs 4 concurrently (4 × 0.25 GPU = 1.0 GPU), so
-# MAGIC wall time is roughly **65 seconds for 52M total paths**.
+# MAGIC All `(1 + 12 + 3) × 4 = 64` tasks are dispatched before any are collected.
+# MAGIC Ray queues them 4 at a time (4 × 0.25 GPU = 1.0 GPU full utilization),
+# MAGIC targeting **~90 seconds for 640M total paths** on a single T4.
 
 # COMMAND ----------
 
-# 4 tasks per run, 1M scenarios each → T4 GPU fully occupied (4 × 0.25 = 1.0 GPU).
-N_TASKS    = 4
-N_PER_TASK = 1_000_000
-N_RUNS     = 1 + len(_forecast_months)  # baseline + 12 SARIMA months
+# 4 tasks per run, 10M scenarios each → T4 GPU under heavy load (4 × 0.25 = 1.0 GPU).
+# 10M paths/task: ~600 MB GPU RAM per task, ~3–5 s/task wall-time on T4.
+N_TASKS          = 4
+N_PER_TASK       = 10_000_000      # 10× — GPU stress demo; total ~640M paths
+STRESS_SCENARIOS = ['stress_corr', 'cat_event', 'inflation_shock']
+N_RUNS           = 1 + len(_forecast_months) + len(STRESS_SCENARIOS)
 
 if RAY_AVAILABLE:
     print(f'Launching {N_RUNS} runs × {N_TASKS} tasks × {N_PER_TASK:,} paths '
@@ -1077,6 +1156,8 @@ if RAY_AVAILABLE:
             'correlation_P_A':      0.40,
             'correlation_P_L':      0.20,
             'correlation_A_L':      0.30,
+            'stress_scenarios':     ','.join(STRESS_SCENARIOS),
+            'n_stress_scenarios':   len(STRESS_SCENARIOS),
         })
 
         # ── Dispatch all tasks before collecting any ───────────────────────────
@@ -1099,9 +1180,22 @@ if RAY_AVAILABLE:
                 for i in range(N_TASKS)
             ]
 
+        # Stress scenarios (seeds 300+): 3 scenarios × 4 tasks each.
+        # All dispatched before collecting any results — Ray queues all 64 tasks
+        # and keeps 4 running concurrently (full T4 occupancy throughout).
+        stress_futures: dict = {}
+        for _si, _sc in enumerate(STRESS_SCENARIOS):
+            stress_futures[_sc] = [
+                simulate_portfolio_losses.remote(
+                    N_PER_TASK, seed=300 + _si * N_TASKS + i, scenario=_sc,
+                )
+                for i in range(N_TASKS)
+            ]
+
         # Collect (Ray blocks until all tasks finish)
         baseline_results = ray.get(baseline_futures)
         ts_results       = {m: ray.get(futs) for m, futs in ts_futures.items()}
+        stress_results   = {sc: ray.get(futs) for sc, futs in stress_futures.items()}
 
         # Shut down Ray immediately so Spark can reclaim executor slots for the
         # saveAsTable calls below. Ray workers hold all CPUs while alive.
@@ -1223,6 +1317,50 @@ if RAY_AVAILABLE:
                 .saveAsTable(f'{CATALOG}.{SCHEMA}.regional_claims_forecast'))
             print(f'Regional breakdown saved → {CATALOG}.{SCHEMA}.regional_claims_forecast')
 
+        # ── Stress test scenario comparison ────────────────────────────────────
+        _STRESS_LABELS = {
+            'stress_corr':    'Systemic Risk (ρ↑)',
+            'cat_event':      'Catastrophe (1-in-250yr)',
+            'inflation_shock': 'Inflation Shock (+30%)',
+        }
+        stress_rows = []
+        for _sc in STRESS_SCENARIOS:
+            _sr     = stress_results[_sc]
+            _sc_row = {
+                'scenario':            _sc,
+                'scenario_label':      _STRESS_LABELS[_sc],
+                'total_mean_M':        _agg(_sr, 'total_loss_mean'),
+                'var_99_M':            _agg(_sr, 'var_99'),
+                'var_995_M':           _agg(_sr, 'var_995'),
+                'cvar_99_M':           _agg(_sr, 'cvar_99'),
+                'var_995_vs_baseline': (_agg(_sr, 'var_995') / aggregate_var995 - 1.0) * 100,
+            }
+            stress_rows.append(_sc_row)
+            mlflow.log_metric(f'VaR_99_5_{_sc}_M', round(_sc_row['var_995_M'], 2))
+
+        print(f'\n  STRESS TEST COMPARISON  (vs. baseline — {N_TASKS * N_PER_TASK:,} paths/scenario)')
+        print('  ' + '─'*75)
+        print(f'  {"Scenario":<28} {"Exp.Loss":>10} {"VaR(99%)":>10} {"VaR(99.5%)":>12} {"Δ VaR(99.5%)":>14}')
+        print('  ' + '─'*75)
+        print(f'  {"[baseline]":<28} ${aggregate_mean:>8.1f}M ${aggregate_var99:>8.1f}M ${aggregate_var995:>10.1f}M  {"—":>12}')
+        for _row in stress_rows:
+            print(
+                f'  {_row["scenario_label"]:<28} '
+                f'${_row["total_mean_M"]:>8.1f}M '
+                f'${_row["var_99_M"]:>8.1f}M '
+                f'${_row["var_995_M"]:>10.1f}M  '
+                f'{_row["var_995_vs_baseline"]:>+11.1f}%'
+            )
+        print('  ' + '─'*75)
+
+        stress_df = spark.createDataFrame(pd.DataFrame(stress_rows))
+        (stress_df.write
+            .format('delta')
+            .mode('overwrite')
+            .option('overwriteSchema', 'true')
+            .saveAsTable(f'{CATALOG}.{SCHEMA}.stress_test_scenarios'))
+        print(f'\nStress scenarios saved → {CATALOG}.{SCHEMA}.stress_test_scenarios')
+
 else:
     # Fallback: single-node t-Copula simulation without Ray (Serverless / no GPU)
     print('\nRunning single-node Monte Carlo (Ray not available on this cluster)\n')
@@ -1294,7 +1432,8 @@ else:
 # MAGIC |---|---|---|---|
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments × 72 months | Claim volume forecasting |
 # MAGIC | GARCH(1,1) | arch + applyInPandas | 52 segments | Loss ratio volatility, risk capital |
-# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 4M paths (4 tasks × 1M) | VaR(99.5%), CVaR, SCR — current period |
-# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMA-driven) | 48M paths (12 months × 4 × 1M) | Forward VaR, regional breakdown |
+# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — current period |
+# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMA-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
+# MAGIC | Monte Carlo — stress tests | Ray + PyTorch GPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
 # MAGIC
 # MAGIC **Next:** Module 5 — Log the best SARIMA model to MLflow, register in UC, and deploy a Model Serving endpoint.

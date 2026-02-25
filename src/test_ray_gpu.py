@@ -184,7 +184,7 @@ def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
 
 # ── Launch 4 tasks × 100k scenarios ──────────────────────────────────────────
 import time
-N_TASKS, N_PER_TASK = 4, 100_000
+N_TASKS, N_PER_TASK = 4, 1_000_000   # smoke test — Module 4 production uses 10M/task
 print(f"Launching {N_TASKS} Ray tasks x {N_PER_TASK:,} scenarios...")
 t0 = time.time()
 futures = [simulate_portfolio_losses.remote(N_PER_TASK, seed=42 + i) for i in range(N_TASKS)]

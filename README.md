@@ -118,28 +118,34 @@ workspace settings from `e2-demo` and adds one override: Task 5 (`fit_statistica
 from serverless to a **DBR 17.3-gpu-ml** job cluster (1 × `g4dn.xlarge`, NVIDIA Tesla T4),
 and `run_ray: "auto"` + `job_mode: "false"` are passed to the notebook.
 
-### GPU Monte Carlo (t-Copula, SARIMA-driven time-series VaR)
+### GPU Monte Carlo (t-Copula, SARIMA-driven VaR evolution + stress scenarios)
 
-Module 4 uses Ray-on-Spark with PyTorch for GPU-accelerated Monte Carlo — two runs dispatched
-together in a single Ray batch:
+Module 4 uses Ray-on-Spark with PyTorch for GPU-accelerated Monte Carlo — all 64 tasks
+dispatched simultaneously in a single Ray batch (~640M total paths):
 
-1. **Baseline** (static means): 4 tasks × 1M = **4M paths** → `monte_carlo_results` (used by Module 5/app)
-2. **12-month VaR evolution** (SARIMA-driven means): 12 months × 4 tasks × 1M = **48M paths**
+1. **Baseline** (static means): 4 tasks × 10M = **40M paths** → `monte_carlo_results` (used by Module 5/app)
+2. **12-month VaR evolution** (SARIMA-driven means): 12 months × 4 tasks × 10M = **480M paths**
    → `portfolio_risk_timeline` showing how capital requirements evolve along the SARIMA forecast path
+3. **Stress scenarios** (3 × 4 tasks × 10M = **120M paths**) → `stress_test_scenarios`:
+   - `cat_event`: 1-in-250yr catastrophe — Property 3.5×, Auto 1.8×, Liability 1.4×, stressed ρ,
+     and a **Poisson(λ=0.05) jump process** for discrete large-loss events
+   - `stress_corr`: systemic/contagion risk — correlations spike to 0.65–0.75
+   - `inflation_shock`: +30% loss-cost inflation across all lines, +15% CV uncertainty
 
 - **t-Copula (df=4)** captures tail dependence between Property, Auto, and Liability lines
 - **Hybrid path:** correlated sampling, chi² mixing, and lognormal inverse CDF on GPU (torch);
   t-CDF (`betainc`) on CPU via scipy (absent from PyTorch's stable API in 2.7.x)
 - Ray workers use `num_gpus=0.25` + `num_cpus=0.5` fractional allocation: **4 concurrent tasks
-  per T4 = full GPU utilization**; 52 total tasks complete in ~65 seconds
+  per T4 = full GPU utilization**; 64 total tasks complete in ~90 seconds for 640M total paths
 - Regional claims breakdown written to `regional_claims_forecast` (SARIMA aggregated by region × month)
 
 ### Ray CPU Reservation
 
 `setup_ray_cluster` is called with `num_cpus_worker_node=2` on the 4-vCPU `g4dn.xlarge` worker,
 leaving 2 vCPUs free for Spark. `num_cpus=0.5` per Ray task allows 4 tasks to run concurrently
-(4 × 0.5 = 2.0 CPUs ≤ 2 available), keeping the T4 fully utilized. After Monte Carlo completes,
-`shutdown_ray_cluster()` is called before any Spark write to release all resources immediately.
+(4 × 0.5 = 2.0 CPUs ≤ 2 available), keeping the T4 fully utilized. After Monte Carlo completes
+(all 64 tasks collected), `shutdown_ray_cluster()` is called before any Spark write to release
+all resources immediately.
 
 > **Note:** Classic/GPU ML clusters are not available on serverless-only workspaces (e.g. FEVM).
 > The Ray variant targets the `e2-demo-field-eng` workspace.
@@ -240,6 +246,9 @@ After running `./deploy.sh`, the following resources will be created:
 | Databricks App | `actuarial-workshop` |
 | Feature Table | `{catalog}.{schema}.segment_monthly_features` |
 | UC Model | `{catalog}.{schema}.sarima_claims_forecaster` |
+| Monte Carlo results | `{catalog}.{schema}.monte_carlo_results` (40M baseline paths) |
+| VaR timeline | `{catalog}.{schema}.portfolio_risk_timeline` (12-month SARIMA-driven) |
+| Stress scenarios | `{catalog}.{schema}.stress_test_scenarios` (CAT, systemic risk, inflation) |
 
 ---
 

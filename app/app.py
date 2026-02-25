@@ -211,6 +211,34 @@ def load_segment_stats(segment_id: str):
         WHERE segment_id = '{segment_id}'
     """)
 
+@st.cache_data(ttl=600)
+def load_stress_scenarios():
+    """Load pre-computed stress test scenario comparison from Module 4."""
+    df = execute_sql(f"""
+        SELECT scenario_label, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline
+        FROM {CATALOG}.{SCHEMA}.stress_test_scenarios
+        ORDER BY var_995_M DESC
+    """)
+    if not df.empty:
+        for col in ['total_mean_M', 'var_99_M', 'var_995_M', 'cvar_99_M', 'var_995_vs_baseline']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+@st.cache_data(ttl=600)
+def load_var_timeline():
+    """Load the 12-month SARIMA-driven VaR evolution from Module 4."""
+    df = execute_sql(f"""
+        SELECT forecast_month, month_idx, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline
+        FROM {CATALOG}.{SCHEMA}.portfolio_risk_timeline
+        ORDER BY month_idx
+    """)
+    if not df.empty:
+        for col in ['total_mean_M', 'var_99_M', 'var_995_M', 'cvar_99_M', 'var_995_vs_baseline', 'month_idx']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
 def call_serving_endpoint(horizon: int) -> pd.DataFrame:
     """Call SARIMA Model Serving endpoint via Databricks SDK."""
     w = _get_workspace_client()
@@ -386,6 +414,7 @@ def _ensure_annotations_table():
 
 _SCENARIO_TYPES = [
     "Assumption Override",
+    "Catastrophe Event",
     "External Event",
     "Review Comment",
     "Judgment Adjustment",
@@ -393,6 +422,53 @@ _SCENARIO_TYPES = [
 ]
 
 _APPROVAL_STATUSES = ["Draft", "Pending Review", "Approved"]
+
+# ─── CAT scenario presets ─────────────────────────────────────────────────────
+# Each preset defines severity multipliers (relative to baseline) applied to
+# means, CVs, and correlation offsets.  Return period further scales means.
+_CAT_PRESETS = {
+    "Hurricane":           {
+        "means_mult": [2.8, 1.9, 1.3], "cv_mult": [1.4, 1.3, 1.2], "corr_add": 0.15,
+        "desc": "Severe wind + storm surge. Property and Auto heavily impacted.",
+    },
+    "Earthquake":          {
+        "means_mult": [3.8, 1.6, 1.4], "cv_mult": [1.6, 1.2, 1.3], "corr_add": 0.20,
+        "desc": "Structural damage + fires. Property losses dominate.",
+    },
+    "Flood":               {
+        "means_mult": [2.3, 1.7, 1.1], "cv_mult": [1.3, 1.2, 1.1], "corr_add": 0.12,
+        "desc": "Widespread inundation. Both Property and Auto impacted.",
+    },
+    "Wildfire":            {
+        "means_mult": [3.2, 1.4, 1.2], "cv_mult": [1.5, 1.1, 1.2], "corr_add": 0.15,
+        "desc": "Structure and vehicle losses across a broad geographic area.",
+    },
+    "Pandemic":            {
+        "means_mult": [1.1, 0.8, 2.8], "cv_mult": [1.2, 1.1, 1.5], "corr_add": 0.25,
+        "desc": "Liability and healthcare claims surge; Auto frequency drops.",
+    },
+    "Market Crash":        {
+        "means_mult": [1.2, 1.1, 1.8], "cv_mult": [1.3, 1.2, 1.4], "corr_add": 0.30,
+        "desc": "Systemic financial stress — correlated across all lines.",
+    },
+    "Industrial Accident": {
+        "means_mult": [2.0, 1.5, 2.2], "cv_mult": [1.3, 1.2, 1.4], "corr_add": 0.18,
+        "desc": "Explosion, chemical spill, or structural collapse. High liability.",
+    },
+}
+
+_RETURN_PERIOD_MULT = {
+    "1-in-50yr":  0.70,
+    "1-in-100yr": 1.00,
+    "1-in-250yr": 1.80,
+    "1-in-500yr": 3.00,
+}
+
+_CANADIAN_PROVINCES = [
+    "Ontario", "Quebec", "British Columbia", "Alberta", "Atlantic",
+    "Manitoba", "Saskatchewan", "Nova Scotia", "New Brunswick",
+    "Newfoundland", "PEI", "NWT", "Yukon",
+]
 
 def save_scenario_annotation(
     segment: str,
@@ -474,7 +550,7 @@ pre-computed in the Feature Store for model training.
 |---|---|
 | **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. Served via REST endpoint (On-Demand Forecast tab). |
 | **GARCH(1,1)** | Models time-varying volatility in loss ratios. Useful for risk capital estimation when variance is not constant. |
-| **Monte Carlo** | 100,000 scenarios using a **t-Copula (df=4) + lognormal marginals** across three lines (Property, Auto, Liability). Parallelised with Ray-on-Spark GPU (100 tasks × 1,000 paths); captures tail dependence for more realistic VaR/CVaR under common shocks. Served as parameterised endpoint (Scenario Analysis tab). |
+| **Monte Carlo** | **640M paths** (64 Ray tasks × 10M each) on NVIDIA T4 GPU: baseline + 12-month SARIMA-driven VaR evolution + 3 stress scenarios (CAT event, systemic risk, inflation shock). t-Copula (df=4) + lognormal marginals + Poisson jump shocks for CAT. See **Catastrophe Scenarios** tab. |
 """)
 
     st.divider()
@@ -506,7 +582,7 @@ the Unity Catalog Model Registry.
 st.title("📊 Actuarial Risk Dashboard")
 st.caption("Powered by Databricks | SARIMA Forecasting + Monte Carlo Portfolio Risk")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast", "🎲 Scenario Analysis"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast", "🎲 Scenario Analysis", "🌪️ Catastrophe Scenarios"])
 
 # ── Tab 1: Segment Forecasts ──────────────────────────────────────────────────
 with tab1:
@@ -704,7 +780,7 @@ Use the annotation tool below to flag such assumptions.
 # ── Tab 2: Portfolio Risk ─────────────────────────────────────────────────────
 with tab2:
     st.subheader("Monte Carlo Portfolio Risk Summary")
-    st.caption("100,000 scenarios | t-Copula (df=4) + Lognormal | Property + Auto + Liability")
+    st.caption("40M baseline paths | t-Copula (df=4) + Lognormal | Property + Auto + Liability")
 
     with st.expander("ℹ️ How the simulation works", expanded=False):
         st.markdown("""
@@ -1160,3 +1236,257 @@ in the request — enabling analysts to run stress scenarios without modifying o
                 "Monte Carlo endpoint not available. "
                 "Start it from Module 6 or wait for the setup job to complete."
             )
+
+# ── Tab 5: Catastrophe Scenarios ──────────────────────────────────────────────
+with tab5:
+    st.subheader("Catastrophe Scenario Analysis")
+    st.caption(
+        "Pre-computed stress tests (Module 4) + custom catastrophe event simulation via Monte Carlo endpoint"
+    )
+
+    import plotly.graph_objects as go
+
+    # ── Section 1: Pre-computed stress scenarios ───────────────────────────────
+    st.markdown("### Pre-Computed Stress Test Results")
+    st.caption(
+        "Run by Module 4 (Ray + GPU) at deploy time — 120M paths across 3 scenarios."
+    )
+
+    _baseline_smry = load_monte_carlo_summary()
+    _stress_df     = load_stress_scenarios()
+
+    if not _stress_df.empty:
+        _b_var995  = float(_baseline_smry.get('var_995', 0))
+        _b_var99   = float(_baseline_smry.get('var_99', 0))
+        _b_cvar99  = float(_baseline_smry.get('cvar_99', 0))
+        _b_mean    = float(_baseline_smry.get('expected_loss', 0))
+
+        _disp_rows = [{"Scenario": "Baseline", "Exp. Loss": f"${_b_mean:.1f}M",
+                       "VaR(99%)": f"${_b_var99:.1f}M", "VaR(99.5%) SCR": f"${_b_var995:.1f}M",
+                       "CVaR(99%)": f"${_b_cvar99:.1f}M", "Δ VaR(99.5%)": "—"}]
+        for _, row in _stress_df.iterrows():
+            _disp_rows.append({
+                "Scenario":       row["scenario_label"],
+                "Exp. Loss":      f"${row['total_mean_M']:.1f}M",
+                "VaR(99%)":       f"${row['var_99_M']:.1f}M",
+                "VaR(99.5%) SCR": f"${row['var_995_M']:.1f}M",
+                "CVaR(99%)":      f"${row['cvar_99_M']:.1f}M",
+                "Δ VaR(99.5%)":   f"{row['var_995_vs_baseline']:+.1f}%",
+            })
+        st.dataframe(pd.DataFrame(_disp_rows), use_container_width=True, hide_index=True)
+
+        _all_labels = ["Baseline"] + _stress_df["scenario_label"].tolist()
+        _all_var995 = [_b_var995] + _stress_df["var_995_M"].tolist()
+        _all_cvar99 = [_b_cvar99] + _stress_df["cvar_99_M"].tolist()
+        _bar_colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd"]
+
+        _fig_stress = go.Figure()
+        _fig_stress.add_trace(go.Bar(
+            name="VaR(99.5%) — SCR",
+            x=_all_labels, y=_all_var995,
+            marker_color=_bar_colors,
+            text=[f"${v:.1f}M" for v in _all_var995], textposition="outside",
+            hovertemplate="%{x}<br>VaR(99.5%): $%{y:.1f}M<extra></extra>",
+        ))
+        _fig_stress.add_trace(go.Bar(
+            name="CVaR(99%)",
+            x=_all_labels, y=_all_cvar99,
+            marker_color=[c.replace(")", ", 0.5)").replace("rgb", "rgba") if "rgb" in c
+                          else c + "80" for c in _bar_colors],
+            text=[f"${v:.1f}M" for v in _all_cvar99], textposition="outside",
+            hovertemplate="%{x}<br>CVaR(99%): $%{y:.1f}M<extra></extra>",
+        ))
+        _fig_stress.update_layout(
+            title="VaR(99.5%) and CVaR(99%) — Baseline vs. Stress Scenarios",
+            yaxis_title="Annual Portfolio Loss ($M)",
+            barmode="group", height=400, showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            yaxis=dict(range=[0, max(_all_var995 + _all_cvar99) * 1.25]),
+        )
+        st.plotly_chart(_fig_stress, use_container_width=True)
+    else:
+        st.info("Stress scenario data not yet available — run the setup job (e2-demo-ray target).")
+
+    # ── Section 2: VaR evolution timeline ─────────────────────────────────────
+    st.markdown("### 12-Month Forward VaR Evolution (SARIMA-Driven)")
+    _timeline_df = load_var_timeline()
+    if not _timeline_df.empty:
+        _fig_tl = go.Figure()
+        _fig_tl.add_trace(go.Scatter(
+            x=_timeline_df["month_idx"], y=_timeline_df["var_995_M"],
+            mode="lines+markers", name="VaR(99.5%)", line=dict(color="#d62728"),
+            hovertemplate="Month +%{x}<br>VaR(99.5%): $%{y:.1f}M<extra></extra>",
+        ))
+        _fig_tl.add_trace(go.Scatter(
+            x=_timeline_df["month_idx"], y=_timeline_df["var_99_M"],
+            mode="lines+markers", name="VaR(99%)", line=dict(color="#ff7f0e", dash="dash"),
+            hovertemplate="Month +%{x}<br>VaR(99%): $%{y:.1f}M<extra></extra>",
+        ))
+        _b_v995 = float(_baseline_smry.get('var_995', 0))
+        if _b_v995 > 0:
+            _fig_tl.add_hline(
+                y=_b_v995, line_dash="dot", line_color="grey",
+                annotation_text=f"Current VaR(99.5%): ${_b_v995:.1f}M",
+                annotation_position="bottom right",
+            )
+        _fig_tl.update_layout(
+            title="Forward Capital Requirement Curve — VaR Evolution Along SARIMA Forecast Path",
+            xaxis_title="Months Ahead", yaxis_title="Annual Portfolio Loss ($M)",
+            height=380,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(_fig_tl, use_container_width=True)
+    else:
+        st.info("VaR timeline not yet available — run the setup job (e2-demo-ray target).")
+
+    st.divider()
+
+    # ── Section 3: Custom CAT scenario submission ──────────────────────────────
+    st.markdown("### Submit Custom Catastrophe Scenario")
+    st.caption(
+        "Configure a natural disaster or market event, translate it to portfolio loss parameters, "
+        "and run a Monte Carlo simulation via the serving endpoint. Results are saved to Lakebase."
+    )
+
+    _cat_top1, _cat_top2 = st.columns(2)
+    with _cat_top1:
+        _cat_type = st.selectbox(
+            "Event type:",
+            list(_CAT_PRESETS.keys()),
+            help="Preset determines default severity multipliers for each line of business.",
+        )
+        st.caption(f"_{_CAT_PRESETS[_cat_type]['desc']}_")
+        _return_period = st.selectbox(
+            "Return period:",
+            list(_RETURN_PERIOD_MULT.keys()),
+            index=1,
+            help="1-in-250yr ≈ Solvency II PML benchmark; 1-in-500yr = extreme stress.",
+        )
+    with _cat_top2:
+        _affected_regions = st.multiselect(
+            "Affected provinces/territories:",
+            _CANADIAN_PROVINCES,
+            default=["Ontario", "Quebec"],
+            help="Provinces exposed to this event (for documentation and audit trail).",
+        )
+        _affected_lines = st.multiselect(
+            "Affected product lines:",
+            ["Commercial Property", "Commercial Auto", "Personal Auto", "Homeowners", "Liability"],
+            default=["Commercial Property", "Commercial Auto"],
+            help="Product lines most directly impacted (for documentation).",
+        )
+
+    # Compute default params from preset + return period
+    _preset   = _CAT_PRESETS[_cat_type]
+    _rp_mult  = _RETURN_PERIOD_MULT[_return_period]
+    _bm, _bc, _bco = [12.5, 8.3, 5.7], [0.35, 0.28, 0.42], [0.40, 0.20, 0.30]
+    _def_means = [round(m * mu * _rp_mult, 1) for m, mu in zip(_bm, _preset["means_mult"])]
+    _def_cvs   = [round(c * cu, 2) for c, cu in zip(_bc, _preset["cv_mult"])]
+    _def_corrs = [min(c + _preset["corr_add"], 0.95) for c in _bco]
+
+    with st.expander("⚙️ Adjust scenario parameters", expanded=False):
+        _adj1, _adj2, _adj3 = st.columns(3)
+        with _adj1:
+            st.markdown("**Expected Annual Losses ($M)**")
+            _cat_mean_prop = st.number_input("Property", value=_def_means[0], min_value=0.1, max_value=2000.0, step=1.0, key="cat_mp")
+            _cat_mean_auto = st.number_input("Auto",     value=_def_means[1], min_value=0.1, max_value=2000.0, step=1.0, key="cat_ma")
+            _cat_mean_liab = st.number_input("Liability",value=_def_means[2], min_value=0.1, max_value=2000.0, step=1.0, key="cat_ml")
+        with _adj2:
+            st.markdown("**Coefficients of Variation**")
+            _cat_cv_prop = st.slider("Property CV", 0.05, 3.0, _def_cvs[0], 0.05, key="cat_cvp")
+            _cat_cv_auto = st.slider("Auto CV",     0.05, 3.0, _def_cvs[1], 0.05, key="cat_cva")
+            _cat_cv_liab = st.slider("Liability CV",0.05, 3.0, _def_cvs[2], 0.05, key="cat_cvl")
+        with _adj3:
+            st.markdown("**Inter-Line Correlations**")
+            _cat_corr_pa = st.slider("Property ↔ Auto",      0.0, 0.95, _def_corrs[0], 0.05, key="cat_cpa")
+            _cat_corr_pl = st.slider("Property ↔ Liability", 0.0, 0.95, _def_corrs[1], 0.05, key="cat_cpl")
+            _cat_corr_al = st.slider("Auto ↔ Liability",     0.0, 0.95, _def_corrs[2], 0.05, key="cat_cal")
+    _cat_n_scen = st.select_slider(
+        "Simulation paths:",
+        options=[5_000, 10_000, 25_000, 50_000],
+        value=25_000,
+        help="25,000 recommended for CAT scenarios — balances precision and response time.",
+        key="cat_nscen",
+    )
+
+    _user_tok5 = st.context.headers.get("X-Forwarded-Access-Token", "")
+    _cat_analyst = _email_from_token(_user_tok5) if _user_tok5 else ""
+    _cat_analyst_in = st.text_input("Analyst:", value=_cat_analyst, key="cat_analyst")
+    _cat_note_in    = st.text_area(
+        "Scenario rationale / assumptions:",
+        placeholder=f"Describe the {_cat_type} scenario, basis for severity assumptions, affected exposure...",
+        key="cat_note",
+    )
+
+    if st.button("🌪️ Run CAT Scenario", type="primary"):
+        _cat_scenario_params = {
+            "mean_property_M":  _cat_mean_prop,
+            "mean_auto_M":      _cat_mean_auto,
+            "mean_liability_M": _cat_mean_liab,
+            "cv_property":      _cat_cv_prop,
+            "cv_auto":          _cat_cv_auto,
+            "cv_liability":     _cat_cv_liab,
+            "corr_prop_auto":   _cat_corr_pa,
+            "corr_prop_liab":   _cat_corr_pl,
+            "corr_auto_liab":   _cat_corr_al,
+            "n_scenarios":      _cat_n_scen,
+            "copula_df":        4,
+        }
+        with st.spinner(f"Running {_cat_type} ({_return_period}) — {_cat_n_scen:,} scenarios..."):
+            _cat_result = call_monte_carlo_endpoint(_cat_scenario_params)
+
+        if _cat_result:
+            st.success(f"✅ {_cat_type} ({_return_period}) complete")
+
+            _b5 = _baseline_smry
+
+            def _cat_delta(sc_val, base_key):
+                bv = float(_b5.get(base_key, 0))
+                d  = sc_val - bv
+                return f"{'+' if d >= 0 else ''}${d:.1f}M"
+
+            _cr1, _cr2, _cr3, _cr4 = st.columns(4)
+            _cr1.metric("Expected Loss",     f"${_cat_result['expected_loss_M']:.1f}M",
+                        delta=_cat_delta(_cat_result['expected_loss_M'], 'expected_loss'))
+            _cr2.metric("VaR(99%)",          f"${_cat_result['var_99_M']:.1f}M",
+                        delta=_cat_delta(_cat_result['var_99_M'], 'var_99'))
+            _cr3.metric("VaR(99.5%) — SCR",  f"${_cat_result['var_995_M']:.1f}M",
+                        delta=_cat_delta(_cat_result['var_995_M'], 'var_995'))
+            _cr4.metric("CVaR(99%)",         f"${_cat_result['cvar_99_M']:.1f}M",
+                        delta=_cat_delta(_cat_result['cvar_99_M'], 'cvar_99'))
+
+            # Save annotation to Lakebase
+            _var_lift = ((_cat_result['var_995_M'] / max(float(_b5.get('var_995', 1)), 0.01)) - 1.0) * 100
+            _full_note = (
+                f"[{_cat_type} | {_return_period}] "
+                f"Regions: {', '.join(_affected_regions) if _affected_regions else 'N/A'} | "
+                f"Lines: {', '.join(_affected_lines) if _affected_lines else 'N/A'} | "
+                f"Prop ${_cat_mean_prop:.1f}M/CV={_cat_cv_prop:.2f}, "
+                f"Auto ${_cat_mean_auto:.1f}M/CV={_cat_cv_auto:.2f}, "
+                f"Liab ${_cat_mean_liab:.1f}M/CV={_cat_cv_liab:.2f} | "
+                f"VaR(99.5%)=${_cat_result['var_995_M']:.1f}M, CVaR=${_cat_result['cvar_99_M']:.1f}M"
+                + (f" | {_cat_note_in}" if _cat_note_in else "")
+            )
+            if save_scenario_annotation(
+                segment_id="CAT_SCENARIO",
+                note=_full_note,
+                analyst=_cat_analyst_in,
+                scenario_type=f"Catastrophe: {_cat_type}",
+                adjustment_pct=round(_var_lift, 1),
+                approval_status="Draft",
+            ):
+                st.caption("✓ Scenario saved to Lakebase audit log")
+        else:
+            st.warning(
+                "Monte Carlo endpoint not available. "
+                "Start it from Module 6 or wait for the setup job to complete."
+            )
+
+    # Recent CAT scenarios
+    st.divider()
+    st.markdown("### Recent CAT Scenario Audit Log (Lakebase)")
+    _cat_history = load_annotations("CAT_SCENARIO")
+    if not _cat_history.empty:
+        st.dataframe(_cat_history, use_container_width=True, hide_index=True)
+    else:
+        st.info("No catastrophe scenarios submitted yet. Use the form above to run one.")
