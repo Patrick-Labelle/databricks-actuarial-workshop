@@ -153,7 +153,7 @@ def execute_sql(statement: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_segments():
-    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.claims_time_series ORDER BY 1")
+    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.sarima_forecasts ORDER BY 1")
     if not df.empty:
         return df["segment_id"].tolist()
     return []
@@ -207,7 +207,7 @@ def load_segment_stats(segment_id: str):
             ROUND(STDDEV(claims_count), 1)      AS stddev_claims,
             MIN(claims_count)                   AS min_claims,
             MAX(claims_count)                   AS max_claims
-        FROM {CATALOG}.{SCHEMA}.claims_time_series
+        FROM {CATALOG}.{SCHEMA}.gold_claims_monthly
         WHERE segment_id = '{segment_id}'
     """)
 
