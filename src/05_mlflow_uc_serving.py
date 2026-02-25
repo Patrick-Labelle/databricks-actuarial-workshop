@@ -352,7 +352,17 @@ endpoint_config = {
             "model_version":          str(latest_version),
             "workload_size":          "Small",
             "scale_to_zero_enabled":  True,
-        }]
+        }],
+        "ai_gateway": {
+            "usage_tracking_config": {"enabled": True},
+            "inference_table_config": {
+                "catalog_name":      CATALOG,
+                "schema_name":       SCHEMA,
+                "table_name_prefix": "sarima_endpoint",
+                "enabled":           True,
+            },
+            "rate_limits": [{"calls": 60, "renewal_period": "minute"}],
+        },
     },
 }
 

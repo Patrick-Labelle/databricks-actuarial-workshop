@@ -1279,6 +1279,10 @@ with tab5:
         _all_var995 = [_b_var995] + _stress_df["var_995_M"].tolist()
         _all_cvar99 = [_b_cvar99] + _stress_df["cvar_99_M"].tolist()
         _bar_colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd"]
+        _bar_colors_muted = [
+            f"rgba({int(c[1:3],16)},{int(c[3:5],16)},{int(c[5:7],16)},0.5)"
+            for c in _bar_colors
+        ]
 
         _fig_stress = go.Figure()
         _fig_stress.add_trace(go.Bar(
@@ -1291,8 +1295,7 @@ with tab5:
         _fig_stress.add_trace(go.Bar(
             name="CVaR(99%)",
             x=_all_labels, y=_all_cvar99,
-            marker_color=[c.replace(")", ", 0.5)").replace("rgb", "rgba") if "rgb" in c
-                          else c + "80" for c in _bar_colors],
+            marker_color=_bar_colors_muted,
             text=[f"${v:.1f}M" for v in _all_cvar99], textposition="outside",
             hovertemplate="%{x}<br>CVaR(99%): $%{y:.1f}M<extra></extra>",
         ))
