@@ -401,7 +401,7 @@ def _ensure_annotations_table():
                 note            TEXT,
                 analyst         TEXT,
                 scenario_type   TEXT,
-                adjustment_pct  NUMERIC(5,1),
+                adjustment_pct  NUMERIC(10,2),
                 approval_status TEXT          DEFAULT 'Draft',
                 created_at      TIMESTAMP     DEFAULT NOW()
             )

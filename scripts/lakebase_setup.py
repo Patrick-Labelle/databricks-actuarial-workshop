@@ -263,7 +263,7 @@ def main() -> None:
             note            TEXT,
             analyst         TEXT,
             scenario_type   TEXT,
-            adjustment_pct  NUMERIC(5,1),
+            adjustment_pct  NUMERIC(10,2),
             approval_status TEXT          DEFAULT 'Draft',
             created_at      TIMESTAMP     DEFAULT NOW()
         )
@@ -271,10 +271,15 @@ def main() -> None:
     # Ensure new columns exist on pre-existing tables (no-op if already present).
     for col_ddl in [
         "ADD COLUMN IF NOT EXISTS scenario_type   TEXT",
-        "ADD COLUMN IF NOT EXISTS adjustment_pct  NUMERIC(5,1)",
+        "ADD COLUMN IF NOT EXISTS adjustment_pct  NUMERIC(10,2)",
         "ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'Draft'",
     ]:
         cur.execute(f"ALTER TABLE public.scenario_annotations {col_ddl}")
+    # Widen adjustment_pct if it was created with the old NUMERIC(5,1) type.
+    cur.execute("""
+        ALTER TABLE public.scenario_annotations
+            ALTER COLUMN adjustment_pct TYPE NUMERIC(10,2)
+    """)
     conn.commit()
     print("    [OK] Table 'public.scenario_annotations' ensured.")
 
