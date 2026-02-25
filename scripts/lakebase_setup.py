@@ -221,16 +221,32 @@ def main() -> None:
 
     if args.app_sp_client_id:
         # Create the Postgres role only if it doesn't already exist.
-        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (args.app_sp_client_id,))
-        if cur.fetchone():
-            print(f"    [OK] Postgres role already exists for SP: {args.app_sp_client_id}")
-        else:
-            cur.execute(
-                "SELECT databricks_create_role(%s, %s)",
-                (args.app_sp_client_id, "service_principal"),
-            )
-            conn.commit()
-            print(f"    [OK] Postgres role created for SP: {args.app_sp_client_id}")
+        # databricks_create_role() calls the workspace API internally and can hit
+        # rate limits, raising psycopg2.errors.InternalError_ (not OperationalError).
+        # Retry with exponential backoff; rollback the aborted transaction before each retry.
+        for _attempt in range(4):
+            try:
+                cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (args.app_sp_client_id,))
+                if cur.fetchone():
+                    print(f"    [OK] Postgres role already exists for SP: {args.app_sp_client_id}")
+                    break
+                cur.execute(
+                    "SELECT databricks_create_role(%s, %s)",
+                    (args.app_sp_client_id, "service_principal"),
+                )
+                conn.commit()
+                print(f"    [OK] Postgres role created for SP: {args.app_sp_client_id}")
+                break
+            except Exception as exc:
+                _msg = str(exc).lower()
+                if "rate limit" in _msg and _attempt < 3:
+                    conn.rollback()
+                    _delay = 30.0 * (2 ** _attempt)   # 30s, 60s, 120s
+                    print(f"    [RETRY] Workspace API rate limit — waiting {_delay:.0f}s "
+                          f"(attempt {_attempt + 1}/4)")
+                    time.sleep(_delay)
+                else:
+                    raise
 
         # Grant CONNECT now that the role exists (GRANT is idempotent).
         cur.execute(
