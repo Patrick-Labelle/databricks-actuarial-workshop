@@ -3,9 +3,9 @@
 # MAGIC # Macro Data Fetch — Statistics Canada
 # MAGIC
 # MAGIC Fetches three Statistics Canada time series and appends them to `macro_indicators_raw`:
-# MAGIC - **14-10-0090-01**: Labour force characteristics by province (unemployment rate, monthly)
+# MAGIC - **14-10-0017-01**: Labour force characteristics by province (unemployment rate, monthly)
 # MAGIC - **18-10-0205-01**: New housing price index by province (monthly)
-# MAGIC - **34-10-0035-01**: Housing starts by province (monthly)
+# MAGIC - **34-10-0158-01**: Housing starts by province (monthly)
 # MAGIC
 # MAGIC **Pattern:** Each run appends with a unique `batch_id`. The SCD Type 2 silver layer
 # MAGIC (`silver_macro_indicators`) captures any value revisions StatCan publishes to prior months.
@@ -36,24 +36,28 @@ from pyspark.sql.types import (
 # COMMAND ----------
 
 # ── StatCan CSV download API ──────────────────────────────────────────────────
-# Returns a ZIP file containing the full table CSV. No authentication required.
-STATCAN_BASE = "https://www150.statcan.gc.ca/t1/tbl1/en/dtbl!downloadTbl/csvDownload"
+# Full-table bulk CSV download (no authentication required).
+# URL format: https://www150.statcan.gc.ca/n1/tbl/csv/{pid}-eng.zip
+# The PID is the table ID with dashes removed and the trailing edition group (-01) dropped.
+STATCAN_BASE = "https://www150.statcan.gc.ca/n1/tbl/csv"
 
 # Three tables to fetch. `filters` are applied in order — each is a (column, value) pair.
 # StatCan CSV columns vary per table; unknown filter columns are skipped with a warning.
 STATCAN_TABLES = {
-    "1410009001": {
-        "source_table":   "14-10-0090-01",
+    # Table 14-10-0017-01: Labour force characteristics by province, monthly.
+    # Monthly YYYY-MM REF_DATE; includes Gender, Age group, and Labour force characteristics columns.
+    "14100017": {
+        "source_table":   "14-10-0017-01",
         "indicator_name": "unemployment_rate",
         "unit_keyword":   "Percent",
         "filters": [
-            # Main breakdown for provincial monthly unemployment rate
             ("Labour force characteristics", "Unemployment rate"),
-            ("Sex",       "Both sexes"),
+            ("Gender",    "Total - Gender"),   # column is "Gender" not "Sex" in this table
             ("Age group", "15 years and over"),
         ],
     },
-    "1810020501": {
+    # Table 18-10-0205-01: New housing price index (total, house + land) by province, monthly.
+    "18100205": {
         "source_table":   "18-10-0205-01",
         "indicator_name": "hpi_index",
         "unit_keyword":   "Index",
@@ -61,13 +65,13 @@ STATCAN_TABLES = {
             ("New housing price indexes", "Total (house and land)"),
         ],
     },
-    "3410003501": {
-        "source_table":   "34-10-0035-01",
+    # Table 34-10-0158-01: Housing starts by province, monthly (CMHC survey).
+    # Single row per GEO × REF_DATE — no extra filter columns.
+    "34100158": {
+        "source_table":   "34-10-0158-01",
         "indicator_name": "housing_starts",
         "unit_keyword":   "Units",
-        "filters": [
-            ("Type of unit", "Total units"),
-        ],
+        "filters": [],   # no further breakdown; each province has one row per month
     },
 }
 
@@ -89,7 +93,7 @@ PROVINCE_MAP = {
 
 def fetch_statcan_csv(pid_nodashes: str) -> pd.DataFrame:
     """Download a StatCan table ZIP and return the data CSV as a DataFrame."""
-    url = f"{STATCAN_BASE}/{pid_nodashes}"
+    url = f"{STATCAN_BASE}/{pid_nodashes}-eng.zip"
     print(f"  Fetching {url} ...")
     resp = requests.get(url, timeout=180)
     resp.raise_for_status()
