@@ -57,7 +57,7 @@ print(f"SARIMA endpoint:    {ENDPOINT_NAME}")
 print(f"MC endpoint:        {MC_ENDPOINT_NAME}")
 print(f"App SP client ID:   {APP_SP_CLIENT_ID or '(not provided)'}")
 print(f"Running as:         {CURRENT_USER}")
-print(f"Token:              {'present' if TOKEN else 'MISSING'} ({len(TOKEN)} chars)")
+print(f"Token:              {'present' if TOKEN else 'MISSING'}")
 
 # COMMAND ----------
 

@@ -655,44 +655,21 @@ else:
 
 # COMMAND ----------
 
-# ── GPU diagnostic check ───────────────────────────────────────────────────────
-# Run a @ray.remote(num_gpus=1) probe task before the simulation to confirm
-# that Ray workers actually see a GPU.  This catches two silent failure modes:
-#   1. torch.cuda.is_available() = False on workers despite being a GPU cluster
-#      (e.g. CUDA_VISIBLE_DEVICES="", driver issue, or wrong DBR image)
-#   2. nvidia-smi unreachable (containerisation / PATH issue)
-# The task also runs a small matmul stress-test to verify CUDA execution works
-# end-to-end, not just that the driver is reachable.
+# ── GPU pre-flight check ───────────────────────────────────────────────────────
 if RAY_AVAILABLE:
     @ray.remote(num_gpus=1)
     def _check_gpu_worker():
-        import torch, subprocess
+        import torch
         result = {'torch_version': torch.__version__, 'cuda_available': torch.cuda.is_available()}
-        print(f"[check_gpu] torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
         if torch.cuda.is_available():
-            result['device_count'] = torch.cuda.device_count()
-            result['device_name']  = torch.cuda.get_device_name(0)
-            print(f"[check_gpu] devices={torch.cuda.device_count()} name={torch.cuda.get_device_name(0)}")
-            # Quick matmul smoke-test to confirm CUDA execution end-to-end
+            result['device_name'] = torch.cuda.get_device_name(0)
             _a = torch.randn(1000, 1000, device='cuda', dtype=torch.float32)
-            _b = (_a @ _a.T).sum().item()
+            (_a @ _a.T).sum().item()
             torch.cuda.synchronize()
-            print(f"[check_gpu] matmul smoke-test passed (sum={_b:.2f})")
-            result['matmul_ok'] = True
-        try:
-            nvsmi = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=10,
-            )
-            result['nvidia_smi'] = nvsmi.stdout.strip()
-            print(f"[check_gpu] nvidia-smi: {nvsmi.stdout.strip()}")
-        except Exception as _e:
-            result['nvidia_smi_error'] = str(_e)
+            result['cuda_ok'] = True
         return result
 
-    print("==> Running GPU diagnostic on a Ray worker...")
     _gpu_diag = ray.get(_check_gpu_worker.remote())
-    print(f"GPU diagnostic result: {_gpu_diag}")
     if not _gpu_diag.get('cuda_available', False):
         print("WARNING: Ray workers report CUDA not available — Monte Carlo will use CPU fallback.")
     else:
@@ -851,9 +828,6 @@ def get_cholesky():
 CHOL = get_cholesky()
 
 # ── Monte Carlo constants (module-level so Ray workers compute once per process) ─
-# Importing here avoids repeated import overhead inside the @ray.remote function.
-import scipy.special as _scipy_sp
-
 _MC_COPULA_DF  = 4
 _MC_MEANS      = np.array(PORTFOLIO["means"],      dtype=np.float32)
 _MC_CV         = np.array(PORTFOLIO["cv"],         dtype=np.float32)
@@ -934,16 +908,13 @@ if RAY_AVAILABLE:
                           Poisson(λ=0.05) jump process for discrete CAT hits.
         'inflation_shock' Sustained 30 % loss-cost inflation with +15 % CV uncertainty.
 
-        Steps (GPU hybrid path):
+        Steps (all GPU — no CPU transfers):
           1. Draw correlated standard normals Z ~ N(0, R) using Cholesky(R).   [GPU]
           2. Draw chi2 W ~ chi2(df)/df (mixing variable for t-distribution).   [GPU]
           3. T = Z / sqrt(W) gives multivariate t(df) with correlation R.      [GPU]
-          4. Apply t-CDF via scipy.special.betainc to get uniform marginals.   [CPU]
-             torch.special.betainc is absent from PyTorch's stable public API
-             (AttributeError in PyTorch 2.7 on DBR 17.3). scipy.betainc is fast
-             (vectorized C); we convert to numpy for this step then move back.
+          4. Apply t-CDF via torch.distributions.StudentT.cdf() (CUDA kernel). [GPU]
           5. Apply lognormal inverse CDF via erfinv: Phi^-1(u) = sqrt(2)*erfinv(2u-1)
-             torch.special.erfinv is CUDA-accelerated; compute back on GPU.   [GPU]
+             torch.special.erfinv is CUDA-accelerated.                         [GPU]
           6. (cat_event only) Poisson jump shocks on GPU for discrete CAT events.
 
         GPU path uses PyTorch (pre-installed on DBR GPU ML) for all array ops.
@@ -992,7 +963,7 @@ if RAY_AVAILABLE:
         _mu_override  = None if (means_override is None and np.all(_sc_means_mult == 1.0)) else _eff_mu_ln
         _sig_override = None if np.all(_sc_cv_mult == 1.0) else _eff_sig_ln
 
-        # ── GPU path via PyTorch (hybrid: sampling on GPU, betainc on CPU) ──────
+        # ── GPU path via PyTorch (100% GPU — no CPU transfers) ───────────────────
         # torch.device('cuda') lets CUDA_VISIBLE_DEVICES pick the right GPU index
         # (safer than hardcoding 'cuda:0' in multi-GPU or containerised setups).
         try:
@@ -1001,14 +972,6 @@ if RAY_AVAILABLE:
 
             device = torch.device('cuda')   # let CUDA_VISIBLE_DEVICES pick index
             dtype  = torch.float32          # fp32 maximises T4 throughput
-
-            # Quick matmul smoke-test to confirm CUDA execution works end-to-end
-            # before running the full simulation (avoids silent hang on first op).
-            _s = torch.randn(64, 64, dtype=dtype, device=device)
-            _s = (_s @ _s.T).sum().item()
-            torch.cuda.synchronize()
-            if seed == 42:
-                print(f"[Ray seed=42] GPU smoke-test ok ({torch.cuda.get_device_name(0)}, sum={_s:.1f})")
 
             # Retrieve precomputed tensors; scenario-specific sig/corr variants are
             # cached on first use per worker process.
@@ -1028,21 +991,16 @@ if RAY_AVAILABLE:
             # Step 3: t-distributed with correlation structure
             t_cor = x_cor / (chi2.unsqueeze(1) / _MC_COPULA_DF).sqrt()  # (n, 3)
 
-            # Step 4: t-CDF via scipy.special.betainc on CPU.
-            # torch.special.betainc is not in PyTorch's stable public API (absent in
-            # PyTorch 2.7.0+cu126 on DBR 17.3 — raises AttributeError).
-            # scipy.betainc is vectorized C — fast even for 100k×3; not the bottleneck.
-            t_cor_np   = t_cor.cpu().numpy()                         # (n, 3) float32
-            x_beta_np  = (_MC_COPULA_DF / (_MC_COPULA_DF + t_cor_np ** 2)).clip(0.0, 1.0)
-            ibeta_np   = _scipy_sp.betainc(_MC_COPULA_DF / 2.0, 0.5, x_beta_np).astype(np.float32)
-            u_np       = np.where(t_cor_np <= 0, ibeta_np / 2.0, 1.0 - ibeta_np / 2.0)
-            u_cpu      = torch.from_numpy(u_np)
+            # Step 4: t-CDF via torch.distributions.StudentT (100% CUDA-native).
+            # torch.distributions.StudentT.cdf() is a CUDA kernel — no CPU transfer.
+            # This replaces the former scipy.special.betainc hybrid path.
+            _t_dist = torch.distributions.StudentT(
+                df=torch.tensor(float(_MC_COPULA_DF), dtype=dtype, device=device)
+            )
+            u_clip = _t_dist.cdf(t_cor).clamp(1e-6, 1 - 1e-6)        # (n, 3) on GPU
 
-            # Step 5: lognormal marginals via inverse normal CDF (back on GPU)
+            # Step 5: lognormal marginals via inverse normal CDF (all on GPU)
             # Phi^-1(u) = sqrt(2) * erfinv(2u - 1)
-            # torch.special.erfinv is CUDA-accelerated (unlike betainc).
-            u      = u_cpu.to(device)
-            u_clip = u.clamp(1e-6, 1 - 1e-6)
             q      = torch.special.erfinv(2.0 * u_clip - 1.0).mul(2.0 ** 0.5)
             losses = torch.exp(mu_t + sig_t * q)                       # (n, 3)
 

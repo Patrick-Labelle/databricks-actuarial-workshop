@@ -172,14 +172,10 @@ except Exception as e:
 # COMMAND ----------
 
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-# Flat paths used since run 4 fix (nested paths fail on fresh workspaces)
 EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster"
 EXPERIMENT_NAME_4 = f"/Users/{_current_user}/actuarial_workshop_claims_sarima"
-# Also handle old nested paths (in case workspace was seeded before the fix)
-EXPERIMENT_NAME_OLD   = f"/Users/{_current_user}/actuarial-workshop/champion-model"
-EXPERIMENT_NAME_4_OLD = f"/Users/{_current_user}/actuarial-workshop/sarima-per-segment"
 
-for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_OLD, EXPERIMENT_NAME_4, EXPERIMENT_NAME_4_OLD]:
+for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_4]:
     try:
         experiment = mlflow.get_experiment_by_name(exp_name)
         if experiment:

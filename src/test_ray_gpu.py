@@ -80,11 +80,10 @@ else:
 
 # COMMAND ----------
 
-# ── Monte Carlo task (hybrid: sampling on GPU, betainc on CPU) ────────────────
+# ── Monte Carlo task (100% GPU — torch.distributions.StudentT.cdf) ───────────
 # Module-level constants and imports: computed/imported once per worker process.
 import numpy as np
 import torch
-import scipy.special as _scipy_sp
 
 _MC_COPULA_DF = 4
 _MC_CV        = np.array([0.35, 0.28, 0.42], dtype=np.float32)
@@ -121,13 +120,6 @@ def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
         device = torch.device('cuda')
         dtype  = torch.float32
 
-        # Matmul smoke-test
-        _s = torch.randn(64, 64, dtype=dtype, device=device)
-        _s = (_s @ _s.T).sum().item()
-        torch.cuda.synchronize()
-        if seed == 42:
-            print(f"[Ray seed=42] GPU smoke-test ok ({torch.cuda.get_device_name(0)}, sum={_s:.1f})")
-
         # Retrieve cached tensors (Cholesky computed only on first call per worker)
         mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype)
 
@@ -138,22 +130,17 @@ def simulate_portfolio_losses(n_scenarios: int, seed: int) -> dict:
         x_cor = z @ chol_t.T
         t_cor = x_cor / (chi2.unsqueeze(1) / _MC_COPULA_DF).sqrt()
 
-        # Step 4: t-CDF via scipy.special.betainc on CPU.
-        # torch.special.betainc is not in PyTorch's stable public API (absent in 2.7).
-        # scipy.betainc is fast (vectorized C), and n×3 is tiny vs. the GPU sampling above.
-        t_cor_np   = t_cor.cpu().numpy()
-        x_beta_np  = (_MC_COPULA_DF / (_MC_COPULA_DF + t_cor_np ** 2)).clip(0.0, 1.0)
-        ibeta_np   = _scipy_sp.betainc(_MC_COPULA_DF / 2.0, 0.5, x_beta_np).astype(np.float32)
-        u_np       = np.where(t_cor_np <= 0, ibeta_np / 2.0, 1.0 - ibeta_np / 2.0)
-        u_cpu      = torch.from_numpy(u_np)
+        # Step 4: t-CDF via torch.distributions.StudentT (100% CUDA-native).
+        _t_dist = torch.distributions.StudentT(
+            df=torch.tensor(float(_MC_COPULA_DF), dtype=dtype, device=device)
+        )
+        u_clip = _t_dist.cdf(t_cor).clamp(1e-6, 1 - 1e-6)
 
-        # erfinv + lognormal back on GPU
-        u      = u_cpu.to(device)
-        u_clip = u.clamp(1e-6, 1 - 1e-6)
+        # Step 5: erfinv + lognormal (all on GPU)
         q      = torch.special.erfinv(2.0 * u_clip - 1.0).mul(2.0 ** 0.5)
         losses = torch.exp(mu_t + sig_t * q)
         total  = losses.sum(dim=1).cpu().numpy().astype(np.float64)
-        backend = 'torch-gpu-hybrid'
+        backend = 'torch-gpu'
 
     except Exception as e_gpu:
         _gpu_error = f"{type(e_gpu).__name__}: {e_gpu}"
