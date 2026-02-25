@@ -182,18 +182,16 @@ fi
 # ── Step 4: run setup job ─────────────────────────────────────────────────────
 # This provisions all data assets and — critically — grants the app's service
 # principal permissions on UC catalog/schema/tables, the Lakebase PostgreSQL
-# database, and the model-serving endpoint. The app must not be deployed until
-# this completes, otherwise it starts with missing permissions.
+# database, and the model-serving endpoints.
 #
-# Note: `databricks bundle run` streams job output and can fail with
-# "Invalid Token" if the OAuth token expires during a long job (>60 min).
-# The job itself continues running on Databricks; we detect this case and
-# poll directly with `jobs get-run` until the job reaches a terminal state.
+# Deploy strategy: the app source code is deployed as soon as the model serving
+# endpoints are ready (tasks register_and_serve_model + register_monte_carlo_endpoint
+# both succeed), rather than waiting for the full job to finish.  The final task
+# (setup_app_dependencies, ~21s) grants UC and CAN_QUERY permissions; by the time
+# the app compute starts, those grants are in place.
 echo "==> Running setup job (this takes ~15 min)..."
 
-# Extract the setup job ID from the deployed bundle state for polling fallback.
-# (The job ID is only assigned after bundle deploy, so we query it from the API
-# using --name filter — much faster than listing all jobs.)
+# Resolve the setup job ID (needed for async polling and fallback).
 SETUP_JOB_ID=$(databricks jobs list \
     --name "Actuarial Workshop — Full Setup" \
     --output json \
@@ -206,27 +204,118 @@ if jobs:
     print(jobs[0].get('job_id', ''))
 " 2>/dev/null || echo "")
 
+# ── 4a: Launch the job and capture the run ID ─────────────────────────────────
 _BUNDLE_RUN_OK=true
-databricks bundle run actuarial_workshop_setup "${BUNDLE_ARGS[@]}" || _BUNDLE_RUN_OK=false
+databricks bundle run actuarial_workshop_setup "${BUNDLE_ARGS[@]}" &
+_BUNDLE_RUN_PID=$!
 
-if [ "$_BUNDLE_RUN_OK" = "false" ]; then
-    echo "WARNING: 'bundle run' exited with an error (possibly OAuth token expiry mid-stream)."
-    echo "         Checking whether the setup job actually completed successfully..."
+# Resolve the latest run ID shortly after launch (give it a few seconds to register).
+sleep 10
+SETUP_RUN_ID=""
+if [ -n "$SETUP_JOB_ID" ]; then
+    SETUP_RUN_ID=$(databricks api get \
+        "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
+        "${PROFILE_ARGS[@]}" 2>/dev/null \
+        | python3 -c "
+import sys, json
+lines = sys.stdin.read().split('\n')
+j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
+if j is not None:
+    runs = json.loads('\n'.join(lines[j:])).get('runs', [])
+    if runs:
+        print(runs[0].get('run_id', ''))
+" 2>/dev/null || echo "")
+fi
+echo "    Run ID: ${SETUP_RUN_ID:-unknown}"
 
-    if [ -z "$SETUP_JOB_ID" ]; then
-        echo "ERROR: Could not determine setup job ID — cannot verify job outcome." >&2
-        exit 1
+# ── 4b: Poll task states; deploy app once endpoints are ready ─────────────────
+_APP_DEPLOYED=false
+_POLL_MAX=180   # max 180 × 20s = 1 hour
+_POLL_COUNT=0
+_FINAL_RESULT=""
+
+while [ $_POLL_COUNT -lt $_POLL_MAX ]; do
+    sleep 20
+
+    # Fetch the current task states for this run
+    if [ -z "$SETUP_RUN_ID" ]; then
+        # Fall back to checking the most recent run
+        _RUN_DATA=$(databricks api get \
+            "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
+            "${PROFILE_ARGS[@]}" 2>/dev/null)
+        SETUP_RUN_ID=$(echo "$_RUN_DATA" | python3 -c "
+import sys, json
+lines = sys.stdin.read().split('\n')
+j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
+if j is not None:
+    runs = json.loads('\n'.join(lines[j:])).get('runs', [])
+    if runs: print(runs[0].get('run_id', ''))
+" 2>/dev/null || echo "")
     fi
 
-    # Poll the most recent run until it reaches a terminal state.
-    _POLL_MAX=120   # max 120 × 60s = 2 hours
-    _POLL_COUNT=0
-    _FINAL_RESULT=""
-    while [ $_POLL_COUNT -lt $_POLL_MAX ]; do
-        _RUN_STATE=$(databricks api get \
-            "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
-            "${PROFILE_ARGS[@]}" 2>/dev/null \
-            | python3 -c "
+    _TASK_STATES=$(databricks api get \
+        "/api/2.1/jobs/runs/get?run_id=${SETUP_RUN_ID}" \
+        "${PROFILE_ARGS[@]}" 2>/dev/null \
+        | python3 -c "
+import sys, json
+lines = sys.stdin.read().split('\n')
+j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
+if j is None: sys.exit()
+data = json.loads('\n'.join(lines[j:]))
+run_state = data.get('state', {})
+lc = run_state.get('life_cycle_state','')
+rs = run_state.get('result_state','')
+print(f'RUN {lc} {rs}')
+for t in data.get('tasks', []):
+    s = t.get('state', {})
+    print(t['task_key'], s.get('life_cycle_state','PENDING'), s.get('result_state',''))
+" 2>/dev/null || echo "RUN UNKNOWN ")
+
+    # Parse overall run state
+    _RUN_LC=$(echo "$_TASK_STATES" | awk 'NR==1{print $2}')
+    _RUN_RS=$(echo "$_TASK_STATES" | awk 'NR==1{print $3}')
+
+    # Check if the run reached a terminal state
+    if [ "$_RUN_LC" = "TERMINATED" ] || [ "$_RUN_LC" = "INTERNAL_ERROR" ]; then
+        _FINAL_RESULT="$_RUN_RS"
+        break
+    fi
+
+    # Check endpoint tasks: deploy app once both serving endpoint tasks succeed
+    if [ "$_APP_DEPLOYED" = "false" ] && [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
+        _SERVE_SARIMA=$(echo "$_TASK_STATES" | awk '$1=="register_and_serve_model"{print $2, $3}')
+        _SERVE_MC=$(echo "$_TASK_STATES"    | awk '$1=="register_monte_carlo_endpoint"{print $2, $3}')
+        _SARIMA_DONE=$(echo "$_SERVE_SARIMA" | grep -c "TERMINATED SUCCESS" || true)
+        _MC_DONE=$(echo "$_SERVE_MC"         | grep -c "TERMINATED SUCCESS" || true)
+
+        if [ "$_SARIMA_DONE" -ge 1 ] && [ "$_MC_DONE" -ge 1 ]; then
+            echo ""
+            echo "==> Model serving endpoints ready — deploying app source code..."
+            echo "    (setup_app_dependencies will finish granting permissions in ~21s)"
+            databricks apps deploy "${APP_NAME}" \
+                --source-code-path "${APP_SOURCE_PATH}" \
+                "${PROFILE_ARGS[@]}" && _APP_DEPLOYED=true || true
+            echo "==> App source deployed — waiting for permission grants to complete..."
+        fi
+    fi
+
+    # Progress indicator
+    _RUNNING=$(echo "$_TASK_STATES" | awk '$2=="RUNNING"{print $1}' | tr '\n' ' ')
+    _DONE=$(echo "$_TASK_STATES" | grep -c "TERMINATED SUCCESS" || true)
+    echo "    [${_DONE}/8 tasks done] running: ${_RUNNING:-none} (poll ${_POLL_COUNT}/${_POLL_MAX})"
+    _POLL_COUNT=$((_POLL_COUNT + 1))
+done
+
+# Wait for the background bundle run process to exit cleanly
+wait $_BUNDLE_RUN_PID 2>/dev/null || _BUNDLE_RUN_OK=false
+
+if [ -z "$_FINAL_RESULT" ]; then
+    # Polling loop hit max without a terminal state
+    echo "WARNING: Polling timed out — checking final job state..."
+    _FINAL_RESULT=$(databricks api get \
+        "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
+        "${PROFILE_ARGS[@]}" 2>/dev/null \
+        | python3 -c "
 import sys, json
 lines = sys.stdin.read().split('\n')
 j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
@@ -234,38 +323,27 @@ if j is not None:
     runs = json.loads('\n'.join(lines[j:])).get('runs', [])
     if runs:
         s = runs[0].get('state', {})
-        print(s.get('life_cycle_state',''), s.get('result_state',''))
-" 2>/dev/null || echo "UNKNOWN ")
-        _LC=$(echo "$_RUN_STATE" | awk '{print $1}')
-        _RS=$(echo "$_RUN_STATE" | awk '{print $2}')
-        if [ "$_LC" = "TERMINATED" ] || [ "$_LC" = "INTERNAL_ERROR" ]; then
-            _FINAL_RESULT="$_RS"
-            break
-        fi
-        echo "    Job still running (${_LC}) — waiting 60s... (poll ${_POLL_COUNT}/${_POLL_MAX})"
-        sleep 60
-        _POLL_COUNT=$((_POLL_COUNT + 1))
-    done
-
-    if [ "$_FINAL_RESULT" = "SUCCESS" ]; then
-        echo "    Job completed successfully despite bundle run auth error. Continuing to app deploy."
-    else
-        echo "ERROR: Setup job did not complete successfully (result=${_FINAL_RESULT:-TIMEOUT})." >&2
-        exit 1
-    fi
+        print(s.get('result_state',''))
+" 2>/dev/null || echo "")
 fi
 
-# ── Step 5: deploy app ────────────────────────────────────────────────────────
-# All permissions are now in place. Deploy the app source code so it starts
-# with a clean slate against the fully-provisioned, permissioned environment.
-if [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
-    echo "==> Deploying app source code..."
+if [ "$_FINAL_RESULT" != "SUCCESS" ]; then
+    echo "ERROR: Setup job did not complete successfully (result=${_FINAL_RESULT:-UNKNOWN})." >&2
+    exit 1
+fi
+echo "==> Setup job complete!"
+
+# ── Step 5: deploy app (if not already deployed during step 4) ────────────────
+if [ "$_APP_DEPLOYED" = "false" ] && [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
+    echo "==> Deploying app source code (post-job — all permissions in place)..."
     echo "    App:    ${APP_NAME}"
     echo "    Source: ${APP_SOURCE_PATH}"
     databricks apps deploy "${APP_NAME}" \
         --source-code-path "${APP_SOURCE_PATH}" \
         "${PROFILE_ARGS[@]}"
     echo "==> App deployment complete!"
+elif [ "$_APP_DEPLOYED" = "true" ]; then
+    echo "==> App was deployed during job run (endpoints were ready). All permissions now in place."
 else
     echo "==> No app found in bundle, skipping app deployment."
 fi
