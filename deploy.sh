@@ -151,6 +151,38 @@ LAKEBASE_ENDPOINT_PATH = '${LAKEBASE_ENDPOINT_PATH}'
 LAKEBASE_HOST = '${LAKEBASE_HOST}'
 EOF
     echo "    LAKEBASE_HOST=${LAKEBASE_HOST}"
+
+    # Push the updated _bundle_config.py to the workspace bundle path so that
+    # `databricks apps deploy` (step 5) picks up the correct LAKEBASE_HOST.
+    # bundle deploy (step 2) synced the placeholder version (LAKEBASE_HOST='');
+    # we need to overwrite it before the app deploy reads from that workspace path.
+    # Uses the workspace import REST API — the CLI's `workspace import --format SOURCE`
+    # has a known issue with single-file overwrite on Python source files.
+    if [ -n "$APP_SOURCE_PATH" ] && [ -n "$WORKSPACE_HOST" ]; then
+        _UPLOAD_TOKEN=$(databricks auth token --host "$WORKSPACE_HOST" "${PROFILE_ARGS[@]}" 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+        _UPL_HOST="$WORKSPACE_HOST" \
+        _UPL_TOKEN="$_UPLOAD_TOKEN" \
+        _UPL_SRC="${SCRIPT_DIR}/app/_bundle_config.py" \
+        _UPL_DST="${APP_SOURCE_PATH}/_bundle_config.py" \
+        python3 -c "
+import base64, json, os, urllib.request, urllib.error
+req = urllib.request.Request(
+    os.environ['_UPL_HOST'] + '/api/2.0/workspace/import',
+    data=json.dumps({'path': os.environ['_UPL_DST'],
+                     'content': base64.b64encode(open(os.environ['_UPL_SRC'],'rb').read()).decode(),
+                     'format': 'AUTO', 'overwrite': True}).encode(),
+    headers={'Authorization': 'Bearer ' + os.environ['_UPL_TOKEN'],
+             'Content-Type': 'application/json'},
+    method='POST',
+)
+try:
+    urllib.request.urlopen(req)
+    print('    _bundle_config.py synced to workspace (LAKEBASE_HOST set)')
+except urllib.error.HTTPError as e:
+    print('WARNING: Could not sync _bundle_config.py (' + str(e.code) + ') — LAKEBASE_HOST may be empty at runtime')
+"
+    fi
 else
     echo "WARNING: psycopg2-binary not installed — skipping Lakebase setup."
     echo "         Install with: pip install psycopg2-binary"

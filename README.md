@@ -133,10 +133,12 @@ dispatched simultaneously in a single Ray batch (~640M total paths):
    - `inflation_shock`: +30% loss-cost inflation across all lines, +15% CV uncertainty
 
 - **t-Copula (df=4)** captures tail dependence between Property, Auto, and Liability lines
-- **Hybrid path:** correlated sampling, chi² mixing, and lognormal inverse CDF on GPU (torch);
-  t-CDF (`betainc`) on CPU via scipy (absent from PyTorch's stable API in 2.7.x)
+- **100% GPU path:** `torch.distributions.StudentT.cdf()` (CUDA-native kernel, PyTorch 2.7+)
+  replaces `scipy.special.betainc` — all computation stays on GPU with zero CPU-GPU transfers
 - Ray workers use `num_gpus=0.25` + `num_cpus=0.5` fractional allocation: **4 concurrent tasks
   per T4 = full GPU utilization**; 64 total tasks complete in ~90 seconds for 640M total paths
+- Cluster: **CPU-only driver** (`m5.xlarge`) + 1 × `g4dn.xlarge` GPU worker — Ray compute runs
+  entirely on the worker; the driver only coordinates task dispatch
 - Regional claims breakdown written to `regional_claims_forecast` (SARIMA aggregated by region × month)
 
 ### Ray CPU Reservation
@@ -249,6 +251,8 @@ After running `./deploy.sh`, the following resources will be created:
 | Monte Carlo results | `{catalog}.{schema}.monte_carlo_results` (40M baseline paths) |
 | VaR timeline | `{catalog}.{schema}.portfolio_risk_timeline` (12-month SARIMA-driven) |
 | Stress scenarios | `{catalog}.{schema}.stress_test_scenarios` (CAT, systemic risk, inflation) |
+| Regional forecast | `{catalog}.{schema}.regional_claims_forecast` (SARIMA aggregated by region × month) |
+| Monte Carlo endpoint | `actuarial-workshop-monte-carlo` (AI Gateway enabled: usage tracking, inference table, rate limits) |
 
 ---
 
