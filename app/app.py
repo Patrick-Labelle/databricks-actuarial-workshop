@@ -27,7 +27,7 @@ def _get_psycopg2():
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Actuarial Risk Dashboard",
+    page_title="Insurance Portfolio Risk Intelligence",
     page_icon="📊",
     layout="wide",
 )
@@ -531,38 +531,32 @@ def load_annotations(segment_id: str):
 # ─── Sidebar: Data & Model Reference ─────────────────────────────────────────
 
 with st.sidebar:
-    st.header("About This Dashboard")
+    st.header("About")
 
-    st.markdown("**Source Data**")
+    st.markdown("**Portfolio Data**")
     st.markdown("""
-Synthetic insurance claims time series across **52 segments**
-(product line × Canadian province/territory):
+Insurance claims across **40 segments** (product line × Canadian province):
 
-| Dimension | Values |
+| | |
 |---|---|
-| Product lines | Commercial Auto, Commercial Property, Personal Auto, Homeowners |
-| Provinces/Territories | Ontario, Quebec, BC, Alberta, Atlantic, Manitoba, Saskatchewan, Nova Scotia, New Brunswick, Newfoundland, PEI, NWT, Yukon |
-| History | Jan 2019 – Dec 2024 |
-| Granularity | Monthly claims counts |
-| Observations | 72 months × 52 segments = 3,744 rows |
-
-Each row records the monthly **claims count** for one segment.
-Rolling features (3/6/12-month means and volatility) are
-pre-computed in the Feature Store for model training.
+| **Product lines** | Personal Auto, Commercial Auto, Homeowners, Commercial Property |
+| **Provinces** | All 10 Canadian provinces |
+| **Period** | Jan 2019 – Dec 2024 (72 months) |
+| **Macro data** | StatCan unemployment, housing price index, housing starts |
 """)
 
     st.divider()
-    st.markdown("**Models**")
+    st.markdown("**What the models do**")
     st.markdown("""
-| Model | What it does |
+| Model | Business purpose |
 |---|---|
-| **SARIMA** | Seasonal ARIMA fitted independently per segment. Captures trend, seasonality, and autocorrelation in monthly claim counts. Served via REST endpoint (On-Demand Forecast tab). |
-| **GARCH(1,1)** | Models time-varying volatility in loss ratios. Useful for risk capital estimation when variance is not constant. |
-| **Monte Carlo** | **640M paths** (64 Ray tasks × 10M each) on NVIDIA T4 GPU: baseline + 12-month SARIMA-driven VaR evolution + 3 stress scenarios (CAT event, systemic risk, inflation shock). t-Copula (df=4) + lognormal marginals + Poisson jump shocks for CAT. See **Catastrophe Scenarios** tab. |
+| **Claims Forecasting** | Projects monthly claim volumes per segment — used in the Claims Forecast and Quick Forecast tabs |
+| **Volatility Model** | Estimates how unpredictable loss ratios are month-to-month — feeds into capital calculations |
+| **Monte Carlo Simulation** | Runs millions of loss scenarios to compute capital requirements (Expected Loss, SCR, Tail Risk) — powers the Capital Requirements and Stress Testing tabs |
 """)
 
     st.divider()
-    st.markdown("**Pipeline**")
+    st.markdown("**How it's built**")
     st.markdown("""
 ```
 Raw CDC events
@@ -587,43 +581,31 @@ the Unity Catalog Model Registry.
 
 # ─── App Header ───────────────────────────────────────────────────────────────
 
-st.title("📊 Actuarial Risk Dashboard")
-st.caption("Powered by Databricks | SARIMA Forecasting + Monte Carlo Portfolio Risk")
+st.title("📊 Insurance Portfolio Risk Intelligence")
+st.caption("Powered by Databricks | Claims Forecasting · Capital Planning · Catastrophe Analysis")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast", "🎲 Scenario Analysis", "🌪️ Catastrophe Scenarios"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Claims Forecast", "💰 Capital Requirements", "⚡ Quick Forecast", "🎲 Stress Testing", "🌪️ Catastrophe Events"])
 
 # ── Tab 1: Segment Forecasts ──────────────────────────────────────────────────
 with tab1:
-    st.subheader("SARIMA Claims Forecasts by Segment")
+    st.subheader("Claims Volume Forecast by Product & Region")
 
-    with st.expander("ℹ️ How this forecast works", expanded=False):
+    with st.expander("ℹ️ About this forecast", expanded=False):
         st.markdown("""
-**Model:** SARIMA (Seasonal AutoRegressive Integrated Moving Average), fitted independently
-per segment using `statsmodels.SARIMAX`.
+**What this shows:** Projected monthly claim volumes for the selected product line and region, based on 6 years of historical claims data (Jan 2019 – Dec 2024).
 
-**What SARIMA captures:**
-- **AR (AutoRegressive):** Each month's claim count is partly explained by prior months —
-  a high-claims month tends to be followed by another high-claims month.
-- **I (Integrated):** Differencing removes trends so the series is stationary before fitting.
-- **MA (Moving Average):** Residual shocks (e.g., a one-time weather event) decay over time
-  rather than persisting indefinitely.
-- **Seasonal (S):** A 12-month seasonal cycle accounts for recurring annual patterns
-  (e.g., winter driving claims peak in Q1).
+**The shaded band** is the forecast uncertainty range — the model expects 95% of actual future months to fall within this range. A wider band means higher uncertainty, which is normal for longer forecast horizons.
 
-**Order used:** SARIMA(1,1,1)(1,1,1)₁₂ — a conservative, widely applicable specification.
+**The dashed line** shows the most likely (point estimate) outcome each month.
 
-**Confidence interval:** The shaded band is the **95% prediction interval** — the range within
-which the model expects 95% of actual future observations to fall, accounting for both
-parameter uncertainty and inherent randomness in the claims process.
+**Important:** This model assumes the historical seasonal pattern continues. Use the analyst note tool below to flag known upcoming changes — new products, regulatory changes, or unusual loss events — that the model cannot anticipate automatically.
 
-**Limitations:** SARIMA assumes the historical seasonal pattern continues. It will not
-anticipate structural breaks (e.g., a new product launch, regulatory change, or pandemic shock).
-Use the annotation tool below to flag such assumptions.
+_Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmodels.SARIMAX._
 """)
 
     segments = load_segments()
     if segments:
-        selected = st.selectbox("Select segment:", segments, index=0)
+        selected = st.selectbox("Select product line & region:", segments, index=0)
 
         if selected:
             # Load segment history stats alongside the forecast
@@ -638,17 +620,17 @@ Use the annotation tool below to flag such assumptions.
                 sc1.metric(
                     "History",
                     f"{str(s['first_month'])[:7]} – {str(s['last_month'])[:7]}",
-                    help="Date range of observed actuals used to fit the SARIMA model"
+                    help="Date range of historical claims data used to build this forecast"
                 )
                 sc2.metric(
                     "Avg Monthly Claims",
                     f"{float(s['avg_monthly_claims']):,.0f}",
-                    help="Mean monthly claims count over the observed history"
+                    help="Average number of claims filed per month over the historical period"
                 )
                 sc3.metric(
-                    "Std Dev",
+                    "Month-to-Month Variability",
                     f"{float(s['stddev_claims']):,.0f}",
-                    help="Standard deviation of monthly claims — higher values indicate greater volatility"
+                    help="How much monthly claims typically vary. Higher values mean less predictable months."
                 )
                 sc4.metric(
                     "Range",
@@ -676,7 +658,7 @@ Use the annotation tool below to flag such assumptions.
                 ))
                 fig.add_trace(go.Scatter(
                     x=forecasts["month"], y=forecasts["forecast_mean"],
-                    mode="lines+markers", name="SARIMA forecast (mean)",
+                    mode="lines+markers", name="Projected claims",
                     line=dict(color="#FF3419", dash="dash"),
                     hovertemplate="<b>%{x}</b><br>Forecast: %{y:,.0f} claims<extra></extra>",
                 ))
@@ -685,7 +667,7 @@ Use the annotation tool below to flag such assumptions.
                     y=pd.concat([forecasts["forecast_hi95"], forecasts["forecast_lo95"][::-1]]),
                     fill="toself", fillcolor="rgba(255,52,25,0.15)",
                     line=dict(color="rgba(255,0,0,0)"),
-                    name="95% prediction interval",
+                    name="Forecast range (95% confidence)",
                     hoverinfo="skip",
                 ))
                 # Add a vertical marker at the forecast start
@@ -702,9 +684,9 @@ Use the annotation tool below to flag such assumptions.
                         yanchor="bottom", font=dict(color="grey", size=11),
                     )
                 fig.update_layout(
-                    title=f"{selected} — SARIMA Forecast",
+                    title=f"{selected} — Claims Forecast",
                     xaxis_title="Month",
-                    yaxis_title="Monthly Claims Count",
+                    yaxis_title="Monthly Claims",
                     height=420,
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                     hovermode="x unified",
@@ -715,21 +697,21 @@ Use the annotation tool below to flag such assumptions.
                 if "mape" in df.columns:
                     mape_vals = pd.to_numeric(df[df["record_type"] == "forecast"]["mape"], errors='coerce')
                     col1.metric(
-                        "Avg MAPE (hold-out)",
+                        "Forecast Accuracy",
                         f"{mape_vals.mean():.1f}%",
-                        help="Mean Absolute Percentage Error on the hold-out test set. Lower is better; <10% is considered good for insurance time series."
+                        help="Average error rate on the out-of-sample test period. Lower is better — under 10% is strong for insurance data."
                     )
                 if not forecasts.empty:
                     col2.metric(
-                        "Avg Monthly Forecast",
+                        "Projected Monthly Claims",
                         f"{int(forecasts['forecast_mean'].mean()):,}",
-                        help="Average of the 12 monthly point forecasts (mean of the predictive distribution)"
+                        help="Average projected claims per month over the 12-month forecast horizon"
                     )
                     half_width = int((forecasts['forecast_hi95'] - forecasts['forecast_lo95']).mean() / 2)
                     col3.metric(
-                        "Avg 95% CI Half-Width",
+                        "Forecast Uncertainty Range",
                         f"±{half_width:,}",
-                        help="Average half-width of the 95% prediction interval. Wider intervals reflect greater uncertainty — typical for longer-horizon forecasts."
+                        help="Average margin of uncertainty around the monthly forecast. Wider ranges reflect higher uncertainty — normal as the forecast extends further into the future."
                     )
 
                 with st.expander("📋 Raw forecast data"):
@@ -748,10 +730,10 @@ Use the annotation tool below to flag such assumptions.
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
         # Scenario annotation
-        with st.expander("📝 Add Scenario Note"):
+        with st.expander("📝 Add Analyst Note"):
             st.caption(
-                "Record assumption overrides, external events, or actuarial judgments "
-                "for this segment. Notes are stored in Lakebase (PostgreSQL) and persist across sessions."
+                "Record any known factors that could affect this forecast — new products, regulatory changes, "
+                "loss events, or expert judgment overrides. Notes are saved and visible to all team members."
             )
             # Pre-populate analyst name from the forwarded user token if available
             _user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
@@ -764,16 +746,16 @@ Use the annotation tool below to flag such assumptions.
             with _an_col2:
                 approval_status = st.selectbox("Status:", _APPROVAL_STATUSES)
                 adjustment_pct  = st.number_input(
-                    "Forecast adjustment (%):",
+                    "Recommended Forecast Adjustment (%):",
                     min_value=-50.0, max_value=50.0, value=0.0, step=0.5,
-                    help="Positive = upward revision; negative = downward revision. Enter 0 if no adjustment.",
+                    help="Enter a positive % to revise the forecast upward, or negative to revise downward. Use 0 if no adjustment is needed.",
                 )
-            note = st.text_area("Notes / assumptions:")
+            note = st.text_area("Notes:")
             if st.button("Save Note"):
                 adj = adjustment_pct if adjustment_pct != 0.0 else None
                 if save_scenario_annotation(selected, note, analyst,
                                             scenario_type, adj, approval_status):
-                    st.success("Note saved to Lakebase")
+                    st.success("Note saved")
 
         with st.expander("📋 View Previous Notes"):
             if selected:
@@ -783,47 +765,28 @@ Use the annotation tool below to flag such assumptions.
                 else:
                     st.info("No annotations yet for this segment.")
     else:
-        st.warning("No segments found. The data pipeline may still be running — please check back shortly.")
+        st.warning("No data found. The pipeline may still be initialising — please check back in a few minutes.")
 
 # ── Tab 2: Portfolio Risk ─────────────────────────────────────────────────────
 with tab2:
-    st.subheader("Monte Carlo Portfolio Risk Summary")
-    st.caption("40M baseline paths | t-Copula (df=4) + Lognormal | Property + Auto + Liability")
+    st.subheader("Annual Capital Requirements")
+    st.caption("Based on 40 million simulated loss scenarios across Commercial Property, Commercial Auto, and Liability")
 
-    with st.expander("ℹ️ How the simulation works", expanded=False):
+    with st.expander("ℹ️ About these numbers", expanded=False):
         st.markdown("""
-**Simulation design:**
+**What this shows:** How much capital your portfolio needs to hold at different risk tolerance levels, based on 40 million simulated loss scenarios.
 
-The portfolio is modelled as three correlated lines of business:
-- **Commercial Property** — large-loss severity, moderate frequency
-- **Commercial Auto** — moderate severity, higher frequency
-- **Liability** — long-tail, low frequency / high severity
+**The four risk levels:**
+- **Expected Annual Loss** — What you should budget for in a typical year (long-run average)
+- **1-in-100 Year Loss** — The loss level you'd only expect to exceed once a century. A common internal risk appetite threshold.
+- **Solvency Capital Requirement (1-in-200 Year)** — The Solvency II regulatory capital benchmark. Insurers must hold capital sufficient to survive this level with 99.5% confidence.
+- **Tail Risk Estimate** — The average loss across the very worst scenarios (beyond the 1-in-100 threshold). More conservative than VaR because it captures how bad things get in extreme years.
 
-Each simulation path draws correlated annual losses using a **Cholesky decomposition**
-of the inter-line correlation matrix, applied to independent lognormal samples.
-The correlation structure captures co-movement during adverse scenarios (e.g., a
-widespread weather event affecting both Property and Auto simultaneously).
+**Why losses cluster and spike:** Most years sit near the expected loss, but a small number of scenarios produce losses many times larger. This "heavy right tail" is normal in insurance — it's why catastrophe reinsurance and capital buffers exist.
 
-**Parameter inputs:**
-- Line means and standard deviations are calibrated from the SARIMA forecasts and
-  GARCH volatility estimates produced in the modelling pipeline.
-- Correlation matrix is assumed (not estimated), with moderate positive correlation (ρ ≈ 0.3–0.5)
-  between lines — conservative for a standard formula approach.
+**How lines of business interact:** Losses are modelled as correlated — a widespread event (e.g., a major storm) can hit Property and Auto simultaneously, compounding total losses beyond what either line would produce alone.
 
-**Dependence model — t-Copula (Student-t, df=4):**
-Insurance portfolios face *common shocks* — catastrophes, judicial inflation, and
-macro-economic stress scenarios that affect multiple lines simultaneously. A Gaussian
-copula (normal distribution) has *no tail dependence* and **understates VaR** for
-these events. The **t-Copula with df=4** captures tail co-movement, producing
-higher — and more realistic — VaR estimates at the 99th and 99.5th percentiles.
-
-**Distributed execution (Module 4):**
-The simulation is task-parallelised using **Ray-on-Spark** on GPU workers (`@ray.remote(num_gpus=0.25)`):
-100 tasks each generate 1,000 scenarios (100,000 paths total). On serverless runtimes
-without Ray, a single-node scipy/NumPy fallback produces equivalent results.
-
-**Output:** 100,000 total portfolio loss values. The empirical distribution of these
-values produces the risk metrics shown below.
+_Technical: t-Copula (df=4) + lognormal marginals. Correlation matrix: ρ(Prop,Auto)=0.40, ρ(Prop,Liab)=0.20, ρ(Auto,Liab)=0.30._
 """)
 
     summary = load_monte_carlo_summary()
@@ -832,32 +795,32 @@ values produces the risk metrics shown below.
     col1.metric(
         "Expected Annual Loss",
         f"${summary['expected_loss']:.1f}M",
-        help="The mean of the simulated loss distribution — the long-run average annual loss across all 100,000 scenarios. This is the actuarial best estimate of what the portfolio will cost in a given year."
+        help="What the portfolio is expected to cost in a typical year — the long-run average across all simulated scenarios. Use this as your base budget assumption."
     )
     col2.metric(
-        "VaR (99%)",
+        "1-in-100 Year Loss",
         f"${summary['var_99']:.1f}M",
-        help="Value at Risk at the 99th percentile — the loss level exceeded in only 1% of scenarios (1-in-100 year event). Under Basel and Solvency frameworks, this is a common risk appetite threshold."
+        help="The loss level exceeded in only 1% of scenarios. Think of it as the worst year in a century. A common risk appetite benchmark for internal capital planning."
     )
     col3.metric(
-        "VaR (99.5%)",
+        "Solvency Capital Requirement",
         f"${summary['var_995']:.1f}M",
-        help="The Solvency II Solvency Capital Requirement (SCR) calibration point — the 1-in-200 year loss. Insurers must hold capital sufficient to cover losses up to this level with 99.5% confidence over a one-year horizon."
+        help="The Solvency II regulatory capital threshold (SCR) — the 1-in-200 year loss level. Insurers must hold enough capital to cover losses at this level with 99.5% confidence."
     )
     col4.metric(
-        "CVaR (99%)",
+        "Tail Risk Estimate",
         f"${summary['cvar_99']:.1f}M",
-        help="Conditional Value at Risk (Expected Shortfall) at 99% — the average loss across the worst 1% of scenarios. CVaR is more conservative than VaR because it accounts for the severity of tail events, not just the threshold."
+        help="The average loss across the worst 1% of scenarios — what you'd expect to lose when things go really wrong, beyond the 1-in-100 threshold. More conservative than VaR and used in IFRS 17 risk margin calculations."
     )
 
     st.divider()
 
     # Risk metric comparison chart
     metrics = {
-        "Expected Loss\n(Mean)": float(summary["expected_loss"]),
-        "VaR 99%\n(1-in-100)": float(summary["var_99"]),
-        "VaR 99.5%\n(SCR / 1-in-200)": float(summary["var_995"]),
-        "CVaR 99%\n(Expected Shortfall)": float(summary["cvar_99"]),
+        "Expected\nAnnual Loss": float(summary["expected_loss"]),
+        "1-in-100\nYear Loss": float(summary["var_99"]),
+        "Solvency Capital\nRequirement": float(summary["var_995"]),
+        "Tail Risk\nEstimate": float(summary["cvar_99"]),
     }
     import plotly.graph_objects as go
     colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd"]
@@ -870,7 +833,7 @@ values produces the risk metrics shown below.
         hovertemplate="%{x}<br><b>$%{y:.1f}M</b><extra></extra>",
     ))
     fig2.update_layout(
-        title="Portfolio Risk Metrics — Comparison",
+        title="Capital Required at Each Risk Level",
         yaxis_title="Annual Loss ($M)",
         height=380,
         showlegend=False,
@@ -884,12 +847,11 @@ values produces the risk metrics shown below.
         for col in dist_df.columns:
             dist_df[col] = pd.to_numeric(dist_df[col], errors='coerce')
 
-        with st.expander("📊 Simulated Loss Distribution", expanded=True):
+        with st.expander("📊 How Losses Are Distributed Across Scenarios", expanded=True):
             st.markdown("""
-The histogram below shows the distribution of **mean portfolio losses** across simulated scenarios.
-The vertical lines mark the key risk thresholds. The heavy right tail is characteristic of
-insurance loss distributions — most years are near the expected loss, but rare extreme years
-can be multiples of the mean.
+Each bar shows how many of the 40 million simulated years produced losses in that range. The vertical lines mark key capital thresholds.
+
+Most simulated years cluster near the expected loss — but a long tail of rare, high-loss years stretches to the right. This is the fundamental reason insurance companies hold capital buffers well above their average annual loss.
 """)
             fig3 = go.Figure()
             fig3.add_trace(go.Histogram(
@@ -900,9 +862,9 @@ can be multiples of the mean.
                 hovertemplate="Loss: $%{x:.1f}M<br>Count: %{y}<extra></extra>",
             ))
             for label, val, color in [
-                ("E[Loss]", float(summary["expected_loss"]), "#2ca02c"),
-                ("VaR 99%", float(summary["var_99"]), "#ff7f0e"),
-                ("VaR 99.5%", float(summary["var_995"]), "#d62728"),
+                ("Expected Loss", float(summary["expected_loss"]), "#2ca02c"),
+                ("1-in-100yr", float(summary["var_99"]), "#ff7f0e"),
+                ("SCR (1-in-200yr)", float(summary["var_995"]), "#d62728"),
             ]:
                 fig3.add_vline(
                     x=val, line_dash="dash", line_color=color,
@@ -918,51 +880,35 @@ can be multiples of the mean.
             st.plotly_chart(fig3, use_container_width=True)
 
     st.markdown("""
-> **Solvency II context:** The VaR(99.5%) figure is the calibration point for the
-> Solvency Capital Requirement (SCR) under the Solvency II Standard Formula. Insurers
-> operating under this framework must hold own funds at least equal to their SCR.
-> The CVaR (Expected Shortfall) goes further — it represents the average cost of the
-> scenarios beyond VaR and is increasingly used in IFRS 17 risk adjustment calculations.
+> **Regulatory context:** The Solvency Capital Requirement (SCR) is the amount of capital a Solvency II insurer must hold to survive a 1-in-200 year loss event. The Tail Risk Estimate goes further — capturing the average severity of scenarios beyond that threshold, and is increasingly referenced in IFRS 17 risk margin calculations.
 """)
 
 # ── Tab 3: On-Demand Forecast ─────────────────────────────────────────────────
 with tab3:
-    st.subheader("On-Demand Forecast via Model Serving")
-    st.caption("Calls the deployed SARIMA REST endpoint in real time")
+    st.subheader("Generate a Custom Claims Forecast")
+    st.caption("Get an instant forecast for any time horizon — results update in seconds")
 
-    with st.expander("ℹ️ About this endpoint", expanded=False):
+    with st.expander("ℹ️ How this works", expanded=False):
         st.markdown("""
-**What this does:**
+**What this does:** Generates a claims forecast on demand for any horizon up to 24 months, without re-running the full modelling pipeline.
 
-This tab calls a live **Databricks Model Serving** endpoint that wraps the fitted SARIMA model
-in a standardised `mlflow.pyfunc` interface. The endpoint is version-controlled — it serves
-the model tagged as `@Champion` in the Unity Catalog Model Registry.
+**When to use it:**
+- Quick "what if I need a 18-month forecast?" checks
+- Board or management presentations requiring a specific horizon
+- Validating that the deployed model is live and responding correctly
 
-**Input:** A single integer `horizon` — the number of months to forecast ahead.
+**What you get back:**
+- A monthly point forecast (most likely outcome)
+- Upper and lower bounds of the 95% forecast range
+- A note if uncertainty grows significantly at longer horizons (expected — forecasts become less precise the further out you go)
 
-**Output:** One row per forecast month, with columns:
+**The model** is the same one trained on all 40 segments — it represents aggregate portfolio behaviour. For segment-specific forecasts with full historical context, use the **Claims Forecast** tab.
 
-| Column | Description |
-|---|---|
-| `month_offset` | Months ahead (1 = next month, 2 = two months ahead, …) |
-| `forecast_mean` | Point forecast — mean of the predictive distribution |
-| `forecast_lo95` | Lower bound of the 95% prediction interval |
-| `forecast_hi95` | Upper bound of the 95% prediction interval |
-
-**Why a serving endpoint?**
-
-Deploying the model as a REST endpoint decouples scoring from the training pipeline.
-Any downstream system (this app, a pricing tool, a reserving worksheet) can call the
-same endpoint without needing access to the training cluster or model code. The
-`@Champion` alias means a new model version can be promoted without changing any
-calling code.
-
-**Note:** The model is fitted on an aggregate of all segments. For segment-specific
-forecasts with the full historical context, use the **Forecasts** tab.
+_Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion alias in Unity Catalog._
 """)
 
     horizon = st.slider(
-        "Forecast horizon (months):",
+        "How many months ahead to forecast:",
         min_value=1, max_value=24, value=6,
         help="How many months ahead to forecast. Uncertainty (CI width) grows with horizon."
     )
@@ -1004,22 +950,22 @@ forecasts with the full historical context, use the **Forecasts** tab.
             fig4 = go.Figure()
             fig4.add_trace(go.Scatter(
                 x=result_df["month_offset"], y=result_df["forecast_mean"],
-                mode="lines+markers", name="Point forecast",
+                mode="lines+markers", name="Projected claims",
                 line=dict(color="#FF3419"),
-                hovertemplate="Month +%{x}<br>Forecast: %{y:,.1f}<extra></extra>",
+                hovertemplate="Month +%{x}<br>Projected: %{y:,.1f} claims<extra></extra>",
             ))
             fig4.add_trace(go.Scatter(
                 x=pd.concat([result_df["month_offset"], result_df["month_offset"][::-1]]),
                 y=pd.concat([result_df["forecast_hi95"], result_df["forecast_lo95"][::-1]]),
                 fill="toself", fillcolor="rgba(255,52,25,0.15)",
                 line=dict(color="rgba(255,0,0,0)"),
-                name="95% prediction interval",
+                name="Forecast range",
                 hoverinfo="skip",
             ))
             fig4.update_layout(
-                title=f"SARIMA On-Demand Forecast — {_display_horizon}-Month Horizon",
-                xaxis_title="Months Ahead",
-                yaxis_title="Forecast Claims Count",
+                title=f"Claims Forecast — Next {_display_horizon} Months",
+                xaxis_title="Month",
+                yaxis_title="Projected Monthly Claims",
                 height=360,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
@@ -1030,9 +976,9 @@ forecasts with the full historical context, use the **Forecasts** tab.
             ci_width_end   = float(result_df["forecast_hi95"].iloc[-1] - result_df["forecast_lo95"].iloc[-1])
             if ci_width_end > ci_width_start * 1.5:
                 st.info(
-                    f"The 95% interval widens from ±{ci_width_start/2:,.0f} at month 1 "
-                    f"to ±{ci_width_end/2:,.0f} at month {_display_horizon}, reflecting "
-                    "increasing uncertainty at longer horizons — expected behaviour for ARIMA models."
+                    "The forecast range widens significantly at longer horizons — this is expected. "
+                    "Uncertainty compounds over time; use shorter-horizon forecasts for operational decisions "
+                    "and longer horizons for strategic planning only."
                 )
 
         st.download_button(
@@ -1044,82 +990,73 @@ forecasts with the full historical context, use the **Forecasts** tab.
 
 # ── Tab 4: Scenario Analysis ──────────────────────────────────────────────────
 with tab4:
-    st.subheader("On-Demand Monte Carlo Scenario Analysis")
-    st.caption("Run custom stress scenarios via the t-Copula Monte Carlo REST endpoint")
+    st.subheader("Custom Stress Test")
+    st.caption("Model the capital impact of any loss scenario in seconds")
 
-    with st.expander("ℹ️ How scenario analysis works", expanded=False):
+    with st.expander("ℹ️ How this works", expanded=False):
         st.markdown("""
-**What this does:**
+**What this does:** Lets you change the loss assumptions for any line of business and immediately see how your capital requirements change. Use it to answer questions like:
 
-This tab calls a live **Monte Carlo Model Serving endpoint** that wraps the t-Copula simulation
-(Module 6) as a stateless REST API. Unlike the SARIMA endpoint, all model assumptions are passed
-in the request — enabling analysts to run stress scenarios without modifying or retraining the model.
+- "What happens to our SCR if property losses increase 20%?"
+- "How much extra capital do we need if losses become more volatile?"
+- "What's the capital impact of a widespread event that hits Property and Auto at the same time?"
 
-**When to use it:**
-- **Hard market analysis:** raise means by 15–25% to estimate capital impact of deteriorating loss ratios
-- **Cat scenario:** increase inter-line correlations (corr_prop_auto ≥ 0.6) to simulate a widespread
-  catastrophe event affecting Property and Auto simultaneously
-- **Parameter uncertainty (ORSA):** increase CVs to represent estimation uncertainty in your loss picks
-- **Solvency II sensitivity:** test how VaR(99.5%) changes under different assumption sets
+**The three groups of inputs:**
+- **Expected Annual Losses** — Your best estimate of what each line will cost in the scenario. Raise these to model a hard market, higher exposure, or adverse claims trends.
+- **Loss Volatility** — How unpredictable each line is. Higher volatility means wider loss distributions and higher capital requirements.
+- **How Lines Move Together** — Whether multiple lines tend to have bad years at the same time. Higher values mean more losses pile up during stress events, increasing required capital.
 
-**Input parameters:**
+**Results** show how your capital requirements (Expected Loss, 1-in-100, SCR, Tail Risk) change versus the pre-computed baseline.
 
-| Group | Parameter | Actuarial meaning |
-|---|---|---|
-| **Means** | `mean_property_M` / `mean_auto_M` / `mean_liability_M` | Expected annual loss per line ($M) — calibrated from pricing or reserving |
-| **CVs** | `cv_property` / `cv_auto` / `cv_liability` | Coefficient of variation — higher values = fatter tails, wider loss distribution |
-| **Correlations** | `corr_prop_auto` / `corr_prop_liab` / `corr_auto_liab` | Inter-line correlation — higher values = more capital required for diversification |
-| **Simulation** | `n_scenarios`, `copula_df` | Paths (precision vs speed) and t-copula degrees of freedom (lower = heavier tail dependence) |
-
-**Output:** VaR and CVaR risk metrics for the stressed portfolio, compared to the baseline calibration.
+_Technical: t-Copula Monte Carlo endpoint, same model as the Portfolio Risk tab._
 """)
 
     # ── Parameter inputs ──────────────────────────────────────────────────────
-    st.markdown("#### Scenario Parameters")
+    st.markdown("#### Loss Assumptions")
 
     col_means, col_cv, col_corr = st.columns(3)
 
     with col_means:
         st.markdown("**Expected Annual Losses ($M)**")
         mean_prop = st.number_input("Commercial Property", value=12.5, min_value=0.1, max_value=500.0, step=0.5,
-                                    help="Baseline: $12.5M. Raise to simulate hard market or increased exposure.")
+                                    help="Baseline: $12.5M. Increase to model higher property losses — hard market, increased building values, or adverse claims trends.")
         mean_auto = st.number_input("Commercial Auto",     value=8.3,  min_value=0.1, max_value=500.0, step=0.5,
-                                    help="Baseline: $8.3M.")
+                                    help="Baseline: $8.3M. Increase to model more frequent or severe auto claims.")
         mean_liab = st.number_input("Liability",           value=5.7,  min_value=0.1, max_value=500.0, step=0.5,
-                                    help="Baseline: $5.7M. Long-tail; higher means reflect adverse development.")
+                                    help="Baseline: $5.7M. Increase to model higher liability exposure or adverse reserve development.")
 
     with col_cv:
-        st.markdown("**Coefficients of Variation**")
-        cv_prop = st.slider("Property CV", min_value=0.05, max_value=2.0, value=0.35, step=0.05,
-                            help="Baseline: 0.35. Higher CV → fatter loss distribution → higher VaR.")
-        cv_auto = st.slider("Auto CV",     min_value=0.05, max_value=2.0, value=0.28, step=0.05,
-                            help="Baseline: 0.28.")
-        cv_liab = st.slider("Liability CV", min_value=0.05, max_value=2.0, value=0.42, step=0.05,
-                            help="Baseline: 0.42. Liability tends to have higher CV due to long-tail uncertainty.")
+        st.markdown("**Loss Volatility (unpredictability)**")
+        cv_prop = st.slider("Property Volatility", min_value=0.05, max_value=2.0, value=0.35, step=0.05,
+                            help="Baseline: 0.35. Higher values mean more unpredictable losses and higher capital requirements.")
+        cv_auto = st.slider("Auto Volatility",     min_value=0.05, max_value=2.0, value=0.28, step=0.05,
+                            help="Baseline: 0.28. Auto claims tend to be the most stable line.")
+        cv_liab = st.slider("Liability Volatility", min_value=0.05, max_value=2.0, value=0.42, step=0.05,
+                            help="Baseline: 0.42. Liability is naturally more volatile due to long development tails and legal uncertainty.")
 
     with col_corr:
-        st.markdown("**Inter-Line Correlations**")
+        st.markdown("**How Lines Move Together**")
         corr_pa = st.slider("Property ↔ Auto",      min_value=0.0, max_value=0.95, value=0.40, step=0.05,
-                            help="Baseline: 0.40. Raise to 0.6–0.8 for cat scenarios (e.g., widespread storm).")
+                            help="Baseline: 0.40. How often Property and Auto have bad years at the same time. Raise to 0.6–0.8 to model a widespread event like a storm affecting both.")
         corr_pl = st.slider("Property ↔ Liability", min_value=0.0, max_value=0.95, value=0.20, step=0.05,
-                            help="Baseline: 0.20. Lower — these lines are less correlated in normal conditions.")
+                            help="Baseline: 0.20. Property and Liability losses are relatively independent in normal conditions.")
         corr_al = st.slider("Auto ↔ Liability",     min_value=0.0, max_value=0.95, value=0.30, step=0.05,
-                            help="Baseline: 0.30.")
+                            help="Baseline: 0.30. Auto and Liability sometimes move together — e.g., an economic downturn affecting both claims frequency and litigation.")
 
     col_sim1, col_sim2 = st.columns(2)
     with col_sim1:
         n_scen = st.select_slider(
-            "Number of scenarios",
+            "Simulation Precision",
             options=[1_000, 5_000, 10_000, 25_000, 50_000],
             value=10_000,
-            help="More scenarios = more precise estimates but slower (~1–5s per 10,000 paths).",
+            help="More paths = more accurate results, takes slightly longer. 10,000 is good for most analyses.",
         )
     with col_sim2:
         copula_df_val = st.select_slider(
-            "t-Copula degrees of freedom",
+            "Tail Risk Sensitivity",
             options=[3, 4, 5, 10, 20, 30],
             value=4,
-            help="Lower df → heavier tail dependence. df=4 is the actuarial calibration. df=30 ≈ Gaussian copula.",
+            help="Controls how severely multiple lines are affected simultaneously during extreme events. Lower = more conservative (heavier simultaneous losses). Default of 4 is the actuarial calibration; 30 approximates independent lines.",
         )
 
     # ── Baseline reference (read from Delta table, cached) ────────────────────
@@ -1152,11 +1089,11 @@ in the request — enabling analysts to run stress scenarios without modifying o
 
     _result = st.session_state.get("scenario_result")
     if _result:
-        st.success("Simulation complete")
+        st.success("Scenario complete")
         st.divider()
 
         # ── Risk metrics comparison ───────────────────────────────────────
-        st.markdown("#### Results: Scenario vs Baseline")
+        st.markdown("#### Capital Impact: Scenario vs. Baseline")
 
         _b = _baseline_summary  # Series from load_monte_carlo_summary()
 
@@ -1168,34 +1105,34 @@ in the request — enabling analysts to run stress scenarios without modifying o
 
         rc1, rc2, rc3, rc4 = st.columns(4)
         rc1.metric(
-            "Expected Loss",
+            "Expected Annual Loss",
             f"${_result['expected_loss_M']:.1f}M",
             delta=_delta(_result['expected_loss_M'], _b.get('expected_loss', 0)),
-            help="Mean portfolio loss across all simulated scenarios.",
+            help="What the portfolio is expected to cost per year under these assumptions.",
         )
         rc2.metric(
-            "VaR (99%)",
+            "1-in-100 Year Loss",
             f"${_result['var_99_M']:.1f}M",
             delta=_delta(_result['var_99_M'], _b.get('var_99', 0)),
-            help="1-in-100 year loss level.",
+            help="Loss level exceeded only once a century under this scenario.",
         )
         rc3.metric(
-            "VaR (99.5%) — SCR",
+            "Solvency Capital Requirement",
             f"${_result['var_995_M']:.1f}M",
             delta=_delta(_result['var_995_M'], _b.get('var_995', 0)),
-            help="Solvency II SCR calibration point (1-in-200 year).",
+            help="Required capital under Solvency II for this scenario.",
         )
         rc4.metric(
-            "CVaR (99%)",
+            "Tail Risk Estimate",
             f"${_result['cvar_99_M']:.1f}M",
             delta=_delta(_result['cvar_99_M'], _b.get('cvar_99', 0)),
-            help="Expected loss in the worst 1% of scenarios.",
+            help="Average loss in the very worst outcomes — beyond the 1-in-100 threshold.",
         )
 
         # ── Waterfall chart: Scenario vs Baseline ─────────────────────────
         import plotly.graph_objects as go
 
-        _metrics_labels = ["E[Loss]", "VaR 95%", "VaR 99%", "VaR 99.5%\n(SCR)", "CVaR 99%"]
+        _metrics_labels = ["Expected\nAnnual Loss", "VaR 95%", "1-in-100\nYear Loss", "Solvency Capital\nRequirement", "Tail Risk\nEstimate"]
         _baseline_vals = [
             float(_b.get("expected_loss", 0)),
             float(_b.get("var_99", 0)) * 0.85,   # approximate VaR95 from VaR99
@@ -1213,21 +1150,21 @@ in the request — enabling analysts to run stress scenarios without modifying o
 
         _fig_cmp = go.Figure()
         _fig_cmp.add_trace(go.Bar(
-            name="Baseline (pre-computed)",
+            name="Baseline",
             x=_metrics_labels,
             y=_baseline_vals,
             marker_color="rgba(31,119,180,0.7)",
             hovertemplate="%{x}<br>Baseline: $%{y:.1f}M<extra></extra>",
         ))
         _fig_cmp.add_trace(go.Bar(
-            name="Scenario (on-demand)",
+            name="Stress Scenario",
             x=_metrics_labels,
             y=_scenario_vals,
             marker_color="rgba(214,39,40,0.7)",
             hovertemplate="%{x}<br>Scenario: $%{y:.1f}M<extra></extra>",
         ))
         _fig_cmp.update_layout(
-            title="Scenario vs Baseline Risk Metrics",
+            title="Capital Requirement Change vs. Baseline",
             yaxis_title="Annual Portfolio Loss ($M)",
             barmode="group",
             height=380,
@@ -1236,9 +1173,9 @@ in the request — enabling analysts to run stress scenarios without modifying o
         st.plotly_chart(_fig_cmp, use_container_width=True)
 
         # ── Raw metrics table ──────────────────────────────────────────────
-        with st.expander("📋 Full scenario metrics"):
+        with st.expander("📋 Detailed results"):
             _display = {
-                "Metric": ["Expected Loss", "VaR (95%)", "VaR (99%)", "VaR (99.5% SCR)", "CVaR (99%)", "Max Loss"],
+                "Metric": ["Expected Loss", "VaR (95%)", "1-in-100 Year Loss", "Solvency Capital Req.", "Tail Risk Estimate", "Max Loss"],
                 "Scenario ($M)": [
                     f"${_result['expected_loss_M']:.2f}",
                     f"${_result['var_95_M']:.2f}",
@@ -1254,17 +1191,17 @@ in the request — enabling analysts to run stress scenarios without modifying o
 
 # ── Tab 5: Catastrophe Scenarios ──────────────────────────────────────────────
 with tab5:
-    st.subheader("Catastrophe Scenario Analysis")
+    st.subheader("Catastrophe Event Analysis")
     st.caption(
-        "Pre-computed stress tests (Module 4) + custom catastrophe event simulation via Monte Carlo endpoint"
+        "Pre-modelled natural disasters and market events, plus custom catastrophe simulation"
     )
 
     import plotly.graph_objects as go
 
     # ── Section 1: Pre-computed stress scenarios ───────────────────────────────
-    st.markdown("### Pre-Computed Stress Test Results")
+    st.markdown("### Pre-Modelled Catastrophe Stress Tests")
     st.caption(
-        "Run by Module 4 (Ray + GPU) at deploy time — 120M paths across 3 scenarios."
+        "Pre-run at deployment across 3 major stress scenarios — 120 million simulated loss paths each."
     )
 
     _baseline_smry = load_monte_carlo_summary()
@@ -1278,7 +1215,7 @@ with tab5:
 
         _disp_rows = [{"Scenario": "Baseline", "Exp. Loss": f"${_b_mean:.1f}M",
                        "VaR(99%)": f"${_b_var99:.1f}M", "VaR(99.5%) SCR": f"${_b_var995:.1f}M",
-                       "CVaR(99%)": f"${_b_cvar99:.1f}M", "Δ VaR(99.5%)": "—"}]
+                       "CVaR(99%)": f"${_b_cvar99:.1f}M", "Δ SCR": "—"}]
         for _, row in _stress_df.iterrows():
             _disp_rows.append({
                 "Scenario":       row["scenario_label"],
@@ -1286,7 +1223,7 @@ with tab5:
                 "VaR(99%)":       f"${row['var_99_M']:.1f}M",
                 "VaR(99.5%) SCR": f"${row['var_995_M']:.1f}M",
                 "CVaR(99%)":      f"${row['cvar_99_M']:.1f}M",
-                "Δ VaR(99.5%)":   f"{row['var_995_vs_baseline']:+.1f}%",
+                "Δ SCR":   f"{row['var_995_vs_baseline']:+.1f}%",
             })
         st.dataframe(pd.DataFrame(_disp_rows), use_container_width=True, hide_index=True)
 
@@ -1326,7 +1263,7 @@ with tab5:
         st.info("Stress scenario data not yet available — run the setup job (e2-demo-ray target).")
 
     # ── Section 2: VaR evolution timeline ─────────────────────────────────────
-    st.markdown("### 12-Month Forward VaR Evolution (SARIMA-Driven)")
+    st.markdown("### Capital Requirement Outlook — Next 12 Months")
     _timeline_df = load_var_timeline()
     if not _timeline_df.empty:
         _fig_tl = go.Figure()
@@ -1348,22 +1285,21 @@ with tab5:
                 annotation_position="bottom right",
             )
         _fig_tl.update_layout(
-            title="Forward Capital Requirement Curve — VaR Evolution Along SARIMA Forecast Path",
-            xaxis_title="Months Ahead", yaxis_title="Annual Portfolio Loss ($M)",
+            title="How Capital Requirements Are Projected to Change Over the Next 12 Months",
+            xaxis_title="Month", yaxis_title="Required Capital ($M)",
             height=380,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(_fig_tl, use_container_width=True)
     else:
-        st.info("VaR timeline not yet available — run the setup job (e2-demo-ray target).")
+        st.info("Capital outlook not yet available. Run the full setup job to generate this view.")
 
     st.divider()
 
     # ── Section 3: Custom CAT scenario submission ──────────────────────────────
-    st.markdown("### Submit Custom Catastrophe Scenario")
+    st.markdown("### Model a Custom Catastrophe Event")
     st.caption(
-        "Configure a natural disaster or market event, translate it to portfolio loss parameters, "
-        "and run a Monte Carlo simulation via the serving endpoint. Results are saved to Lakebase."
+        "Configure a natural disaster or market event and immediately see its capital impact. Results are saved to the audit log."
     )
 
     _cat_top1, _cat_top2 = st.columns(2)
@@ -1371,27 +1307,27 @@ with tab5:
         _cat_type = st.selectbox(
             "Event type:",
             list(_CAT_PRESETS.keys()),
-            help="Preset determines default severity multipliers for each line of business.",
+            help="Each event type pre-fills realistic loss assumptions for that type of disaster. You can adjust them in the parameters section below.",
         )
         st.caption(f"_{_CAT_PRESETS[_cat_type]['desc']}_")
         _return_period = st.selectbox(
-            "Return period:",
+            "Event Severity:",
             list(_RETURN_PERIOD_MULT.keys()),
             index=1,
-            help="1-in-250yr ≈ Solvency II PML benchmark; 1-in-500yr = extreme stress.",
+            help="How rare and severe the event is. 1-in-250yr is the Solvency II catastrophe benchmark; 1-in-500yr represents an extreme stress test.",
         )
     with _cat_top2:
         _affected_regions = st.multiselect(
-            "Affected provinces/territories:",
+            "Affected Regions:",
             _CANADIAN_PROVINCES,
             default=["Ontario", "Quebec"],
-            help="Provinces exposed to this event (for documentation and audit trail).",
+            help="Which provinces are exposed to this event — used for documentation and the audit log.",
         )
         _affected_lines = st.multiselect(
-            "Affected product lines:",
+            "Affected Lines of Business:",
             ["Commercial Property", "Commercial Auto", "Personal Auto", "Homeowners", "Liability"],
             default=["Commercial Property", "Commercial Auto"],
-            help="Product lines most directly impacted (for documentation).",
+            help="Which lines of business are most directly hit — used for documentation.",
         )
 
     # Compute default params from preset + return period
@@ -1402,7 +1338,7 @@ with tab5:
     _def_cvs   = [min(round(c * cu, 2), 3.0) for c, cu in zip(_bc, _preset["cv_mult"])]
     _def_corrs = [min(c + _preset["corr_add"], 0.95) for c in _bco]
 
-    with st.expander("⚙️ Adjust scenario parameters", expanded=False):
+    with st.expander("⚙️ Fine-tune loss assumptions", expanded=False):
         _adj1, _adj2, _adj3 = st.columns(3)
         with _adj1:
             st.markdown("**Expected Annual Losses ($M)**")
@@ -1423,7 +1359,7 @@ with tab5:
         "Simulation paths:",
         options=[5_000, 10_000, 25_000, 50_000],
         value=25_000,
-        help="25,000 recommended for CAT scenarios — balances precision and response time.",
+        help="25,000 recommended for catastrophe scenarios — good balance of accuracy and speed.",
         key="cat_nscen",
     )
 
@@ -1432,11 +1368,11 @@ with tab5:
     _cat_analyst_in = st.text_input("Analyst:", value=_cat_analyst, key="cat_analyst")
     _cat_note_in    = st.text_area(
         "Scenario rationale / assumptions:",
-        placeholder=f"Describe the {_cat_type} scenario, basis for severity assumptions, affected exposure...",
+        placeholder=f"Describe the {_cat_type} scenario — affected exposure, basis for severity, any expert judgment applied...",
         key="cat_note",
     )
 
-    if st.button("🌪️ Run CAT Scenario", type="primary"):
+    if st.button("🌪️ Run Catastrophe Scenario", type="primary"):
         _cat_scenario_params = {
             "mean_property_M":  _cat_mean_prop,
             "mean_auto_M":      _cat_mean_auto,
@@ -1454,7 +1390,7 @@ with tab5:
             _cat_result = call_monte_carlo_endpoint(_cat_scenario_params)
 
         if _cat_result:
-            st.success(f"✅ {_cat_type} ({_return_period}) complete")
+            st.success(f"✅ {_cat_type} scenario complete")
 
             _b5 = _baseline_smry
 
@@ -1464,13 +1400,13 @@ with tab5:
                 return f"{'+' if d >= 0 else ''}${d:.1f}M"
 
             _cr1, _cr2, _cr3, _cr4 = st.columns(4)
-            _cr1.metric("Expected Loss",     f"${_cat_result['expected_loss_M']:.1f}M",
+            _cr1.metric("Expected Annual Loss",     f"${_cat_result['expected_loss_M']:.1f}M",
                         delta=_cat_delta(_cat_result['expected_loss_M'], 'expected_loss'))
-            _cr2.metric("VaR(99%)",          f"${_cat_result['var_99_M']:.1f}M",
+            _cr2.metric("1-in-100 Year Loss",          f"${_cat_result['var_99_M']:.1f}M",
                         delta=_cat_delta(_cat_result['var_99_M'], 'var_99'))
-            _cr3.metric("VaR(99.5%) — SCR",  f"${_cat_result['var_995_M']:.1f}M",
+            _cr3.metric("Solvency Capital Requirement",  f"${_cat_result['var_995_M']:.1f}M",
                         delta=_cat_delta(_cat_result['var_995_M'], 'var_995'))
-            _cr4.metric("CVaR(99%)",         f"${_cat_result['cvar_99_M']:.1f}M",
+            _cr4.metric("Tail Risk Estimate",         f"${_cat_result['cvar_99_M']:.1f}M",
                         delta=_cat_delta(_cat_result['cvar_99_M'], 'cvar_99'))
 
             # Save annotation to Lakebase
@@ -1493,7 +1429,7 @@ with tab5:
                 adjustment_pct=round(_var_lift, 1),
                 approval_status="Draft",
             ):
-                st.caption("✓ Scenario saved to Lakebase audit log")
+                st.caption("✓ Scenario saved to audit log")
         else:
             st.warning(
                 "Monte Carlo endpoint not available. "
@@ -1502,7 +1438,7 @@ with tab5:
 
     # Recent CAT scenarios
     st.divider()
-    st.markdown("### Recent CAT Scenario Audit Log (Lakebase)")
+    st.markdown("### Recent Catastrophe Scenario Audit Log")
     _cat_history = load_annotations("CAT_SCENARIO")
     if not _cat_history.empty:
         st.dataframe(_cat_history, use_container_width=True, hide_index=True)
