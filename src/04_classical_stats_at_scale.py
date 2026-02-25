@@ -778,8 +778,8 @@ if RAY_AVAILABLE:
 # MAGIC **GPU acceleration:** `@ray.remote(num_gpus=0.25)` — fractional allocation allows
 # MAGIC 4 concurrent tasks per T4 GPU (8 tasks total with 2 workers × 1 GPU each).
 # MAGIC Each task runs 100,000 scenarios using PyTorch. Random sampling + Cholesky +
-# MAGIC lognormal inverse CDF (`erfinv`) run on GPU; the t-CDF step (`betainc`) runs
-# MAGIC on CPU (no CUDA kernel in some PyTorch builds) then results move back to GPU.
+# MAGIC lognormal inverse CDF (`erfinv`) + t-CDF (`torch.distributions.StudentT.cdf`)
+# MAGIC all run on GPU via CUDA-native kernels — zero CPU transfer during simulation.
 # MAGIC PyTorch is pre-installed on DBR GPU ML; no pip install needed.
 # MAGIC Falls back transparently to NumPy/SciPy if `torch.cuda` is unavailable.
 
@@ -975,7 +975,7 @@ def _get_gpu_tensors(device, dtype, mu_ln_arr=None, sig_ln_arr=None, corr_arr=No
 # @ray.remote(num_gpus=0.25, num_cpus=0.5): 4 concurrent tasks on 1 T4 GPU
 # (4 × 0.25 = 1.0 GPU); num_cpus=0.5 allows all 4 to fit within the 2 Ray CPU
 # slots reserved on g4dn.xlarge (4 × 0.5 = 2.0 CPUs).
-# GPU path (hybrid): random sampling + Cholesky + lognormal on GPU; betainc on CPU.
+# GPU path (100%): random sampling + Cholesky + lognormal + t-CDF all on GPU.
 if RAY_AVAILABLE:
     @ray.remote(num_gpus=0.25, num_cpus=0.5)
     def simulate_portfolio_losses(n_scenarios: int, seed: int, means_override=None,
@@ -1104,7 +1104,7 @@ if RAY_AVAILABLE:
                 losses = losses * (1.0 + _cat_amp)
 
             total  = losses.sum(dim=1).cpu().numpy().astype(np.float64)
-            backend = 'torch-gpu-hybrid'   # sampling on GPU, betainc on CPU
+            backend = 'torch-gpu'   # 100% GPU: sampling + Cholesky + lognormal + t-CDF
 
         except Exception as e_gpu:
             # ── CPU fallback (Serverless, non-GPU workers, torch.cuda unavailable) ─

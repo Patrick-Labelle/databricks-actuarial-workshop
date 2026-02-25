@@ -262,7 +262,8 @@ permissions), then deploys the app source code last so it starts with full permi
 | 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
 | 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (reads DLT gold layer + real StatCan macro exog), t-Copula Monte Carlo, Ray+GPU, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
-| 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
+| 6 | `06_monte_carlo_serving.py` | Monte Carlo as REST API — MLflow PyFunc, UC Model Registry, AI Gateway |
+| 6 (CI/CD) | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |
 
 All notebooks accept `catalog`, `schema`, and `endpoint_name` as widget
