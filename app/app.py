@@ -471,7 +471,7 @@ _CANADIAN_PROVINCES = [
 ]
 
 def save_scenario_annotation(
-    segment: str,
+    segment_id: str,
     note: str,
     analyst: str,
     scenario_type: str = "",
@@ -486,7 +486,7 @@ def save_scenario_annotation(
             "INSERT INTO public.scenario_annotations "
             "(segment_id, note, analyst, scenario_type, adjustment_pct, approval_status, created_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
-            (segment, note, analyst,
+            (segment_id, note, analyst,
              scenario_type or None,
              adjustment_pct,
              approval_status or "Draft"),
@@ -961,73 +961,78 @@ forecasts with the full historical context, use the **Forecasts** tab.
 
     if st.button("Generate Forecast"):
         with st.spinner("Calling Model Serving endpoint..."):
-            result_df = call_serving_endpoint(horizon)
-
-            if not result_df.empty:
-                # Rename for display
-                display_cols = {
-                    "month_offset": "Month Ahead",
-                    "forecast_mean": "Point Forecast (mean)",
-                    "forecast_lo95": "Lower 95% CI",
-                    "forecast_hi95": "Upper 95% CI",
-                }
-                display_df = result_df.rename(columns={k: v for k, v in display_cols.items() if k in result_df.columns})
-
-                # Numeric formatting
-                for col in display_df.columns:
-                    if col != "Month Ahead":
-                        display_df[col] = pd.to_numeric(display_df[col], errors='coerce').round(1)
-
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-                # Visualise the forecast
-                if all(c in result_df.columns for c in ["month_offset", "forecast_mean", "forecast_lo95", "forecast_hi95"]):
-                    result_df["forecast_mean"] = pd.to_numeric(result_df["forecast_mean"], errors='coerce')
-                    result_df["forecast_lo95"] = pd.to_numeric(result_df["forecast_lo95"], errors='coerce')
-                    result_df["forecast_hi95"] = pd.to_numeric(result_df["forecast_hi95"], errors='coerce')
-
-                    fig4 = go.Figure()
-                    fig4.add_trace(go.Scatter(
-                        x=result_df["month_offset"], y=result_df["forecast_mean"],
-                        mode="lines+markers", name="Point forecast",
-                        line=dict(color="#FF3419"),
-                        hovertemplate="Month +%{x}<br>Forecast: %{y:,.1f}<extra></extra>",
-                    ))
-                    fig4.add_trace(go.Scatter(
-                        x=pd.concat([result_df["month_offset"], result_df["month_offset"][::-1]]),
-                        y=pd.concat([result_df["forecast_hi95"], result_df["forecast_lo95"][::-1]]),
-                        fill="toself", fillcolor="rgba(255,52,25,0.15)",
-                        line=dict(color="rgba(255,0,0,0)"),
-                        name="95% prediction interval",
-                        hoverinfo="skip",
-                    ))
-                    fig4.update_layout(
-                        title=f"SARIMA On-Demand Forecast — {horizon}-Month Horizon",
-                        xaxis_title="Months Ahead",
-                        yaxis_title="Forecast Claims Count",
-                        height=360,
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    )
-                    st.plotly_chart(fig4, use_container_width=True)
-
-                    # Flag widening CI
-                    ci_width_start = float(result_df["forecast_hi95"].iloc[0] - result_df["forecast_lo95"].iloc[0])
-                    ci_width_end   = float(result_df["forecast_hi95"].iloc[-1] - result_df["forecast_lo95"].iloc[-1])
-                    if ci_width_end > ci_width_start * 1.5:
-                        st.info(
-                            f"The 95% interval widens from ±{ci_width_start/2:,.0f} at month 1 "
-                            f"to ±{ci_width_end/2:,.0f} at month {horizon}, reflecting "
-                            "increasing uncertainty at longer horizons — expected behaviour for ARIMA models."
-                        )
-
-                st.download_button(
-                    "Download CSV",
-                    result_df.to_csv(index=False),
-                    file_name=f"sarima_forecast_{horizon}m.csv",
-                    mime="text/csv",
-                )
+            _fetched = call_serving_endpoint(horizon)
+            if not _fetched.empty:
+                st.session_state["ondemand_result"] = _fetched
+                st.session_state["ondemand_horizon"] = horizon
             else:
                 st.warning("Endpoint not available — start the Model Serving endpoint from Module 5")
+
+    result_df = st.session_state.get("ondemand_result", pd.DataFrame())
+    _display_horizon = st.session_state.get("ondemand_horizon", horizon)
+    if not result_df.empty:
+        # Rename for display
+        display_cols = {
+            "month_offset": "Month Ahead",
+            "forecast_mean": "Point Forecast (mean)",
+            "forecast_lo95": "Lower 95% CI",
+            "forecast_hi95": "Upper 95% CI",
+        }
+        display_df = result_df.rename(columns={k: v for k, v in display_cols.items() if k in result_df.columns})
+
+        # Numeric formatting
+        for col in display_df.columns:
+            if col != "Month Ahead":
+                display_df[col] = pd.to_numeric(display_df[col], errors='coerce').round(1)
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Visualise the forecast
+        if all(c in result_df.columns for c in ["month_offset", "forecast_mean", "forecast_lo95", "forecast_hi95"]):
+            result_df["forecast_mean"] = pd.to_numeric(result_df["forecast_mean"], errors='coerce')
+            result_df["forecast_lo95"] = pd.to_numeric(result_df["forecast_lo95"], errors='coerce')
+            result_df["forecast_hi95"] = pd.to_numeric(result_df["forecast_hi95"], errors='coerce')
+
+            fig4 = go.Figure()
+            fig4.add_trace(go.Scatter(
+                x=result_df["month_offset"], y=result_df["forecast_mean"],
+                mode="lines+markers", name="Point forecast",
+                line=dict(color="#FF3419"),
+                hovertemplate="Month +%{x}<br>Forecast: %{y:,.1f}<extra></extra>",
+            ))
+            fig4.add_trace(go.Scatter(
+                x=pd.concat([result_df["month_offset"], result_df["month_offset"][::-1]]),
+                y=pd.concat([result_df["forecast_hi95"], result_df["forecast_lo95"][::-1]]),
+                fill="toself", fillcolor="rgba(255,52,25,0.15)",
+                line=dict(color="rgba(255,0,0,0)"),
+                name="95% prediction interval",
+                hoverinfo="skip",
+            ))
+            fig4.update_layout(
+                title=f"SARIMA On-Demand Forecast — {_display_horizon}-Month Horizon",
+                xaxis_title="Months Ahead",
+                yaxis_title="Forecast Claims Count",
+                height=360,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+
+            # Flag widening CI
+            ci_width_start = float(result_df["forecast_hi95"].iloc[0] - result_df["forecast_lo95"].iloc[0])
+            ci_width_end   = float(result_df["forecast_hi95"].iloc[-1] - result_df["forecast_lo95"].iloc[-1])
+            if ci_width_end > ci_width_start * 1.5:
+                st.info(
+                    f"The 95% interval widens from ±{ci_width_start/2:,.0f} at month 1 "
+                    f"to ±{ci_width_end/2:,.0f} at month {_display_horizon}, reflecting "
+                    "increasing uncertainty at longer horizons — expected behaviour for ARIMA models."
+                )
+
+        st.download_button(
+            "Download CSV",
+            result_df.to_csv(index=False),
+            file_name=f"sarima_forecast_{_display_horizon}m.csv",
+            mime="text/csv",
+        )
 
 # ── Tab 4: Scenario Analysis ──────────────────────────────────────────────────
 with tab4:
@@ -1128,114 +1133,116 @@ in the request — enabling analysts to run stress scenarios without modifying o
             "copula_df":        copula_df_val,
         }
         with st.spinner(f"Running Monte Carlo ({n_scen:,} scenarios)..."):
-            _result = call_monte_carlo_endpoint(_scenario)
-
-        if _result:
-            st.success("Simulation complete")
-            st.divider()
-
-            # ── Risk metrics comparison ───────────────────────────────────────
-            st.markdown("#### Results: Scenario vs Baseline")
-
-            _b = _baseline_summary  # Series from load_monte_carlo_summary()
-
-            def _delta(scenario_val, baseline_val):
-                """Return delta string (e.g., '+$2.3M') for metric display."""
-                if baseline_val and baseline_val != 0:
-                    d = scenario_val - float(baseline_val)
-                    return f"{'+' if d >= 0 else ''}${d:.1f}M"
-                return None
-
-            rc1, rc2, rc3, rc4 = st.columns(4)
-            rc1.metric(
-                "Expected Loss",
-                f"${_result['expected_loss_M']:.1f}M",
-                delta=_delta(_result['expected_loss_M'], _b.get('expected_loss', 0)),
-                help="Mean portfolio loss across all simulated scenarios.",
-            )
-            rc2.metric(
-                "VaR (99%)",
-                f"${_result['var_99_M']:.1f}M",
-                delta=_delta(_result['var_99_M'], _b.get('var_99', 0)),
-                help="1-in-100 year loss level.",
-            )
-            rc3.metric(
-                "VaR (99.5%) — SCR",
-                f"${_result['var_995_M']:.1f}M",
-                delta=_delta(_result['var_995_M'], _b.get('var_995', 0)),
-                help="Solvency II SCR calibration point (1-in-200 year).",
-            )
-            rc4.metric(
-                "CVaR (99%)",
-                f"${_result['cvar_99_M']:.1f}M",
-                delta=_delta(_result['cvar_99_M'], _b.get('cvar_99', 0)),
-                help="Expected loss in the worst 1% of scenarios.",
-            )
-
-            # ── Waterfall chart: Scenario vs Baseline ─────────────────────────
-            import plotly.graph_objects as go
-
-            _metrics_labels = ["E[Loss]", "VaR 95%", "VaR 99%", "VaR 99.5%\n(SCR)", "CVaR 99%"]
-            _baseline_vals = [
-                float(_b.get("expected_loss", 0)),
-                float(_b.get("var_99", 0)) * 0.85,   # approximate VaR95 from VaR99
-                float(_b.get("var_99", 0)),
-                float(_b.get("var_995", 0)),
-                float(_b.get("cvar_99", 0)),
-            ]
-            _scenario_vals = [
-                _result["expected_loss_M"],
-                _result["var_95_M"],
-                _result["var_99_M"],
-                _result["var_995_M"],
-                _result["cvar_99_M"],
-            ]
-
-            _fig_cmp = go.Figure()
-            _fig_cmp.add_trace(go.Bar(
-                name="Baseline (pre-computed)",
-                x=_metrics_labels,
-                y=_baseline_vals,
-                marker_color="rgba(31,119,180,0.7)",
-                hovertemplate="%{x}<br>Baseline: $%{y:.1f}M<extra></extra>",
-            ))
-            _fig_cmp.add_trace(go.Bar(
-                name="Scenario (on-demand)",
-                x=_metrics_labels,
-                y=_scenario_vals,
-                marker_color="rgba(214,39,40,0.7)",
-                hovertemplate="%{x}<br>Scenario: $%{y:.1f}M<extra></extra>",
-            ))
-            _fig_cmp.update_layout(
-                title="Scenario vs Baseline Risk Metrics",
-                yaxis_title="Annual Portfolio Loss ($M)",
-                barmode="group",
-                height=380,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(_fig_cmp, use_container_width=True)
-
-            # ── Raw metrics table ──────────────────────────────────────────────
-            with st.expander("📋 Full scenario metrics"):
-                _display = {
-                    "Metric": ["Expected Loss", "VaR (95%)", "VaR (99%)", "VaR (99.5% SCR)", "CVaR (99%)", "Max Loss"],
-                    "Scenario ($M)": [
-                        f"${_result['expected_loss_M']:.2f}",
-                        f"${_result['var_95_M']:.2f}",
-                        f"${_result['var_99_M']:.2f}",
-                        f"${_result['var_995_M']:.2f}",
-                        f"${_result['cvar_99_M']:.2f}",
-                        f"${_result['max_loss_M']:.2f}",
-                    ],
-                    "Copula": [_result.get("copula", ""), "", "", "", "", ""],
-                    "Scenarios": [f"{int(_result.get('n_scenarios_used', n_scen)):,}", "", "", "", "", ""],
-                }
-                st.dataframe(pd.DataFrame(_display), use_container_width=True, hide_index=True)
+            _fetched = call_monte_carlo_endpoint(_scenario)
+        if _fetched:
+            st.session_state["scenario_result"] = _fetched
         else:
             st.warning(
                 "Monte Carlo endpoint not available. "
                 "Start it from Module 6 or wait for the setup job to complete."
             )
+
+    _result = st.session_state.get("scenario_result")
+    if _result:
+        st.success("Simulation complete")
+        st.divider()
+
+        # ── Risk metrics comparison ───────────────────────────────────────
+        st.markdown("#### Results: Scenario vs Baseline")
+
+        _b = _baseline_summary  # Series from load_monte_carlo_summary()
+
+        def _delta(scenario_val, baseline_val):
+            if baseline_val and baseline_val != 0:
+                d = scenario_val - float(baseline_val)
+                return f"{'+' if d >= 0 else ''}${d:.1f}M"
+            return None
+
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric(
+            "Expected Loss",
+            f"${_result['expected_loss_M']:.1f}M",
+            delta=_delta(_result['expected_loss_M'], _b.get('expected_loss', 0)),
+            help="Mean portfolio loss across all simulated scenarios.",
+        )
+        rc2.metric(
+            "VaR (99%)",
+            f"${_result['var_99_M']:.1f}M",
+            delta=_delta(_result['var_99_M'], _b.get('var_99', 0)),
+            help="1-in-100 year loss level.",
+        )
+        rc3.metric(
+            "VaR (99.5%) — SCR",
+            f"${_result['var_995_M']:.1f}M",
+            delta=_delta(_result['var_995_M'], _b.get('var_995', 0)),
+            help="Solvency II SCR calibration point (1-in-200 year).",
+        )
+        rc4.metric(
+            "CVaR (99%)",
+            f"${_result['cvar_99_M']:.1f}M",
+            delta=_delta(_result['cvar_99_M'], _b.get('cvar_99', 0)),
+            help="Expected loss in the worst 1% of scenarios.",
+        )
+
+        # ── Waterfall chart: Scenario vs Baseline ─────────────────────────
+        import plotly.graph_objects as go
+
+        _metrics_labels = ["E[Loss]", "VaR 95%", "VaR 99%", "VaR 99.5%\n(SCR)", "CVaR 99%"]
+        _baseline_vals = [
+            float(_b.get("expected_loss", 0)),
+            float(_b.get("var_99", 0)) * 0.85,   # approximate VaR95 from VaR99
+            float(_b.get("var_99", 0)),
+            float(_b.get("var_995", 0)),
+            float(_b.get("cvar_99", 0)),
+        ]
+        _scenario_vals = [
+            _result["expected_loss_M"],
+            _result["var_95_M"],
+            _result["var_99_M"],
+            _result["var_995_M"],
+            _result["cvar_99_M"],
+        ]
+
+        _fig_cmp = go.Figure()
+        _fig_cmp.add_trace(go.Bar(
+            name="Baseline (pre-computed)",
+            x=_metrics_labels,
+            y=_baseline_vals,
+            marker_color="rgba(31,119,180,0.7)",
+            hovertemplate="%{x}<br>Baseline: $%{y:.1f}M<extra></extra>",
+        ))
+        _fig_cmp.add_trace(go.Bar(
+            name="Scenario (on-demand)",
+            x=_metrics_labels,
+            y=_scenario_vals,
+            marker_color="rgba(214,39,40,0.7)",
+            hovertemplate="%{x}<br>Scenario: $%{y:.1f}M<extra></extra>",
+        ))
+        _fig_cmp.update_layout(
+            title="Scenario vs Baseline Risk Metrics",
+            yaxis_title="Annual Portfolio Loss ($M)",
+            barmode="group",
+            height=380,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(_fig_cmp, use_container_width=True)
+
+        # ── Raw metrics table ──────────────────────────────────────────────
+        with st.expander("📋 Full scenario metrics"):
+            _display = {
+                "Metric": ["Expected Loss", "VaR (95%)", "VaR (99%)", "VaR (99.5% SCR)", "CVaR (99%)", "Max Loss"],
+                "Scenario ($M)": [
+                    f"${_result['expected_loss_M']:.2f}",
+                    f"${_result['var_95_M']:.2f}",
+                    f"${_result['var_99_M']:.2f}",
+                    f"${_result['var_995_M']:.2f}",
+                    f"${_result['cvar_99_M']:.2f}",
+                    f"${_result['max_loss_M']:.2f}",
+                ],
+                "Copula": [_result.get("copula", ""), "", "", "", "", ""],
+                "Scenarios": [f"{int(_result.get('n_scenarios_used', n_scen)):,}", "", "", "", "", ""],
+            }
+            st.dataframe(pd.DataFrame(_display), use_container_width=True, hide_index=True)
 
 # ── Tab 5: Catastrophe Scenarios ──────────────────────────────────────────────
 with tab5:
