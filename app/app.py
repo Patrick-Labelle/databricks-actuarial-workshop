@@ -239,6 +239,45 @@ def load_var_timeline():
                 df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
+def load_garch_volatility(segment_id: str):
+    """Load GARCH conditional volatility for a segment."""
+    df = execute_sql(f"""
+        SELECT month, loss_ratio, cond_volatility, forecast_vol_1m, forecast_vol_12m
+        FROM {CATALOG}.{SCHEMA}.garch_volatility
+        WHERE segment_id = '{segment_id}' AND record_type = 'actual'
+        ORDER BY month
+    """)
+    if not df.empty:
+        for col in ['loss_ratio', 'cond_volatility', 'forecast_vol_1m', 'forecast_vol_12m']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+def load_regional_forecast():
+    """Load regional claims forecast from Module 4."""
+    df = execute_sql(f"""
+        SELECT region, forecast_month, total_forecast_claims
+        FROM {CATALOG}.{SCHEMA}.regional_claims_forecast
+        ORDER BY region, forecast_month
+    """)
+    if not df.empty:
+        df['total_forecast_claims'] = pd.to_numeric(df['total_forecast_claims'], errors='coerce')
+    return df
+
+def load_reserve_triangle():
+    """Load the loss development triangle from the DLT pipeline."""
+    df = execute_sql(f"""
+        SELECT segment_id, product_line, region, accident_month, dev_lag,
+               cumulative_paid, cumulative_incurred, case_reserve
+        FROM {CATALOG}.{SCHEMA}.gold_reserve_triangle
+        ORDER BY segment_id, accident_month, dev_lag
+    """)
+    if not df.empty:
+        for col in ['cumulative_paid', 'cumulative_incurred', 'case_reserve', 'dev_lag']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
 def call_serving_endpoint(horizon: int) -> pd.DataFrame:
     """Call SARIMA Model Serving endpoint via Databricks SDK."""
     w = _get_workspace_client()
@@ -584,7 +623,7 @@ the Unity Catalog Model Registry.
 st.title("📊 Insurance Portfolio Risk Intelligence")
 st.caption("Powered by Databricks | Claims Forecasting · Capital Planning · Catastrophe Analysis")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Claims Forecast", "💰 Capital Requirements", "⚡ Quick Forecast", "🎲 Stress Testing", "🌪️ Catastrophe Events"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Claims Forecast", "💰 Capital Requirements", "⚡ Quick Forecast", "🎲 Stress Testing", "🌪️ Catastrophe & Reserves"])
 
 # ── Tab 1: Segment Forecasts ──────────────────────────────────────────────────
 with tab1:
@@ -713,6 +752,33 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                         f"±{half_width:,}",
                         help="Average margin of uncertainty around the monthly forecast. Wider ranges reflect higher uncertainty — normal as the forecast extends further into the future."
                     )
+
+                # GARCH volatility overlay
+                with st.expander("📊 GARCH Volatility Overlay", expanded=False):
+                    st.caption(
+                        "Conditional volatility from GARCH(1,1) — shows how loss ratio variability "
+                        "clusters over time. Higher volatility periods indicate greater uncertainty in claims."
+                    )
+                    garch_df = load_garch_volatility(selected)
+                    if not garch_df.empty:
+                        import plotly.graph_objects as go
+                        fig_garch = go.Figure()
+                        fig_garch.add_trace(go.Scatter(
+                            x=garch_df["month"], y=garch_df["cond_volatility"],
+                            mode="lines", name="Conditional Volatility",
+                            line=dict(color="#FF6B35", width=2),
+                            hovertemplate="<b>%{x}</b><br>Volatility: %{y:.3f}<extra></extra>",
+                        ))
+                        fig_garch.update_layout(
+                            title=f"{selected} — GARCH(1,1) Conditional Volatility",
+                            xaxis_title="Month",
+                            yaxis_title="Conditional Volatility (loss ratio log-returns)",
+                            height=300,
+                            hovermode="x unified",
+                        )
+                        st.plotly_chart(fig_garch, use_container_width=True)
+                    else:
+                        st.info("GARCH volatility data not yet available. Run Module 4 to generate.")
 
                 with st.expander("📋 Raw forecast data"):
                     st.markdown("""
@@ -1444,3 +1510,90 @@ with tab5:
         st.dataframe(_cat_history, use_container_width=True, hide_index=True)
     else:
         st.info("No catastrophe scenarios submitted yet. Use the form above to run one.")
+
+    # ── Section 4: Regional Forecast Context ─────────────────────────────────
+    st.divider()
+    st.markdown("### Regional Claims Forecast")
+    st.caption(
+        "Geographic breakdown of projected claims over the next 12 months — shows where "
+        "exposure is concentrated and helps contextualize catastrophe stress scenarios."
+    )
+    _reg_forecast = load_regional_forecast()
+    if not _reg_forecast.empty:
+        import plotly.express as px
+        # Pivot to get regions as rows, months as value
+        _reg_total = _reg_forecast.groupby("region")["total_forecast_claims"].sum().reset_index()
+        _reg_total = _reg_total.sort_values("total_forecast_claims", ascending=True)
+        _fig_reg = px.bar(
+            _reg_total, x="total_forecast_claims", y="region",
+            orientation="h",
+            title="12-Month Cumulative Projected Claims by Region",
+            labels={"total_forecast_claims": "Total Projected Claims", "region": "Region"},
+        )
+        _fig_reg.update_layout(height=400)
+        st.plotly_chart(_fig_reg, use_container_width=True)
+
+        with st.expander("📋 Regional forecast detail"):
+            st.dataframe(_reg_forecast, use_container_width=True, hide_index=True)
+    else:
+        st.info("Regional forecast data not yet available. Run Module 4 (Ray target) to generate.")
+
+    # ── Section 5: Reserve Development Triangle ──────────────────────────────
+    st.divider()
+    st.markdown("### Loss Development Triangle")
+    st.caption(
+        "Standard actuarial exhibit showing how claims reserves develop over time. "
+        "Each row is an accident month; columns show cumulative paid at each development lag."
+    )
+    _triangle_data = load_reserve_triangle()
+    if not _triangle_data.empty:
+        # Let user select a product line to view
+        _tri_products = sorted(_triangle_data["product_line"].unique())
+        _tri_selected = st.selectbox("Product line:", _tri_products, key="tri_prod")
+        _tri_filtered = _triangle_data[_triangle_data["product_line"] == _tri_selected]
+
+        # Aggregate across regions for the selected product line
+        _tri_agg = (
+            _tri_filtered
+            .groupby(["accident_month", "dev_lag"])
+            .agg({"cumulative_paid": "sum", "cumulative_incurred": "sum", "case_reserve": "sum"})
+            .reset_index()
+        )
+
+        # Pivot to triangle format: accident_month × dev_lag → cumulative_paid
+        if not _tri_agg.empty:
+            _pivot = _tri_agg.pivot_table(
+                index="accident_month", columns="dev_lag",
+                values="cumulative_paid", aggfunc="sum",
+            )
+            _pivot.columns = [f"Lag {int(c)}" for c in _pivot.columns]
+            _pivot.index.name = "Accident Month"
+
+            # Format as currency
+            _display_tri = _pivot.map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+            st.dataframe(_display_tri, use_container_width=True)
+
+            # Development factor summary
+            with st.expander("📊 Development Factors"):
+                st.caption(
+                    "Link ratios (cumulative paid at lag N / cumulative paid at lag N-1) — "
+                    "used by actuaries to estimate ultimate losses via the chain ladder method."
+                )
+                _dev_factors = {}
+                _cols = sorted(_tri_agg["dev_lag"].unique())
+                for i in range(len(_cols) - 1):
+                    _lag_from = _cols[i]
+                    _lag_to = _cols[i + 1]
+                    _from_vals = _tri_agg[_tri_agg["dev_lag"] == _lag_from].set_index("accident_month")["cumulative_paid"]
+                    _to_vals = _tri_agg[_tri_agg["dev_lag"] == _lag_to].set_index("accident_month")["cumulative_paid"]
+                    _common = _from_vals.index.intersection(_to_vals.index)
+                    if len(_common) > 0:
+                        _ratios = _to_vals[_common] / _from_vals[_common].replace(0, np.nan)
+                        _dev_factors[f"{int(_lag_from)}→{int(_lag_to)}"] = round(_ratios.mean(), 3)
+                if _dev_factors:
+                    st.dataframe(
+                        pd.DataFrame([_dev_factors], index=["Avg Link Ratio"]),
+                        use_container_width=True,
+                    )
+    else:
+        st.info("Reserve triangle data not yet available. Run the DLT pipeline to generate.")

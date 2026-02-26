@@ -115,15 +115,21 @@ After running all modules, the following assets will exist in your workspace:
 
 | Table | Created By | Description |
 |-------|------------|-------------|
-| `bronze_policy_cdc` | Module 1 (DLT) | Raw CDC policy events, append-only |
-| `silver_policies` | Module 1 (DLT) | SCD Type 2 current + history (Apply Changes) |
-| `gold_segment_monthly_stats` | Module 1 (DLT) | Aggregated monthly loss stats by segment |
+| `reserve_development_raw` | Module 1 (generator) | Synthetic reserve CDC source |
+| `bronze_reserve_cdc` | Module 1 (DLT) | Raw reserve development CDC, append-only |
+| `silver_reserves` | Module 1 (DLT) | SCD Type 2 reserve history (Apply Changes) |
+| `gold_reserve_triangle` | Module 1 (DLT) | Loss development triangle (accident month × dev lag) |
+| `bronze_claims` | Module 1 (DLT) | Raw claim events, append-only |
+| `gold_claims_monthly` | Module 1 (DLT) | Segment × month claims aggregate (40 segments × 72 months) |
 | `silver_rolling_features` | Module 2 | Rolling means, volatility features per segment |
-| `segment_monthly_features` | Module 3 | UC Feature Table (with timestamp key) |
-| `sarima_forecasts` | Module 4 | SARIMA forecasts + confidence intervals for all 20 segments |
-| `garch_volatility_metrics` | Module 4 | GARCH volatility estimates per segment |
-| `monte_carlo_results` | Module 4 | Monte Carlo simulation paths, VaR, CVaR |
-| `claims_time_series` | Bonus | Monthly claims time series used by the Databricks App |
+| `segment_monthly_features` | Module 3 | UC Feature Table (feeds Module 4 SARIMAX as exog vars) |
+| `sarima_forecasts` | Module 4 | SARIMAX forecasts + confidence intervals for all 40 segments |
+| `garch_volatility` | Module 4 | GARCH(1,1) volatility estimates → feeds MC CVs |
+| `monte_carlo_results` | Module 4 | Monte Carlo simulation (GARCH-calibrated CVs), VaR, CVaR |
+| `reserve_validation` | Module 4 | Reserve adequacy: SARIMA forecasts vs. actual development |
+| `regional_claims_forecast` | Module 4 | Regional breakdown of projected claims |
+| `portfolio_risk_timeline` | Module 4 | 12-month SARIMA-driven VaR evolution |
+| `stress_test_scenarios` | Module 4 | Stress test results (CAT, systemic, inflation) |
 
 ### MLflow
 

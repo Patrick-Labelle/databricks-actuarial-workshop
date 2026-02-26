@@ -108,15 +108,15 @@ standard OAuth JWTs issued by the workspace OIDC endpoint — internal cluster t
 are not accepted (see [Lakebase authentication](#lakebase-authentication) below).
 
 The setup job runs the following tasks in order:
-1. **Generate source data** — synthetic policy CDC events + claim incidents → `policy_cdc_raw`, `claims_events_raw`
+1. **Generate source data** — synthetic reserve development CDC + claim incidents → `reserve_development_raw`, `claims_events_raw`
 2. **Fetch macro data** (parallel after task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
 3. **Run DLT pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
-   - Policy: `bronze_policy_cdc` → `silver_policies` → `gold_segment_monthly_stats`
+   - Reserves: `bronze_reserve_cdc` → `silver_reserves` → `gold_reserve_triangle` (loss development triangle)
    - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 72 months)
    - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
-4. **Build rolling features** — window aggregates and rolling statistics per segment
-5. **Register Feature Store + Online Table** — leakage-free training set assembly and real-time lookup table
-6. **Fit SARIMAX / GARCH / Monte Carlo** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` from DLT; joins real StatCan macro exogenous variables; compares SARIMA vs SARIMAX MAPE
+4. **Build rolling features** — window aggregates and rolling statistics per segment from `gold_claims_monthly`
+5. **Register Feature Store + Online Table** — leakage-free training set assembly and real-time lookup table; features feed Module 4 SARIMAX as exogenous variables
+6. **Fit SARIMAX / GARCH / Monte Carlo** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` + Feature Store features + `gold_reserve_triangle`; GARCH-derived CVs feed Monte Carlo; reserve validation compares forecasts to actual development
 7a. **Register SARIMA model** + create Model Serving endpoint
 7b. **Register Monte Carlo model** + create CPU endpoint — parallel with 7a
 8. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal

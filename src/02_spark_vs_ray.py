@@ -53,10 +53,10 @@ SCHEMA   = dbutils.widgets.get("schema")
 RUN_RAY  = dbutils.widgets.get("run_ray")
 
 # Load segment data from Module 1's Gold table; fall back to synthetic data if unavailable.
-# Note: gold_segment_monthly_stats is a DLT materialized view — reading it in a regular
+# Note: gold_claims_monthly is a DLT materialized view — reading it in a regular
 # notebook context works via Delta, but we guard with try/except for robustness.
 try:
-    _gold_tbl = f"{CATALOG}.{SCHEMA}.gold_segment_monthly_stats"
+    _gold_tbl = f"{CATALOG}.{SCHEMA}.gold_claims_monthly"
     gold_df = spark.table(_gold_tbl)
     # Trigger a lightweight Spark action to verify the table is readable before proceeding
     _schema_ok = gold_df.schema  # schema-only fetch, no data scan
@@ -74,26 +74,37 @@ if not USE_GOLD:
 
     np.random.seed(42)
     PRODUCT_LINES = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
-    REGIONS       = ["Ontario", "Quebec", "British_Columbia", "Alberta", "Atlantic"]
-    MONTHS        = pd.date_range("2019-01-01", periods=60, freq="MS")
+    REGIONS       = [
+        "Ontario", "Quebec", "British_Columbia", "Alberta",
+        "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
+        "Prince_Edward_Island", "Newfoundland",
+    ]
+    MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")
     SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
     BASE_CLAIMS   = {"Personal_Auto":450,"Commercial_Auto":180,"Homeowners":320,"Commercial_Property":90}
-    REGION_MULT   = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,"Atlantic":0.7}
+    REGION_MULT   = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,
+                     "Manitoba":0.85,"Saskatchewan":0.80,"New_Brunswick":0.70,
+                     "Nova_Scotia":0.75,"Prince_Edward_Island":0.60,"Newfoundland":0.65}
 
     rows = []
     for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
         base = BASE_CLAIMS[prod] * REGION_MULT[region]
         for i, m in enumerate(MONTHS):
-            claims = max(0, base * (1+0.003*i) * SEASONALITY[m.month] * (1+np.random.normal(0,0.08)))
+            claims_count = max(0, base * (1+0.003*i) * SEASONALITY[m.month] * (1+np.random.normal(0,0.08)))
+            avg_sev = np.random.uniform(5000, 12000)
+            total_incurred = claims_count * avg_sev
+            earned_premium = total_incurred / np.random.uniform(0.55, 0.80)
             rows.append({
                 "segment_id": f"{prod}__{region}", "product_line": prod, "region": region,
-                "month": m.date(), "claims_estimate": int(round(claims)),
-                "avg_loss_ratio": round(np.random.uniform(0.55, 0.80), 4),
-                "total_premium": round(base * np.random.uniform(3.2, 3.8), 2),
+                "month": m.date(), "claims_count": int(round(claims_count)),
+                "total_incurred": round(total_incurred, 2),
+                "avg_severity": round(avg_sev, 2),
+                "earned_premium": round(earned_premium, 2),
+                "loss_ratio": round(total_incurred / earned_premium, 4),
             })
 
     gold_df = spark.createDataFrame(pd.DataFrame(rows))
-    print(f"Generated synthetic data: {len(rows)} rows")
+    print(f"Generated synthetic data: {len(rows)} rows (40 segments × 72 months)")
 
 if not RUN_RAY == "skip":  # Skip display in automated job runs
     display(gold_df.limit(20))
@@ -132,7 +143,7 @@ def compute_rolling_features_pandas(pdf: pd.DataFrame) -> pd.DataFrame:
     Originally written for single-segment, single-node analysis.
     """
     pdf = pdf.sort_values("month").copy()
-    claims = pdf["claims_estimate"].astype(float)
+    claims = pdf["claims_count"].astype(float)
 
     pdf["rolling_3m_mean"]  = claims.rolling(3, min_periods=1).mean()
     pdf["rolling_6m_mean"]  = claims.rolling(6, min_periods=1).mean()
@@ -146,7 +157,7 @@ def compute_rolling_features_pandas(pdf: pd.DataFrame) -> pd.DataFrame:
 
 result_single = compute_rolling_features_pandas(one_segment_pdf)
 print(f"Single-segment result: {len(result_single)} rows")
-print(result_single[["segment_id", "month", "claims_estimate", "rolling_3m_mean", "mom_change_pct"]].tail(5).to_string())
+print(result_single[["segment_id", "month", "claims_count", "rolling_3m_mean", "mom_change_pct"]].tail(5).to_string())
 
 # COMMAND ----------
 
@@ -163,19 +174,19 @@ seg_time_win = Window.partitionBy("segment_id").orderBy("month")
 
 features_spark_df = (
     gold_df
-    .withColumn("rolling_3m_mean",  F.avg("claims_estimate").over(seg_time_win.rowsBetween(-2, 0)))
-    .withColumn("rolling_6m_mean",  F.avg("claims_estimate").over(seg_time_win.rowsBetween(-5, 0)))
-    .withColumn("rolling_12m_mean", F.avg("claims_estimate").over(seg_time_win.rowsBetween(-11, 0)))
-    .withColumn("_prev1",   F.lag("claims_estimate", 1).over(seg_time_win))
-    .withColumn("_prev12",  F.lag("claims_estimate", 12).over(seg_time_win))
+    .withColumn("rolling_3m_mean",  F.avg("claims_count").over(seg_time_win.rowsBetween(-2, 0)))
+    .withColumn("rolling_6m_mean",  F.avg("claims_count").over(seg_time_win.rowsBetween(-5, 0)))
+    .withColumn("rolling_12m_mean", F.avg("claims_count").over(seg_time_win.rowsBetween(-11, 0)))
+    .withColumn("_prev1",   F.lag("claims_count", 1).over(seg_time_win))
+    .withColumn("_prev12",  F.lag("claims_count", 12).over(seg_time_win))
     # Guard against divide-by-zero (Photon + ANSI mode raises ArithmeticException on DBX Serverless)
     .withColumn("mom_change_pct",
         F.when(F.col("_prev1").isNotNull() & (F.col("_prev1") != 0),
-               (F.col("claims_estimate") - F.col("_prev1")) / F.col("_prev1") * 100
+               (F.col("claims_count") - F.col("_prev1")) / F.col("_prev1") * 100
         ).otherwise(F.lit(0.0)))
     .withColumn("yoy_change_pct",
         F.when(F.col("_prev12").isNotNull() & (F.col("_prev12") != 0),
-               (F.col("claims_estimate") - F.col("_prev12")) / F.col("_prev12") * 100
+               (F.col("claims_count") - F.col("_prev12")) / F.col("_prev12") * 100
         ).otherwise(F.lit(0.0)))
     .drop("_prev1", "_prev12")
 )
@@ -189,9 +200,9 @@ display(features_spark_df.limit(30))
 # import pyspark.pandas as ps
 # ps.set_option("compute.ops_on_diff_frames", True)
 # ps_df = gold_df.to_pandas_on_spark().sort_values(["segment_id", "month"])
-# ps_df["rolling_3m_mean"]  = ps_df.groupby("segment_id")["claims_estimate"].transform(
+# ps_df["rolling_3m_mean"]  = ps_df.groupby("segment_id")["claims_count"].transform(
 #     lambda x: x.rolling(3, min_periods=1).mean())
-# ps_df["mom_change_pct"]   = ps_df.groupby("segment_id")["claims_estimate"].transform(
+# ps_df["mom_change_pct"]   = ps_df.groupby("segment_id")["claims_count"].transform(
 #     lambda x: x.pct_change().fillna(0) * 100)
 # features_spark_df = ps_df.to_spark()
 
@@ -270,7 +281,7 @@ def fit_trend_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 
     segment_id = pdf["segment_id"].iloc[0]
     pdf = pdf.sort_values("month").reset_index(drop=True)
-    y = pdf["claims_estimate"].astype(float).values
+    y = pdf["claims_count"].astype(float).values
     n = len(y)
     t = np.arange(n)
 
@@ -302,13 +313,13 @@ def fit_trend_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Distribute Across All 20 Segments Simultaneously
+# MAGIC ### Distribute Across All 40 Segments Simultaneously
 
 # COMMAND ----------
 
 trend_results = (
     gold_df
-    .select("segment_id", "month", "claims_estimate")
+    .select("segment_id", "month", "claims_count")
     .groupby("segment_id")
     .applyInPandas(fit_trend_per_segment, schema=TREND_SCHEMA)
 )
@@ -408,10 +419,10 @@ else:
 
 # Collect data to driver for distribution to Ray workers (small dataset — only 60 months per segment)
 segment_data = {
-    row_s["segment_id"]: [r["claims_estimate"] for r in
+    row_s["segment_id"]: [r["claims_count"] for r in
         gold_df.filter(F.col("segment_id") == row_s["segment_id"])
                .orderBy("month")
-               .select("claims_estimate").collect()]
+               .select("claims_count").collect()]
     for row_s in gold_df.select("segment_id").distinct().limit(4).collect()  # Top 4 segments for demo
 }
 
@@ -489,14 +500,8 @@ if RAY_AVAILABLE:
     print(f"\nBest ARIMA orders per segment:")
     print(best_per_segment.to_string(index=False))
 
-    # Save to Delta
-    ray_results_spark = spark.createDataFrame(results_df[results_df["aic"] < float("inf")])
-    (ray_results_spark.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(f"{CATALOG}.{SCHEMA}.arima_grid_search_results"))
-    print(f"\nSaved to {CATALOG}.{SCHEMA}.arima_grid_search_results")
+    # Results displayed interactively — no need to persist since this is a technique demo.
+    # The SARIMA model fitting in Module 04 uses its own optimized orders.
 
 else:
     # ── Single-node fallback ──────────────────────────────────────────────────
@@ -532,6 +537,7 @@ else:
 # MAGIC | Monte Carlo simulation | Ray tasks | Task-parallel; pure Python; millions of trials |
 # MAGIC | SQL/aggregation queries | SQL Warehouses + Photon | Vectorized columnar engine; 10x+ speedup |
 # MAGIC
-# MAGIC **Next:** Module 3 — now that we have reliable, scaled data and features,
+# MAGIC **Next:** Module 3 — now that we have reliable, scaled data and features across 40 segments,
 # MAGIC let's register them in the Unity Catalog Feature Store with point-in-time correctness.
+# MAGIC The features from `silver_rolling_features` will feed Module 4's SARIMAX models as exogenous variables.
 # MAGIC

@@ -211,14 +211,53 @@ except Exception as _e:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro Exogenous Variables
+# MAGIC ## 2b. Feature Store Integration — Exogenous Variables from Module 3
+# MAGIC
+# MAGIC The Feature Store (`segment_monthly_features`) provides rolling statistical features
+# MAGIC computed in Module 2 and registered in Module 3. These features — rolling means,
+# MAGIC volatility regime, momentum — serve as additional exogenous variables for SARIMAX,
+# MAGIC completing the lineage: `gold_claims_monthly` → Module 2 → Module 3 → Module 4.
+
+# COMMAND ----------
+
+# Load Feature Store features and join to claims data
+try:
+    _fs_table = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
+    fs_features = spark.table(_fs_table)
+    _fs_count = fs_features.count()
+    print(f"segment_monthly_features: {_fs_count:,} rows")
+
+    # Select key features for SARIMAX exogenous variables
+    _fs_cols = ["segment_id", "month", "rolling_3m_mean", "rolling_6m_mean",
+                "coeff_variation_3m", "mom_change_pct", "normalized_premium"]
+    # Only select columns that exist in the feature table
+    _available_fs_cols = [c for c in _fs_cols if c in fs_features.columns]
+    fs_subset = fs_features.select(*_available_fs_cols)
+
+    claims_with_macro = (
+        claims_with_macro
+        .join(fs_subset, on=["segment_id", "month"], how="left")
+    )
+    claims_with_macro.createOrReplaceTempView("claims_with_macro")
+    HAS_FS_FEATURES = _fs_count > 0
+    print(f"Feature Store features joined: {', '.join(_available_fs_cols[2:])}")
+
+except Exception as _fs_err:
+    print(f"Note: segment_monthly_features not available ({_fs_err}).")
+    print("SARIMAX will use macro variables only (no Feature Store exog).")
+    HAS_FS_FEATURES = False
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro + Feature Store Exogenous Variables
 # MAGIC
 # MAGIC ### Strategy
 # MAGIC We use `df.groupby("segment_id").applyInPandas(fit_fn, schema)`.
 # MAGIC
-# MAGIC Each Spark task receives **one segment's pandas DataFrame** (claims + macro joined) and:
+# MAGIC Each Spark task receives **one segment's pandas DataFrame** (claims + macro + features joined) and:
 # MAGIC 1. Fits baseline `SARIMA(1,0,1)(1,1,0,12)` — monthly seasonality, no exog
-# MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` as exog
+# MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` + Feature Store features as exog
 # MAGIC 3. Evaluates out-of-sample MAPE on held-out last 12 months (validation set)
 # MAGIC 4. Refits final model on all 72 months for the 12-month forecast
 # MAGIC 5. Returns a standardized pandas DataFrame with both MAPE metrics for comparison
@@ -269,7 +308,12 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     y      = pdf["claims_count"].astype(float).values
     months = pd.to_datetime(pdf["month"])
 
+    # Exog columns: macro variables + Feature Store features (if available)
     exog_cols = ["unemployment_rate", "hpi_growth"]
+    _fs_exog = ["rolling_3m_mean", "coeff_variation_3m", "mom_change_pct"]
+    for _fc in _fs_exog:
+        if _fc in pdf.columns and not pdf[_fc].isna().all():
+            exog_cols.append(_fc)
 
     # Fill NaN exog values (hpi_growth is NaN for the first month due to lag;
     # forward-fill then back-fill covers edge cases at either end of the series)
@@ -894,11 +938,49 @@ except NameError:
 import numpy as np
 import pandas as pd
 
+# ── GARCH → Monte Carlo Bridge: derive CVs from fitted volatilities ──────────
+# Instead of hardcoded CVs, aggregate GARCH conditional volatilities by line of
+# business to produce data-driven coefficients of variation for the MC simulation.
+# This connects the GARCH output directly to Monte Carlo input.
+_DEFAULT_CV = [0.35, 0.28, 0.42]  # fallback if GARCH results unavailable
+try:
+    _garch_pd = garch_results_df.toPandas()
+    _garch_pd["product_line"] = _garch_pd["segment_id"].str.split("__").str[0]
+
+    # Aggregate conditional volatility by product line → MC segment mapping
+    _garch_vol = (
+        _garch_pd[_garch_pd["cond_volatility"].notna()]
+        .groupby("product_line")["cond_volatility"]
+        .mean()
+    )
+
+    # Map product lines to MC segments (Property, Auto, Liability proxy)
+    _prop_vol = np.mean([_garch_vol.get("Homeowners", 0.35),
+                          _garch_vol.get("Commercial_Property", 0.42)])
+    _auto_vol = np.mean([_garch_vol.get("Personal_Auto", 0.28),
+                          _garch_vol.get("Commercial_Auto", 0.30)])
+    # Liability proxied as average of Property and Auto volatility
+    _liab_vol = 0.5 * (_prop_vol + _auto_vol)
+
+    # Scale GARCH volatility (in log-return %) to CV space (typically 0.1–0.6)
+    # GARCH conditional vol is in % of log-returns; scale to CV by dividing by 100
+    # and applying a floor/ceiling for stability
+    _garch_cvs = np.clip(
+        np.array([_prop_vol, _auto_vol, _liab_vol]) / 100.0 * 3.0,  # empirical scaling
+        0.15, 0.60,
+    ).tolist()
+    print(f"GARCH-derived CVs: Property={_garch_cvs[0]:.3f}, Auto={_garch_cvs[1]:.3f}, Liability={_garch_cvs[2]:.3f}")
+    _MC_USE_GARCH_CV = True
+except (NameError, Exception) as _garch_cv_err:
+    print(f"GARCH CVs not available ({_garch_cv_err}) — using default CVs: {_DEFAULT_CV}")
+    _garch_cvs = _DEFAULT_CV
+    _MC_USE_GARCH_CV = False
+
 # Portfolio parameters (in $M expected annual losses)
 PORTFOLIO = {
     "segments":   ["Property", "Auto", "Liability"],
     "means":      [12.5, 8.3, 5.7],          # Expected annual loss per segment ($M)
-    "cv":         [0.35, 0.28, 0.42],         # Coefficients of variation
+    "cv":         _garch_cvs,                 # GARCH-derived CVs (or defaults)
     "corr_matrix": np.array([                 # Pearson correlations
         [1.00, 0.40, 0.20],
         [0.40, 1.00, 0.30],
@@ -1414,7 +1496,7 @@ else:
     COPULA_DF    = 4
     rng          = np.random.default_rng(42)
     means        = np.array([12.5, 8.3, 5.7])
-    cv           = np.array([0.35, 0.28, 0.42])
+    cv           = np.array(_garch_cvs)  # GARCH-derived CVs (or defaults)
     sigma2       = np.log(1 + cv**2)
     mu_ln        = np.log(means) - sigma2 / 2
     sigma_ln     = np.sqrt(sigma2)
@@ -1472,15 +1554,88 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 6. Reserve Triangle Validation
+# MAGIC
+# MAGIC The loss development triangle from the DLT pipeline (`gold_reserve_triangle`) provides an
+# MAGIC independent check on SARIMA forecasts. We compare the SARIMA-projected incurred claims against
+# MAGIC actual reserve development to assess **reserve adequacy**.
+# MAGIC
+# MAGIC This connects the new CDC pipeline → Module 4, completing the end-to-end lineage.
+
+# COMMAND ----------
+
+try:
+    _triangle_table = f"{CATALOG}.{SCHEMA}.gold_reserve_triangle"
+    triangle_df = spark.table(_triangle_table)
+    _tri_count = triangle_df.count()
+    print(f"gold_reserve_triangle: {_tri_count:,} rows")
+
+    # Aggregate triangle to get latest cumulative incurred per segment × accident month
+    # (use the maximum dev_lag available for each accident month as the most mature estimate)
+    from pyspark.sql import Window as _RW
+    _max_lag_win = _RW.partitionBy("segment_id", "accident_month").orderBy(F.col("dev_lag").desc())
+    latest_reserves = (
+        triangle_df
+        .withColumn("_rn", F.row_number().over(_max_lag_win))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+        .withColumnRenamed("accident_month", "month")
+        .withColumn("month", F.to_date("month"))
+    )
+
+    # Compare with SARIMA actuals: join on segment_id + month
+    try:
+        _sarima_actuals = (
+            sarima_results_df
+            .filter(F.col("record_type") == "actual")
+            .select("segment_id", "month", "claims_count")
+        )
+        reserve_validation = (
+            latest_reserves
+            .join(_sarima_actuals, on=["segment_id", "month"], how="inner")
+            .withColumn("reserve_adequacy_ratio",
+                F.when(F.col("claims_count") > 0,
+                       F.col("cumulative_incurred") / F.col("claims_count"))
+                 .otherwise(F.lit(None).cast("double")))
+            .select("segment_id", "month", "cumulative_incurred", "cumulative_paid",
+                    "case_reserve", "claims_count", "reserve_adequacy_ratio", "dev_lag")
+        )
+
+        (reserve_validation.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(f"{CATALOG}.{SCHEMA}.reserve_validation"))
+
+        _avg_adequacy = reserve_validation.agg(F.mean("reserve_adequacy_ratio")).collect()[0][0]
+        print(f"Reserve validation saved → {CATALOG}.{SCHEMA}.reserve_validation")
+        print(f"  Average reserve adequacy ratio: {_avg_adequacy:.2f}")
+        print(f"  (>1.0 = over-reserved, <1.0 = under-reserved, ~1.0 = adequate)")
+
+    except NameError:
+        print("SARIMA results not available — skipping reserve adequacy comparison")
+
+except Exception as _tri_err:
+    print(f"Note: gold_reserve_triangle not available ({_tri_err})")
+    print("Reserve validation skipped — run the DLT pipeline first.")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Summary
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 72 months | Baseline claim volume forecast |
-# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + 2 exog vars | Forecast with StatCan macro signals |
-# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility, risk capital |
-# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — current period |
+# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
+# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility → MC CVs |
+# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |
 # MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
 # MAGIC | Monte Carlo — stress tests | Ray + PyTorch GPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
+# MAGIC | Reserve validation | Spark join | Triangle × SARIMA | Reserve adequacy vs. forecasted claims |
+# MAGIC
+# MAGIC **Data lineage:** `gold_claims_monthly` → Module 2 → `silver_rolling_features` → Module 3 → `segment_monthly_features` → SARIMAX exog vars
+# MAGIC
+# MAGIC **GARCH → MC:** Fitted volatilities from GARCH(1,1) provide data-driven CVs for Monte Carlo (replacing hardcoded values)
 # MAGIC
 # MAGIC **Next:** Module 5 — Log the best SARIMAX model to MLflow, register in UC, and deploy a Model Serving endpoint.

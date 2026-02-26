@@ -91,6 +91,27 @@ print(f"Endpoint:         {MC_ENDPOINT_NAME}")
 
 # COMMAND ----------
 
+# ── Load GARCH-derived CVs from Module 04 (if available) ─────────────────────
+# The GARCH(1,1) models fitted in Module 04 produce per-segment conditional
+# volatilities. These are aggregated by line of business and used as default CVs,
+# replacing hardcoded values. Callers can still override CVs in the request.
+_GARCH_CV_DEFAULTS = {"cv_property": 0.35, "cv_auto": 0.28, "cv_liability": 0.42}
+try:
+    _garch_vol_table = f"{CATALOG}.{SCHEMA}.garch_volatility"
+    _gv = spark.table(_garch_vol_table).toPandas()
+    _gv["product_line"] = _gv["segment_id"].str.split("__").str[0]
+    _gv_means = _gv[_gv["cond_volatility"].notna()].groupby("product_line")["cond_volatility"].mean()
+    _prop_v = np.mean([_gv_means.get("Homeowners", 3.5), _gv_means.get("Commercial_Property", 4.2)])
+    _auto_v = np.mean([_gv_means.get("Personal_Auto", 2.8), _gv_means.get("Commercial_Auto", 3.0)])
+    _liab_v = 0.5 * (_prop_v + _auto_v)
+    _scaled = np.clip(np.array([_prop_v, _auto_v, _liab_v]) / 100.0 * 3.0, 0.15, 0.60)
+    _GARCH_CV_DEFAULTS = {"cv_property": round(float(_scaled[0]), 4),
+                          "cv_auto": round(float(_scaled[1]), 4),
+                          "cv_liability": round(float(_scaled[2]), 4)}
+    print(f"GARCH-derived default CVs: {_GARCH_CV_DEFAULTS}")
+except Exception as _gcv_err:
+    print(f"GARCH CVs not available ({_gcv_err}) — using static defaults")
+
 class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
     """
     MLflow PyFunc wrapper for t-Copula + Lognormal Marginals Monte Carlo.
@@ -98,6 +119,9 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
     Parameterised simulation: all assumptions arrive in the request, so analysts
     can run stressed scenarios (hard market, cat event, parameter uncertainty)
     without retraining.
+
+    Default CVs come from GARCH(1,1) volatility estimates fitted in Module 04.
+    Callers can override all parameters including CVs at request time.
 
     Actuarial design:
       - t-Copula (df=4): captures tail dependence / common shocks between lines
@@ -114,16 +138,16 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
 
         row = model_input.iloc[0]
 
-        # ── Read scenario parameters (with defaults) ──────────────────────────
+        # ── Read scenario parameters (with GARCH-derived defaults) ────────────
         means = np.array([
             float(row.get("mean_property_M",  12.5)),
             float(row.get("mean_auto_M",       8.3)),
             float(row.get("mean_liability_M",  5.7)),
         ])
         cv = np.array([
-            float(row.get("cv_property",  0.35)),
-            float(row.get("cv_auto",      0.28)),
-            float(row.get("cv_liability", 0.42)),
+            float(row.get("cv_property",  _GARCH_CV_DEFAULTS["cv_property"])),
+            float(row.get("cv_auto",      _GARCH_CV_DEFAULTS["cv_auto"])),
+            float(row.get("cv_liability", _GARCH_CV_DEFAULTS["cv_liability"])),
         ])
         corr_prop_auto = float(row.get("corr_prop_auto",  0.40))
         corr_prop_liab = float(row.get("corr_prop_liab",  0.20))
@@ -202,14 +226,14 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
 
 # COMMAND ----------
 
-# Baseline scenario (matches Module 4 calibration)
+# Baseline scenario (uses GARCH-derived CVs from Module 4)
 _baseline_input = pd.DataFrame([{
     "mean_property_M":  12.5,
     "mean_auto_M":       8.3,
     "mean_liability_M":  5.7,
-    "cv_property":       0.35,
-    "cv_auto":           0.28,
-    "cv_liability":      0.42,
+    "cv_property":       _GARCH_CV_DEFAULTS["cv_property"],
+    "cv_auto":           _GARCH_CV_DEFAULTS["cv_auto"],
+    "cv_liability":      _GARCH_CV_DEFAULTS["cv_liability"],
     "corr_prop_auto":    0.40,
     "corr_prop_liab":    0.20,
     "corr_auto_liab":    0.30,
@@ -289,9 +313,10 @@ with mlflow.start_run(run_name="monte_carlo_portfolio_champion") as run:
         "mean_property_M_base":   12.5,
         "mean_auto_M_base":        8.3,
         "mean_liability_M_base":   5.7,
-        "cv_property_base":       0.35,
-        "cv_auto_base":           0.28,
-        "cv_liability_base":      0.42,
+        "cv_property_base":       _GARCH_CV_DEFAULTS["cv_property"],
+        "cv_auto_base":           _GARCH_CV_DEFAULTS["cv_auto"],
+        "cv_liability_base":      _GARCH_CV_DEFAULTS["cv_liability"],
+        "cv_source":              "GARCH(1,1)" if _GARCH_CV_DEFAULTS["cv_property"] != 0.35 else "static",
         "corr_prop_auto_base":    0.40,
         "corr_prop_liab_base":    0.20,
         "corr_auto_liab_base":    0.30,

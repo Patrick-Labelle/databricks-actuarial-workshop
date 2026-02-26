@@ -84,15 +84,18 @@ try:
 except Exception:
     print("Silver features not found — regenerating (run Module 2 first for full pipeline)")
 
-    # Fallback: generate directly
+    # Fallback: generate directly (matching gold_claims_monthly schema: 40 segments × 72 months)
     from itertools import product as iterproduct
     np.random.seed(42)
     PRODUCT_LINES = ["Personal_Auto","Commercial_Auto","Homeowners","Commercial_Property"]
-    REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Atlantic"]
-    MONTHS        = pd.date_range("2019-01-01", periods=60, freq="MS")
+    REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Manitoba",
+                     "Saskatchewan","New_Brunswick","Nova_Scotia","Prince_Edward_Island","Newfoundland"]
+    MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")
     SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
     BASE          = {"Personal_Auto":450,"Commercial_Auto":180,"Homeowners":320,"Commercial_Property":90}
-    MULT          = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,"Atlantic":0.7}
+    MULT          = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,
+                     "Manitoba":0.85,"Saskatchewan":0.80,"New_Brunswick":0.70,
+                     "Nova_Scotia":0.75,"Prince_Edward_Island":0.60,"Newfoundland":0.65}
 
     rows = []
     for prod, reg in iterproduct(PRODUCT_LINES, REGIONS):
@@ -102,7 +105,7 @@ except Exception:
         for i, (m, v) in enumerate(zip(MONTHS, y_arr)):
             rows.append({
                 "segment_id": f"{prod}__{reg}", "product_line": prod, "region": reg,
-                "month": m.date(), "claims_estimate": int(round(v)),
+                "month": m.date(), "claims_count": int(round(v)),
                 "rolling_3m_mean": float(np.mean(y_arr[max(0,i-2):i+1])),
                 "rolling_6m_mean": float(np.mean(y_arr[max(0,i-5):i+1])),
                 "rolling_12m_mean": float(np.mean(y_arr[max(0,i-11):i+1])),
@@ -130,7 +133,7 @@ if "rolling_3m_std" not in silver_features.columns:
     w3 = _W.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
     silver_features = silver_features.withColumn(
         "rolling_3m_std",
-        _F.coalesce(_F.stddev("claims_estimate").over(w3).cast("double"), _F.lit(0.0)) + _F.lit(1e-6)
+        _F.coalesce(_F.stddev("claims_count").over(w3).cast("double"), _F.lit(0.0)) + _F.lit(1e-6)
     )
 
 if "avg_loss_ratio" not in silver_features.columns:
@@ -142,7 +145,7 @@ if "avg_loss_ratio" not in silver_features.columns:
 if "total_premium" not in silver_features.columns:
     silver_features = silver_features.withColumn(
         "total_premium",
-        (_F.col("claims_estimate").cast("double") / _F.lit(0.65)) * _F.lit(3.5)
+        (_F.col("claims_count").cast("double") / _F.lit(0.65)) * _F.lit(3.5)
     )
 
 feature_df = (
@@ -443,7 +446,7 @@ spark.sql(f"""
 # MAGIC
 # MAGIC | Step | What Happened |
 # MAGIC |---|---|
-# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 20 segments |
+# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 40 segments |
 # MAGIC | UC registration | Feature table with timestamp key — enables point-in-time joins |
 # MAGIC | Training set assembly | Point-in-time join guarantees no future leakage |
 # MAGIC | Online Table | Low-latency feature lookup for real-time scoring |
@@ -454,4 +457,5 @@ spark.sql(f"""
 # MAGIC for unbiased actuarial models and regulatory compliance.
 # MAGIC
 # MAGIC **Next:** Module 4 — with reliable data and leakage-free features, we're ready to fit
-# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 20 segments.
+# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 40 segments. Module 4 reads
+# MAGIC `segment_monthly_features` to provide exogenous variables for SARIMAX forecasting.

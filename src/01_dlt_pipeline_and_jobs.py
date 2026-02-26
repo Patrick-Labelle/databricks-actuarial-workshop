@@ -25,13 +25,13 @@
 # MAGIC ### Architecture for Today
 # MAGIC
 # MAGIC ```
-# MAGIC Raw CDC feed (policy changes)
+# MAGIC Raw CDC feed (reserve development snapshots)
 # MAGIC        ↓
 # MAGIC   BRONZE  — append-only raw records (full history preserved)
 # MAGIC        ↓  Apply Changes (SCD Type 2)
-# MAGIC   SILVER  — current + history of each policy, DLT expectations enforced
+# MAGIC   SILVER  — current + history of each reserve estimate, DLT expectations enforced
 # MAGIC        ↓  Aggregation
-# MAGIC   GOLD    — segment-level monthly loss statistics (ready for SARIMA/GARCH)
+# MAGIC   GOLD    — loss development triangle (accident month × development lag)
 # MAGIC ```
 
 # COMMAND ----------
@@ -88,102 +88,147 @@ else:
 # MAGIC ### Step 1 — Generate Raw CDC Data (simulates a Bronze landing zone)
 # MAGIC
 # MAGIC In production, Bronze is fed by Auto Loader reading from S3/ADLS.
-# MAGIC For this workshop we generate a synthetic CDC stream of insurance policy records:
-# MAGIC - Policy events: NEW, ENDORSEMENT (mid-term change), CANCELLATION, REINSTATEMENT
-# MAGIC - Each event captures: policy_id, effective_date, premium, coverage_amount, loss_ratio
+# MAGIC For this workshop we generate a synthetic CDC stream of **claims reserve development** records:
+# MAGIC - Reserve snapshots: how case reserves evolve over time for each accident month × segment
+# MAGIC - Operations: INSERT (initial estimate), UPDATE (development as claims settle)
+# MAGIC - Each record captures: segment_id, accident_month, development_month, incurred/paid/case_reserve
 
 # COMMAND ----------
 
-# ── Helper: generate synthetic policy CDC data ────────────────────────────────
+# ── Helper: generate synthetic reserve development CDC data ───────────────────
 # Run this cell OUTSIDE the DLT pipeline to seed the landing zone with data
 
-def generate_bronze_cdc_data(spark, catalog: str, schema: str, n_policies: int = 5000):
+def generate_reserve_development_data(spark, catalog: str, schema: str):
     """
-    Generate synthetic insurance policy CDC records and write to a Delta table
-    that acts as the Bronze source for the DLT pipeline.
+    Generate synthetic claims reserve development CDC records and write to a Delta
+    table that acts as the Bronze source for the DLT pipeline.
+
+    Reserve development is core actuarial data: case reserves are set when a claim
+    is first reported, then revised as the claim develops (additional information,
+    partial payments, settlements). The SCD2 pattern captures how reserve estimates
+    change over time — a standard actuarial workflow for loss triangle construction.
+
+    Each (segment_id, accident_month) has multiple development snapshots at
+    increasing development lags (1, 2, …, 12+). Earlier lags have higher case
+    reserves (claims are uncertain); later lags converge as claims settle.
     """
     import numpy as np
     import pandas as pd
-    from datetime import date, timedelta
+    from itertools import product as iterproduct
 
     np.random.seed(2024)
 
-    PRODUCT_LINES  = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
-    REGIONS        = [
+    PRODUCT_LINES = ["Personal_Auto", "Commercial_Auto", "Homeowners", "Commercial_Property"]
+    REGIONS = [
         "Ontario", "Quebec", "British_Columbia", "Alberta",
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
     ]
-    EVENT_TYPES    = ["NEW", "ENDORSEMENT", "CANCELLATION", "REINSTATEMENT"]
-    EVENT_WEIGHTS  = [0.50,   0.30,          0.12,            0.08]
+    # Accident months: Jan 2019 – Dec 2024 (72 months, matching claims data)
+    ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=72, freq="MS")
+
+    # Base ultimate incurred by product line (per accident month, Alberta reference)
+    BASE_ULTIMATE = {
+        "Personal_Auto":       3_200_000,
+        "Commercial_Auto":     1_800_000,
+        "Homeowners":          2_700_000,
+        "Commercial_Property": 1_300_000,
+    }
+    REGION_MULT = {
+        "Ontario": 1.40, "Quebec": 1.10, "British_Columbia": 1.20,
+        "Alberta": 1.00, "Manitoba": 0.85, "Saskatchewan": 0.80,
+        "New_Brunswick": 0.70, "Nova_Scotia": 0.75,
+        "Prince_Edward_Island": 0.60, "Newfoundland": 0.65,
+    }
+
+    # Development pattern: cumulative paid % of ultimate at each dev lag (months)
+    # Realistic pattern — fast-settling personal lines, slower commercial/liability
+    DEV_PATTERN = {
+        "Personal_Auto":       [0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.82, 0.87, 0.91, 0.94, 0.97, 0.99],
+        "Commercial_Auto":     [0.10, 0.22, 0.35, 0.46, 0.55, 0.63, 0.70, 0.77, 0.83, 0.88, 0.93, 0.97],
+        "Homeowners":          [0.12, 0.28, 0.42, 0.54, 0.64, 0.73, 0.80, 0.86, 0.90, 0.94, 0.97, 0.99],
+        "Commercial_Property": [0.08, 0.18, 0.30, 0.40, 0.50, 0.59, 0.67, 0.74, 0.81, 0.87, 0.92, 0.96],
+    }
 
     rows = []
     event_seq = 1
 
-    for policy_id in range(1001, 1001 + n_policies):
-        product = np.random.choice(PRODUCT_LINES)
-        region  = np.random.choice(REGIONS)
-        base_premium = np.random.uniform(800, 4500)
+    for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
+        segment_id = f"{prod}__{region}"
+        base_ult = BASE_ULTIMATE[prod] * REGION_MULT[region]
+        dev_pct = DEV_PATTERN[prod]
 
-        # Each policy has 1-5 CDC events spanning 3 years
-        n_events = np.random.randint(1, 6)
-        start_date = date(2021, 1, 1) + timedelta(days=np.random.randint(0, 730))
+        for acc_month in ACCIDENT_MONTHS:
+            # Ultimate incurred with noise (±15%)
+            ultimate = base_ult * np.random.uniform(0.85, 1.15)
 
-        current_premium = base_premium
-        for ev_idx in range(n_events):
-            event_type = (
-                "NEW" if ev_idx == 0
-                else np.random.choice(EVENT_TYPES[1:], p=[w/0.50 for w in EVENT_WEIGHTS[1:]])
-            )
-            effective_date = start_date + timedelta(days=ev_idx * np.random.randint(30, 180))
+            # Slight trend: +0.3% per month
+            month_idx = (acc_month.year - 2019) * 12 + (acc_month.month - 1)
+            ultimate *= (1 + 0.003 * month_idx)
 
-            if event_type == "ENDORSEMENT":
-                current_premium *= np.random.uniform(0.90, 1.15)
-            elif event_type == "CANCELLATION":
-                current_premium = 0.0
+            # Max development lags available depends on how old the accident month is
+            # (newer months have fewer lags observed)
+            max_lag = min(12, 72 - month_idx)
+            if max_lag < 1:
+                continue
 
-            rows.append({
-                "event_id":         event_seq,
-                "policy_id":        policy_id,
-                "event_type":       event_type,
-                "effective_date":   effective_date.isoformat(),
-                "product_line":     product,
-                "region":           region,
-                "annual_premium":   round(current_premium, 2),
-                "coverage_amount":  round(current_premium * np.random.uniform(15, 50), 2),
-                "loss_ratio":       round(np.random.uniform(0.45, 0.95), 4),
-                "ingested_at":      pd.Timestamp.now().isoformat(),
-                "_is_deleted":      (event_type == "CANCELLATION"),
-            })
-            event_seq += 1
+            prev_paid = 0.0
+            for lag in range(1, max_lag + 1):
+                cum_paid_pct = dev_pct[lag - 1] * np.random.uniform(0.92, 1.08)
+                cum_paid = ultimate * min(cum_paid_pct, 1.0)
+                incurred = ultimate * np.random.uniform(0.95, 1.05)  # incurred fluctuates
+
+                # Case reserve = incurred - cumulative paid (what's still expected)
+                case_reserve = max(0, incurred - cum_paid)
+
+                # Development month = accident month + lag months
+                dev_month = acc_month + pd.DateOffset(months=lag)
+
+                rows.append({
+                    "event_id":           event_seq,
+                    "segment_id":         segment_id,
+                    "product_line":       prod,
+                    "region":             region,
+                    "accident_month":     acc_month.strftime("%Y-%m-%d"),
+                    "development_month":  dev_month.strftime("%Y-%m-%d"),
+                    "dev_lag":            lag,
+                    "cumulative_paid":    round(cum_paid, 2),
+                    "cumulative_incurred": round(incurred, 2),
+                    "case_reserve":       round(case_reserve, 2),
+                    "op":                 "INSERT" if lag == 1 else "UPDATE",
+                    "ingested_at":        pd.Timestamp.now().isoformat(),
+                })
+                event_seq += 1
+                prev_paid = cum_paid
 
     pdf = pd.DataFrame(rows)
 
-    schema_str = StructType([
-        StructField("event_id",        IntegerType(), False),
-        StructField("policy_id",       IntegerType(), False),
-        StructField("event_type",      StringType(),  False),
-        StructField("effective_date",  StringType(),  False),
-        StructField("product_line",    StringType(),  False),
-        StructField("region",          StringType(),  False),
-        StructField("annual_premium",  DoubleType(),  True),
-        StructField("coverage_amount", DoubleType(),  True),
-        StructField("loss_ratio",      DoubleType(),  True),
-        StructField("ingested_at",     StringType(),  False),
-        StructField("_is_deleted",     BooleanType(), False),
+    reserve_schema = StructType([
+        StructField("event_id",            IntegerType(), False),
+        StructField("segment_id",          StringType(),  False),
+        StructField("product_line",        StringType(),  False),
+        StructField("region",              StringType(),  False),
+        StructField("accident_month",      StringType(),  False),
+        StructField("development_month",   StringType(),  False),
+        StructField("dev_lag",             IntegerType(), False),
+        StructField("cumulative_paid",     DoubleType(),  True),
+        StructField("cumulative_incurred", DoubleType(),  True),
+        StructField("case_reserve",        DoubleType(),  True),
+        StructField("op",                  StringType(),  False),
+        StructField("ingested_at",         StringType(),  False),
     ])
 
-    sdf = spark.createDataFrame(pdf, schema=schema_str)
+    sdf = spark.createDataFrame(pdf, schema=reserve_schema)
 
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
     (sdf.write
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .saveAsTable(f"{catalog}.{schema}.policy_cdc_raw"))
+        .saveAsTable(f"{catalog}.{schema}.reserve_development_raw"))
 
     count = sdf.count()
-    print(f"Generated {count:,} CDC events for {n_policies} policies → {catalog}.{schema}.policy_cdc_raw")
+    print(f"Generated {count:,} reserve development CDC events → {catalog}.{schema}.reserve_development_raw")
     return sdf
 
 # ── Helper: generate synthetic claim incident data ────────────────────────────
@@ -315,7 +360,7 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
 
 # Run OUTSIDE the DLT context to seed data
 if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessible DLT spark conf)
-    raw_df = generate_bronze_cdc_data(spark, CATALOG, SCHEMA)
+    raw_df = generate_reserve_development_data(spark, CATALOG, SCHEMA)
     display(raw_df.limit(20))
     # Generate claims events data (feeds bronze_claims → gold_claims_monthly DLT tables)
     generate_claims_events_data(spark, CATALOG, SCHEMA)
@@ -357,26 +402,27 @@ if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessibl
 
 if IN_DLT:
     @dlt.table(
-        name="bronze_policy_cdc",
-        comment="Raw CDC events from policy administration system. Append-only, schema-on-read, full history.",
+        name="bronze_reserve_cdc",
+        comment="Raw reserve development CDC events. Append-only — tracks how case reserves evolve over time.",
         table_properties={
             "quality":      "bronze",
             "delta.enableChangeDataFeed": "true",
         },
     )
-    @dlt.expect_or_drop("valid_premium",    "annual_premium >= 0")
-    @dlt.expect_or_drop("valid_loss_ratio", "loss_ratio BETWEEN 0.0 AND 2.5")
-    @dlt.expect_or_drop("valid_product",    "product_line IN ('Personal_Auto','Commercial_Auto','Homeowners','Commercial_Property')")
-    @dlt.expect("valid_coverage",           "coverage_amount > annual_premium")
-    def bronze_policy_cdc():
+    @dlt.expect_or_drop("valid_paid",      "cumulative_paid >= 0")
+    @dlt.expect_or_drop("valid_incurred",  "cumulative_incurred >= 0")
+    @dlt.expect_or_drop("valid_reserve",   "case_reserve >= 0")
+    @dlt.expect_or_drop("valid_product",   "product_line IN ('Personal_Auto','Commercial_Auto','Homeowners','Commercial_Property')")
+    @dlt.expect("valid_dev_lag",           "dev_lag BETWEEN 1 AND 120")
+    def bronze_reserve_cdc():
         """
-        Bronze: Read raw policy CDC records from the landing zone.
-        Append-only — preserves complete history including corrections and deletions.
+        Bronze: Read raw reserve development CDC records from the landing zone.
+        Append-only — preserves complete history of reserve estimate revisions.
         """
         return (
             spark.readStream
                  .format("delta")
-                 .table(f"{CATALOG}.{SCHEMA}.policy_cdc_raw")
+                 .table(f"{CATALOG}.{SCHEMA}.reserve_development_raw")
         )
 else:
     print("ℹ️  DLT not active — Bronze/Silver/Gold tables are created by the DLT pipeline.")
@@ -385,16 +431,16 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Step 3 — Silver: Cleansed Policies (SCD Type 2 via Apply Changes)
+# MAGIC ### Step 3 — Silver: Reserve History (SCD Type 2 via Apply Changes)
 # MAGIC
 # MAGIC `dlt.apply_changes()` replaces hand-rolled MERGE SQL with a declarative pattern:
-# MAGIC - **SCD Type 2**: Every version of a policy is retained with `__START_AT` and `__END_AT` timestamps
-# MAGIC - **Sequence**: `effective_date` determines ordering (handles late-arriving events)
-# MAGIC - **Soft deletes**: `_is_deleted = true` marks cancelled policies without physical deletion
+# MAGIC - **SCD Type 2**: Every version of a reserve estimate is retained with `__START_AT` and `__END_AT` timestamps
+# MAGIC - **Sequence**: `development_month` determines ordering (handles late-arriving revisions)
+# MAGIC - **Composite key**: `(segment_id, accident_month, dev_lag)` — each development snapshot is a separate version
 # MAGIC - **Data quality**: Expectations are applied at Bronze (Step 2) — architecturally correct since
 # MAGIC   Bronze should capture every raw record and quality enforcement happens before CDC merge.
 # MAGIC
-# MAGIC This is the layer actuaries query for historical exposure analysis.
+# MAGIC This is the layer actuaries query for historical reserve analysis and triangle construction.
 
 # COMMAND ----------
 
@@ -409,65 +455,67 @@ else:
 # CDC merge logic on top of validated Bronze records.
 if IN_DLT:
     dlt.create_streaming_table(
-        name="silver_policies",
-        comment="Current and historical policy states with full SCD Type 2 history.",
+        name="silver_reserves",
+        comment="Reserve development history with SCD Type 2 tracking. Each (segment, accident_month, dev_lag) tracks how estimates evolve.",
         table_properties={"quality": "silver"},
     )
 
     # Apply Changes: CDC → SCD Type 2
     dlt.apply_changes(
-        target       = "silver_policies",
-        source       = "bronze_policy_cdc",
-        keys         = ["policy_id"],
-        sequence_by  = F.col("effective_date"),
-        apply_as_deletes = F.col("_is_deleted") == True,
+        target       = "silver_reserves",
+        source       = "bronze_reserve_cdc",
+        keys         = ["segment_id", "accident_month", "dev_lag"],
+        sequence_by  = F.col("development_month"),
         stored_as_scd_type = 2,
-        column_list  = ["policy_id", "event_type", "effective_date", "product_line",
-                        "region", "annual_premium", "coverage_amount", "loss_ratio"],
+        column_list  = ["segment_id", "product_line", "region", "accident_month",
+                        "development_month", "dev_lag", "cumulative_paid",
+                        "cumulative_incurred", "case_reserve"],
     )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Step 4 — Gold: Segment Aggregates (Materialized View)
+# MAGIC ### Step 4 — Gold: Loss Development Triangle (Materialized View)
 # MAGIC
-# MAGIC Gold is where actuarial consumers (pricing analysts, reserving actuaries, ML pipelines) read from.
-# MAGIC We aggregate monthly claims statistics by segment — exactly the data that feeds Module 4's SARIMA models.
+# MAGIC Gold is where actuarial consumers (reserving actuaries, ML pipelines, the app) read from.
+# MAGIC We aggregate reserve development data into a **loss development triangle** — the standard
+# MAGIC actuarial exhibit for tracking how claims settle over time.
 # MAGIC
 # MAGIC DLT **materialized views** keep this table incrementally up-to-date as Silver changes.
 # MAGIC No scheduled jobs needed — DLT handles the refresh automatically.
+# MAGIC
+# MAGIC | Axis | Description |
+# MAGIC |---|---|
+# MAGIC | `accident_month` | When the loss occurred (rows) |
+# MAGIC | `dev_lag` | Months since accident (columns) |
+# MAGIC | Values | Cumulative paid, cumulative incurred, case reserve |
 
 # COMMAND ----------
 
 if IN_DLT:
     @dlt.table(
-        name="gold_segment_monthly_stats",
-        comment="Monthly aggregated loss statistics by product line × region. Primary input for SARIMA/GARCH modeling.",
+        name="gold_reserve_triangle",
+        comment="Loss development triangle by segment × accident month × development lag. Core actuarial exhibit for reserve adequacy analysis.",
         table_properties={"quality": "gold"},
     )
-    def gold_segment_monthly_stats():
+    def gold_reserve_triangle():
         """
-        Gold: Monthly segment statistics aggregated from Silver.
-        - segment_id: product_line × region key (matches Module 4 naming)
-        - avg_loss_ratio: simple average (use earned premium weighted in production)
-        - exposure_count: policy-months in force
+        Gold: Loss development triangle from Silver reserve history.
+        Uses current SCD2 versions only (__END_AT IS NULL) to get the latest
+        reserve estimate at each development lag.
         """
-        silver = dlt.read("silver_policies")
+        silver = dlt.read("silver_reserves")
 
         return (
             silver
-            .withColumn("month", F.date_trunc("month", F.col("effective_date").cast("date")))
-            .withColumn("segment_id", F.concat_ws("__", "product_line", "region"))
-            .groupBy("segment_id", "product_line", "region", "month")
+            .filter(F.col("__END_AT").isNull())  # current SCD2 records only
+            .groupBy("segment_id", "product_line", "region", "accident_month", "dev_lag")
             .agg(
-                F.count("*").alias("exposure_count"),
-                F.avg("loss_ratio").alias("avg_loss_ratio"),
-                F.sum("annual_premium").alias("total_premium"),
-                F.avg("annual_premium").alias("avg_premium"),
-                F.countDistinct("policy_id").alias("unique_policies"),
+                F.sum("cumulative_paid").alias("cumulative_paid"),
+                F.sum("cumulative_incurred").alias("cumulative_incurred"),
+                F.sum("case_reserve").alias("case_reserve"),
             )
-            .withColumn("claims_estimate", (F.col("avg_loss_ratio") * F.col("total_premium") / 12).cast("int"))
-            .orderBy("segment_id", "month")
+            .orderBy("segment_id", "accident_month", "dev_lag")
         )
 
 # COMMAND ----------
@@ -894,17 +942,17 @@ except Exception:
 # MAGIC
 # MAGIC | Layer | Table | Pattern | Consumer |
 # MAGIC |---|---|---|---|
-# MAGIC | Bronze | `bronze_policy_cdc` | Append-only CDC stream | Silver SCD2 |
-# MAGIC | Silver | `silver_policies` | SCD Type 2 via Apply Changes | Gold aggregates |
-# MAGIC | Gold | `gold_segment_monthly_stats` | Materialized view; monthly policy stats | Module 2, 3 |
+# MAGIC | Bronze | `bronze_reserve_cdc` | Append-only reserve development CDC | Silver SCD2 |
+# MAGIC | Silver | `silver_reserves` | SCD Type 2 via Apply Changes | Gold triangle |
+# MAGIC | Gold | `gold_reserve_triangle` | Materialized view; loss development triangle | **Module 4, App** |
 # MAGIC | Bronze | `bronze_claims` | Append-only claim events stream | Gold claims |
-# MAGIC | Gold | `gold_claims_monthly` | Materialized view; segment × month claims | **Module 4** |
+# MAGIC | Gold | `gold_claims_monthly` | Materialized view; segment × month claims | **Module 2, 3, 4** |
 # MAGIC | Bronze | `bronze_macro_indicators` | Append-only StatCan macro stream | Silver SCD2 |
 # MAGIC | Silver | `silver_macro_indicators` | SCD Type 2; tracks StatCan revisions | Gold features |
 # MAGIC | Gold | `gold_macro_features` | Pivoted macro features; current versions | **Module 4 exog** |
 # MAGIC
-# MAGIC `gold_claims_monthly` and `gold_macro_features` feed directly into Module 4's SARIMAX pipeline.
-# MAGIC Real macro signals from Statistics Canada (unemployment, HPI growth) improve forecast accuracy
-# MAGIC over baseline SARIMA — watch the MAPE improvement in the MLflow experiment comparison.
+# MAGIC `gold_claims_monthly` feeds Module 2 (scaling techniques), Module 3 (feature store), and Module 4 (SARIMAX).
+# MAGIC `gold_reserve_triangle` provides the loss development triangle for reserve adequacy validation in Module 4
+# MAGIC and display in the Streamlit app.
 # MAGIC
 # MAGIC **Next:** Module 2 — making decisions about compute and scale before we fit those models.
