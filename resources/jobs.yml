@@ -168,12 +168,12 @@ resources:
       environments:
         - environment_key: default_env
           spec:
-            client: "4"
+            environment_version: "4"
             dependencies:
               - databricks-feature-engineering
         - environment_key: ml_env
           spec:
-            client: "4"
+            environment_version: "4"
             dependencies:
               # statsmodels and arch are available via %pip install in the notebook
               # (for driver-side job_mode fitting) and listed here for the interactive
@@ -228,7 +228,7 @@ resources:
       environments:
         - environment_key: ml_env
           spec:
-            client: "4"
+            environment_version: "4"
             dependencies:
               - statsmodels>=0.14
               - arch>=7.0

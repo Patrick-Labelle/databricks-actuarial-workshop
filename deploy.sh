@@ -100,7 +100,7 @@ WORKSPACE_HOST=$(echo "$VALIDATE_JSON" \
 
 # ── Step 2: bundle deploy ─────────────────────────────────────────────────────
 echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
-databricks bundle deploy "${BUNDLE_ARGS[@]}"
+databricks bundle deploy "${PROFILE_ARGS[@]}" "${BUNDLE_ARGS[@]}"
 
 # ── Step 2.5: Lakebase database setup (runs locally using CLI OAuth JWT) ──────
 # Lakebase Autoscaling endpoints require standard OAuth JWTs for authentication.
@@ -238,7 +238,7 @@ if jobs:
 
 # ── 4a: Launch the job and capture the run ID ─────────────────────────────────
 _BUNDLE_RUN_OK=true
-databricks bundle run actuarial_workshop_setup "${BUNDLE_ARGS[@]}" &
+databricks bundle run actuarial_workshop_setup "${PROFILE_ARGS[@]}" "${BUNDLE_ARGS[@]}" &
 _BUNDLE_RUN_PID=$!
 
 # Resolve the latest run ID shortly after launch (give it a few seconds to register).
