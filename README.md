@@ -1,16 +1,17 @@
 # Databricks Actuarial Demo
 
 An end-to-end actuarial modeling solution on the Databricks Lakehouse — synthetic
-insurance portfolio data, a full DLT medallion pipeline, SARIMAX/GARCH/Monte Carlo
-models, MLflow model registry, model serving, and a Streamlit risk dashboard —
+insurance portfolio data, a full DLT medallion pipeline, and statistical models that
+**forecast claims, model volatility, and simulate portfolio loss** (SARIMAX/GARCH/Monte Carlo),
+plus MLflow model registry, model serving, and a Streamlit risk dashboard —
 packaged as a single **Databricks Asset Bundle** for one-command deployment.
 
 ## What's in the box
 
 - **DLT medallion pipeline** — three data streams (policy CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
-- **SARIMAX forecasting** — 40 segments (4 product lines × 10 Canadian provinces), 72-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
-- **GARCH volatility modeling** — per-segment conditional variance estimation via the `arch` library
-- **t-Copula Monte Carlo** — 640M-path GPU simulation (Ray-on-Spark + PyTorch) for portfolio VaR/CVaR, 12-month capital evolution, and catastrophe stress scenarios
+- **SARIMAX forecasting** — forecasts **monthly claim frequency and severity by product line and province** for reserving, pricing, and capital planning; 40 segments (4 product lines × 10 Canadian provinces), 72-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
+- **GARCH volatility modeling** — models **time-varying uncertainty in claim outcomes by segment** for risk capital and reinsurance; per-segment conditional variance estimation via the `arch` library
+- **t-Copula Monte Carlo** — simulates **portfolio loss distribution** for VaR/CVaR, 12-month capital-at-risk evolution, and catastrophe stress scenarios; 640M-path GPU simulation (Ray-on-Spark + PyTorch)
 - **MLflow + UC Model Registry** — PyFunc-wrapped models, versioned, with `@Champion` alias and AI Gateway-enabled serving endpoints
 - **Unity Catalog Feature Store** — point-in-time joins for leakage-free training sets, Online Table for real-time inference
 - **Streamlit risk dashboard** — claims forecasts, capital requirements, on-demand scoring, stress testing, and catastrophe scenario simulation backed by Lakebase (managed PostgreSQL) for analyst annotations
@@ -115,7 +116,7 @@ The setup job runs the following tasks in order:
    - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
 4. **Build rolling features** — window aggregates and rolling statistics per segment
 5. **Register Feature Store + Online Table** — leakage-free training set assembly and real-time lookup table
-6. **Fit SARIMAX / GARCH / Monte Carlo** — reads `gold_claims_monthly` from DLT; joins real StatCan macro exogenous variables; compares SARIMA vs SARIMAX MAPE
+6. **Fit SARIMAX / GARCH / Monte Carlo** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` from DLT; joins real StatCan macro exogenous variables; compares SARIMA vs SARIMAX MAPE
 7a. **Register SARIMA model** + create Model Serving endpoint
 7b. **Register Monte Carlo model** + create CPU endpoint — parallel with 7a
 8. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal
@@ -124,9 +125,7 @@ The setup job runs the following tasks in order:
 
 ## Statistics Canada Macro Data Integration
 
-The SARIMAX models in `04_classical_stats_at_scale.py` use real macroeconomic data
-from Statistics Canada as exogenous variables, flowing through the same DLT medallion
-pipeline as the claims data:
+The SARIMAX models in `04_classical_stats_at_scale.py` **forecast monthly claim counts and severity by product line and province** for reserving, pricing, and capital planning. They use real macroeconomic data from Statistics Canada as exogenous variables, flowing through the same DLT medallion pipeline as the claims data:
 
 ```
 scripts/fetch_macro_data.py  →  macro_indicators_raw
@@ -174,7 +173,7 @@ The Ray target overrides Task 5 (`fit_statistical_models`) from serverless to a
 
 ### GPU Monte Carlo details (t-Copula, 640M paths)
 
-All 64 Ray tasks are dispatched simultaneously in a single batch:
+The simulation produces **capital-at-risk and tail-risk metrics** (VaR/CVaR) and **stress-test outcomes** (catastrophe, correlation spike, inflation) for regulatory and internal risk management. All 64 Ray tasks are dispatched simultaneously in a single batch:
 
 1. **Baseline** (static means): 4 tasks × 10M = **40M paths** → `monte_carlo_results`
 2. **12-month VaR evolution** (SARIMA-driven means): 12 months × 4 tasks × 10M = **480M paths**
@@ -242,7 +241,7 @@ gitignored but force-included in the bundle sync via `databricks.yml`.
 | 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API; 3 data streams (policy, claims, macro) |
 | 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
 | 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
-| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (reads DLT gold layer + real StatCan macro exog), t-Copula Monte Carlo, Ray+GPU, MLflow |
+| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (**claim forecasts and volatility by segment**), t-Copula Monte Carlo (**portfolio loss distribution, VaR, stress tests**), reads DLT gold + StatCan macro, Ray+GPU, MLflow |
 | 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
 | 6 | `06_monte_carlo_serving.py` | Monte Carlo as REST API — MLflow PyFunc, UC Model Registry, AI Gateway |
 | 6 (CI/CD) | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
