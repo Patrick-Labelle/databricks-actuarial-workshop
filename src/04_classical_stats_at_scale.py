@@ -13,7 +13,8 @@
 # MAGIC 3. **SARIMAX at Scale** — Per-segment SARIMA + SARIMAX fit; compare MAPE with/without exog
 # MAGIC 4. **GARCH at Scale** — Per-segment volatility modeling with the `arch` library
 # MAGIC 5. **Monte Carlo with Ray** — Task-parallel portfolio loss simulation (100k+ paths)
-# MAGIC 6. **MLflow Integration** — Experiment tracking, metrics, artifacts
+# MAGIC 6. **Reserve Validation** — SARIMA forecasts vs. actual development from the loss triangle
+# MAGIC 7. **Model Registration** — Register SARIMA + Monte Carlo models to UC with `@Champion` alias
 # MAGIC
 # MAGIC ---
 # MAGIC ### Why `applyInPandas`?
@@ -44,23 +45,9 @@
 
 # COMMAND ----------
 
-# ── GPU detection ─────────────────────────────────────────────────────────────
-# PyTorch (pre-installed on DBR GPU ML) is used for GPU Monte Carlo simulation.
-# No extra pip install needed — torch.cuda is available on all GPU ML nodes.
-import subprocess as _subprocess
-try:
-    _gpu_check = _subprocess.run(
-        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=5,
-    )
-    HAS_GPU = _gpu_check.returncode == 0 and bool(_gpu_check.stdout.strip())
-except (FileNotFoundError, OSError):
-    # nvidia-smi not in PATH on this node (CPU-only driver; GPU workers have it via Ray)
-    HAS_GPU = False
-if HAS_GPU:
-    print(f"GPU detected on driver: {_gpu_check.stdout.strip().splitlines()[0]}")
-else:
-    print("No GPU on driver (normal for multi-node clusters) — Ray workers will use torch.cuda")
+# ── Runtime detection ─────────────────────────────────────────────────────────
+# Monte Carlo simulation uses NumPy/SciPy on CPU Ray workers.
+# No GPU or PyTorch required — all array ops are CPU-native.
 
 # COMMAND ----------
 
@@ -211,14 +198,53 @@ except Exception as _e:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro Exogenous Variables
+# MAGIC ## 2b. Feature Store Integration — Exogenous Variables from Module 3
+# MAGIC
+# MAGIC The Feature Store (`segment_monthly_features`) provides rolling statistical features
+# MAGIC computed in Module 2 and registered in Module 3. These features — rolling means,
+# MAGIC volatility regime, momentum — serve as additional exogenous variables for SARIMAX,
+# MAGIC completing the lineage: `gold_claims_monthly` → Module 2 → Module 3 → Module 4.
+
+# COMMAND ----------
+
+# Load Feature Store features and join to claims data
+try:
+    _fs_table = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
+    fs_features = spark.table(_fs_table)
+    _fs_count = fs_features.count()
+    print(f"segment_monthly_features: {_fs_count:,} rows")
+
+    # Select key features for SARIMAX exogenous variables
+    _fs_cols = ["segment_id", "month", "rolling_3m_mean", "rolling_6m_mean",
+                "coeff_variation_3m", "mom_change_pct", "normalized_premium"]
+    # Only select columns that exist in the feature table
+    _available_fs_cols = [c for c in _fs_cols if c in fs_features.columns]
+    fs_subset = fs_features.select(*_available_fs_cols)
+
+    claims_with_macro = (
+        claims_with_macro
+        .join(fs_subset, on=["segment_id", "month"], how="left")
+    )
+    claims_with_macro.createOrReplaceTempView("claims_with_macro")
+    HAS_FS_FEATURES = _fs_count > 0
+    print(f"Feature Store features joined: {', '.join(_available_fs_cols[2:])}")
+
+except Exception as _fs_err:
+    print(f"Note: segment_monthly_features not available ({_fs_err}).")
+    print("SARIMAX will use macro variables only (no Feature Store exog).")
+    HAS_FS_FEATURES = False
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro + Feature Store Exogenous Variables
 # MAGIC
 # MAGIC ### Strategy
 # MAGIC We use `df.groupby("segment_id").applyInPandas(fit_fn, schema)`.
 # MAGIC
-# MAGIC Each Spark task receives **one segment's pandas DataFrame** (claims + macro joined) and:
+# MAGIC Each Spark task receives **one segment's pandas DataFrame** (claims + macro + features joined) and:
 # MAGIC 1. Fits baseline `SARIMA(1,0,1)(1,1,0,12)` — monthly seasonality, no exog
-# MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` as exog
+# MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` + Feature Store features as exog
 # MAGIC 3. Evaluates out-of-sample MAPE on held-out last 12 months (validation set)
 # MAGIC 4. Refits final model on all 72 months for the 12-month forecast
 # MAGIC 5. Returns a standardized pandas DataFrame with both MAPE metrics for comparison
@@ -269,7 +295,12 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     y      = pdf["claims_count"].astype(float).values
     months = pd.to_datetime(pdf["month"])
 
+    # Exog columns: macro variables + Feature Store features (if available)
     exog_cols = ["unemployment_rate", "hpi_growth"]
+    _fs_exog = ["rolling_3m_mean", "coeff_variation_3m", "mom_change_pct"]
+    for _fc in _fs_exog:
+        if _fc in pdf.columns and not pdf[_fc].isna().all():
+            exog_cols.append(_fc)
 
     # Fill NaN exog values (hpi_growth is NaN for the first month due to lag;
     # forward-fill then back-fill covers edge cases at either end of the series)
@@ -713,19 +744,14 @@ else:
         except Exception:
             pass
 
-        # Prevent Spark from reserving GPUs for its own tasks so Ray can use them all.
-        spark.conf.set("spark.task.resource.gpu.amount", "0")
-
-        # Reserve 2 of 4 vCPUs on the g4dn.xlarge worker for Spark so that
-        # createDataFrame/saveAsTable can schedule tasks after Ray finishes.
-        # Without this, Ray occupies all CPUs and subsequent Spark jobs stall
-        # at "0 tasks started". (ref: Databricks Ray-on-Spark docs)
-        # num_cpus=0.5 per Ray task (see @ray.remote below) allows 4 concurrent
-        # tasks on the 2 Ray CPU slots: 4 × 0.5 = 2.0 CPUs ≤ 2 available.
+        # 4 workers × 6 Ray CPUs = 24 Ray CPU slots; Spark retains 2 vCPUs
+        # per worker (8 total) for Delta writes after Ray shuts down.
+        # Without reserving CPUs for Spark, Ray occupies all cores and
+        # subsequent saveAsTable calls stall at "0 tasks started".
         setup_ray_cluster(
-            max_worker_nodes=1,
-            num_cpus_worker_node=2,      # leave 2 of 4 vCPUs free for Spark
-            num_gpus_worker_node=1,      # g4dn.xlarge: 1 NVIDIA T4 GPU per node
+            max_worker_nodes=4,
+            num_cpus_worker_node=6,      # leave 2 of 8 vCPUs free for Spark per worker
+            num_gpus_worker_node=0,      # pure CPU cluster
             collect_log_to_path="/tmp/ray_logs",
         )
 
@@ -741,28 +767,6 @@ else:
 
 # COMMAND ----------
 
-# ── GPU pre-flight check ───────────────────────────────────────────────────────
-if RAY_AVAILABLE:
-    @ray.remote(num_gpus=1)
-    def _check_gpu_worker():
-        import torch
-        result = {'torch_version': torch.__version__, 'cuda_available': torch.cuda.is_available()}
-        if torch.cuda.is_available():
-            result['device_name'] = torch.cuda.get_device_name(0)
-            _a = torch.randn(1000, 1000, device='cuda', dtype=torch.float32)
-            (_a @ _a.T).sum().item()
-            torch.cuda.synchronize()
-            result['cuda_ok'] = True
-        return result
-
-    _gpu_diag = ray.get(_check_gpu_worker.remote())
-    if not _gpu_diag.get('cuda_available', False):
-        print("WARNING: Ray workers report CUDA not available — Monte Carlo will use CPU fallback.")
-    else:
-        print(f"GPU confirmed on workers: {_gpu_diag.get('device_name', 'unknown')}")
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ### Define Monte Carlo Task (t-Copula + Lognormal Marginals)
 # MAGIC
@@ -775,13 +779,10 @@ if RAY_AVAILABLE:
 # MAGIC - Property ↔ Liability: 0.20 (moderate — inflation affects both)
 # MAGIC - Auto ↔ Liability: 0.30 (judicial/social inflation trend)
 # MAGIC
-# MAGIC **GPU acceleration:** `@ray.remote(num_gpus=0.25)` — fractional allocation allows
-# MAGIC 4 concurrent tasks per T4 GPU (8 tasks total with 2 workers × 1 GPU each).
-# MAGIC Each task runs 100,000 scenarios using PyTorch. Random sampling + Cholesky +
-# MAGIC lognormal inverse CDF (`erfinv`) + t-CDF (`torch.distributions.StudentT.cdf`)
-# MAGIC all run on GPU via CUDA-native kernels — zero CPU transfer during simulation.
-# MAGIC PyTorch is pre-installed on DBR GPU ML; no pip install needed.
-# MAGIC Falls back transparently to NumPy/SciPy if `torch.cuda` is unavailable.
+# MAGIC **Ray-distributed:** `@ray.remote(num_cpus=1)` — each task uses 1 CPU slot; 24 Ray CPUs
+# MAGIC across 4 workers allow up to 24 concurrent tasks. Each task runs 10M scenarios
+# MAGIC using NumPy/SciPy: random sampling + Cholesky + lognormal inverse CDF (`norm.ppf`)
+# MAGIC + t-CDF (`scipy.stats.t.cdf`). Falls back to single-node NumPy when Ray is unavailable.
 
 # COMMAND ----------
 
@@ -894,11 +895,49 @@ except NameError:
 import numpy as np
 import pandas as pd
 
+# ── GARCH → Monte Carlo Bridge: derive CVs from fitted volatilities ──────────
+# Instead of hardcoded CVs, aggregate GARCH conditional volatilities by line of
+# business to produce data-driven coefficients of variation for the MC simulation.
+# This connects the GARCH output directly to Monte Carlo input.
+_DEFAULT_CV = [0.35, 0.28, 0.42]  # fallback if GARCH results unavailable
+try:
+    _garch_pd = garch_results_df.toPandas()
+    _garch_pd["product_line"] = _garch_pd["segment_id"].str.split("__").str[0]
+
+    # Aggregate conditional volatility by product line → MC segment mapping
+    _garch_vol = (
+        _garch_pd[_garch_pd["cond_volatility"].notna()]
+        .groupby("product_line")["cond_volatility"]
+        .mean()
+    )
+
+    # Map product lines to MC segments (Property, Auto, Liability proxy)
+    _prop_vol = np.mean([_garch_vol.get("Homeowners", 0.35),
+                          _garch_vol.get("Commercial_Property", 0.42)])
+    _auto_vol = np.mean([_garch_vol.get("Personal_Auto", 0.28),
+                          _garch_vol.get("Commercial_Auto", 0.30)])
+    # Liability proxied as average of Property and Auto volatility
+    _liab_vol = 0.5 * (_prop_vol + _auto_vol)
+
+    # Scale GARCH volatility (in log-return %) to CV space (typically 0.1–0.6)
+    # GARCH conditional vol is in % of log-returns; scale to CV by dividing by 100
+    # and applying a floor/ceiling for stability
+    _garch_cvs = np.clip(
+        np.array([_prop_vol, _auto_vol, _liab_vol]) / 100.0 * 3.0,  # empirical scaling
+        0.15, 0.60,
+    ).tolist()
+    print(f"GARCH-derived CVs: Property={_garch_cvs[0]:.3f}, Auto={_garch_cvs[1]:.3f}, Liability={_garch_cvs[2]:.3f}")
+    _MC_USE_GARCH_CV = True
+except (NameError, Exception) as _garch_cv_err:
+    print(f"GARCH CVs not available ({_garch_cv_err}) — using default CVs: {_DEFAULT_CV}")
+    _garch_cvs = _DEFAULT_CV
+    _MC_USE_GARCH_CV = False
+
 # Portfolio parameters (in $M expected annual losses)
 PORTFOLIO = {
     "segments":   ["Property", "Auto", "Liability"],
     "means":      [12.5, 8.3, 5.7],          # Expected annual loss per segment ($M)
-    "cv":         [0.35, 0.28, 0.42],         # Coefficients of variation
+    "cv":         _garch_cvs,                 # GARCH-derived CVs (or defaults)
     "corr_matrix": np.array([                 # Pearson correlations
         [1.00, 0.40, 0.20],
         [0.40, 1.00, 0.30],
@@ -932,52 +971,11 @@ _CAT_CORR    = np.array([[1.00, 0.55, 0.40],
                           [0.55, 1.00, 0.45],
                           [0.40, 0.45, 1.00]], dtype=np.float32)
 
-# Per-worker GPU tensor cache: populated on first GPU call, reused by all subsequent
-# tasks on the same worker process.
-# (sig, corr) variants are cached by (device, dtype, sig_hash, corr_hash) so each
-# unique scenario combination is computed once per worker.
-# mu_t varies per SARIMA month / scenario → cached only for the static baseline case.
-_GPU_TENSOR_CACHE: dict = {}
-
-def _get_gpu_tensors(device, dtype, mu_ln_arr=None, sig_ln_arr=None, corr_arr=None):
-    """Return (mu_t, sig_t, chol_t) GPU tensors.
-
-    sig_t and chol_t are cached by (device, dtype, sig_hash, corr_hash) so each
-    unique (CV vector, correlation matrix) combination is computed once per worker
-    process.  sig_ln_arr / corr_arr override the module-level defaults for stress
-    scenarios.  mu_t is computed from mu_ln_arr (SARIMA / scenario overrides) or
-    the cached static baseline value.
-    """
-    import torch
-    _sig_id  = 'base' if sig_ln_arr is None else hash(sig_ln_arr.tobytes())
-    _corr_id = 'base' if corr_arr is None else hash(corr_arr.tobytes())
-    sc_key   = (str(device), str(dtype), _sig_id, _corr_id)
-    if sc_key not in _GPU_TENSOR_CACHE:
-        _sig  = _MC_SIGMA_LN if sig_ln_arr is None else sig_ln_arr
-        _corr = _MC_CORR     if corr_arr is None else corr_arr
-        _GPU_TENSOR_CACHE[sc_key] = (
-            torch.tensor(_sig,  dtype=dtype, device=device),    # sig_t
-            torch.linalg.cholesky(torch.tensor(_corr, dtype=dtype, device=device)),  # chol_t
-        )
-    sig_t, chol_t = _GPU_TENSOR_CACHE[sc_key]
-
-    if mu_ln_arr is not None:
-        mu_t = torch.tensor(mu_ln_arr, dtype=dtype, device=device)
-    else:
-        static_key = (str(device), str(dtype), 'mu_static')
-        if static_key not in _GPU_TENSOR_CACHE:
-            _GPU_TENSOR_CACHE[static_key] = torch.tensor(_MC_MU_LN, dtype=dtype, device=device)
-        mu_t = _GPU_TENSOR_CACHE[static_key]
-
-    return mu_t, sig_t, chol_t
-
 # Define the Ray task function (only if Ray is available)
-# @ray.remote(num_gpus=0.25, num_cpus=0.5): 4 concurrent tasks on 1 T4 GPU
-# (4 × 0.25 = 1.0 GPU); num_cpus=0.5 allows all 4 to fit within the 2 Ray CPU
-# slots reserved on g4dn.xlarge (4 × 0.5 = 2.0 CPUs).
-# GPU path (100%): random sampling + Cholesky + lognormal + t-CDF all on GPU.
+# @ray.remote(num_cpus=1): 24 concurrent tasks across 4 workers (4 × 6 = 24 Ray CPUs).
+# NumPy/SciPy path: random sampling + Cholesky + lognormal + t-CDF all on CPU.
 if RAY_AVAILABLE:
-    @ray.remote(num_gpus=0.25, num_cpus=0.5)
+    @ray.remote(num_cpus=1)
     def simulate_portfolio_losses(n_scenarios: int, seed: int, means_override=None,
                                    scenario: str = 'baseline') -> dict:
         """
@@ -994,25 +992,19 @@ if RAY_AVAILABLE:
                           Poisson(λ=0.05) jump process for discrete CAT hits.
         'inflation_shock' Sustained 30 % loss-cost inflation with +15 % CV uncertainty.
 
-        Steps (all GPU — no CPU transfers):
-          1. Draw correlated standard normals Z ~ N(0, R) using Cholesky(R).   [GPU]
-          2. Draw chi2 W ~ chi2(df)/df (mixing variable for t-distribution).   [GPU]
-          3. T = Z / sqrt(W) gives multivariate t(df) with correlation R.      [GPU]
-          4. Apply t-CDF via torch.distributions.StudentT.cdf() (CUDA kernel). [GPU]
-          5. Apply lognormal inverse CDF via erfinv: Phi^-1(u) = sqrt(2)*erfinv(2u-1)
-             torch.special.erfinv is CUDA-accelerated.                         [GPU]
-          6. (cat_event only) Poisson jump shocks on GPU for discrete CAT events.
+        Steps (NumPy/SciPy):
+          1. Draw correlated standard normals Z ~ N(0, R) using Cholesky(R).
+          2. Draw chi2 W ~ chi2(df)/df (mixing variable for t-distribution).
+          3. T = Z / sqrt(W) gives multivariate t(df) with correlation R.
+          4. Apply t-CDF via scipy.stats.t.cdf().
+          5. Apply lognormal inverse CDF via scipy.stats.norm.ppf().
+          6. (cat_event only) Poisson jump shocks for discrete CAT events.
 
-        GPU path uses PyTorch (pre-installed on DBR GPU ML) for all array ops.
-        Uses float32 for throughput (T4 tensor cores optimised for fp32).
-        Results are moved back to CPU via .cpu().numpy() before returning (Ray
-        cannot serialize CUDA tensors across process boundaries).
-
-        Module-level constants and _get_gpu_tensors() are captured in the closure
-        and loaded once per worker process, avoiding redundant computation.
+        Module-level constants (_MC_MEANS, _MC_CV, _MC_CORR, etc.) are captured
+        in the closure and available on each Ray worker without serialisation.
         """
         import numpy as np
-        import torch
+        from scipy.stats import t as tdist, norm as scipy_norm
 
         # ── Scenario parameter resolution ─────────────────────────────────────
         # Each scenario adjusts the effective means, CV, and/or correlation matrix.
@@ -1045,96 +1037,36 @@ if RAY_AVAILABLE:
         _eff_mu_ln  = np.log(_eff_means) - _eff_sig2 / 2.0
         _eff_sig_ln = np.sqrt(_eff_sig2)
 
-        # Pass None for unchanged params to hit cached static tensors
-        _mu_override  = None if (means_override is None and np.all(_sc_means_mult == 1.0)) else _eff_mu_ln
-        _sig_override = None if np.all(_sc_cv_mult == 1.0) else _eff_sig_ln
+        # ── NumPy/SciPy simulation ────────────────────────────────────────────
+        _cpu_chol = np.linalg.cholesky(
+            _sc_corr_arr if _sc_corr_arr is not None else _MC_CORR
+        )
+        rng      = np.random.default_rng(seed)
+        z        = rng.standard_normal((n_scenarios, 3))
+        chi2     = rng.chisquare(_MC_COPULA_DF, n_scenarios)
+        t_cor    = (z @ _cpu_chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
+        u        = tdist.cdf(t_cor, df=_MC_COPULA_DF)
+        q        = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
+        losses   = np.exp(_eff_mu_ln + _eff_sig_ln * q)
 
-        # ── GPU path via PyTorch (100% GPU — no CPU transfers) ───────────────────
-        # torch.device('cuda') lets CUDA_VISIBLE_DEVICES pick the right GPU index
-        # (safer than hardcoding 'cuda:0' in multi-GPU or containerised setups).
-        try:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA not available on this Ray worker")
-
-            device = torch.device('cuda')   # let CUDA_VISIBLE_DEVICES pick index
-            dtype  = torch.float32          # fp32 maximises T4 throughput
-
-            # Retrieve precomputed tensors; scenario-specific sig/corr variants are
-            # cached on first use per worker process.
-            mu_t, sig_t, chol_t = _get_gpu_tensors(device, dtype,
-                                                     mu_ln_arr=_mu_override,
-                                                     sig_ln_arr=_sig_override,
-                                                     corr_arr=_sc_corr_arr)
-
-            # Steps 1-2: correlated standard normals + chi2 mixing variable
-            # chi2(df) = sum of df² independent standard normals (exact, GPU-native)
-            torch.manual_seed(seed)
-            z    = torch.randn(n_scenarios, 3, dtype=dtype, device=device)
-            z_nu = torch.randn(n_scenarios, _MC_COPULA_DF, dtype=dtype, device=device)
-            chi2 = (z_nu ** 2).sum(dim=1)                              # (n,)
-            x_cor = z @ chol_t.T                                       # correlated N(0,1)
-
-            # Step 3: t-distributed with correlation structure
-            t_cor = x_cor / (chi2.unsqueeze(1) / _MC_COPULA_DF).sqrt()  # (n, 3)
-
-            # Step 4: t-CDF via torch.distributions.StudentT (100% CUDA-native).
-            # torch.distributions.StudentT.cdf() is a CUDA kernel — no CPU transfer.
-            # This replaces the former scipy.special.betainc hybrid path.
-            _t_dist = torch.distributions.StudentT(
-                df=torch.tensor(float(_MC_COPULA_DF), dtype=dtype, device=device)
-            )
-            u_clip = _t_dist.cdf(t_cor).clamp(1e-6, 1 - 1e-6)        # (n, 3) on GPU
-
-            # Step 5: lognormal marginals via inverse normal CDF (all on GPU)
-            # Phi^-1(u) = sqrt(2) * erfinv(2u - 1)
-            q      = torch.special.erfinv(2.0 * u_clip - 1.0).mul(2.0 ** 0.5)
-            losses = torch.exp(mu_t + sig_t * q)                       # (n, 3)
-
-            # Catastrophe jump process (cat_event scenario only).
-            # Poisson(λ=0.05): each scenario has a 5 % chance of a discrete CAT
-            # event.  When it hits, losses are amplified by line-specific factors
-            # (Property ×8, Auto ×3, Liability ×1.5) on top of the copula result.
-            if _add_cat_jump:
-                _cat_n   = torch.poisson(
-                    torch.full((n_scenarios,), 0.05, dtype=dtype, device=device)
-                )                                          # ≈95 % → 0,  ≈5 % → 1
-                _cat_amp = torch.stack(
-                    [_cat_n * 8.0, _cat_n * 3.0, _cat_n * 1.5], dim=1
-                )
-                losses = losses * (1.0 + _cat_amp)
-
-            total  = losses.sum(dim=1).cpu().numpy().astype(np.float64)
-            backend = 'torch-gpu'   # 100% GPU: sampling + Cholesky + lognormal + t-CDF
-
-        except Exception as e_gpu:
-            # ── CPU fallback (Serverless, non-GPU workers, torch.cuda unavailable) ─
-            print(f"[Ray task seed={seed}] GPU path failed ({type(e_gpu).__name__}: {e_gpu}) — using CPU")
-            from scipy.stats import t as tdist, norm as scipy_norm
-            _cpu_chol = np.linalg.cholesky(
-                _sc_corr_arr if _sc_corr_arr is not None else _MC_CORR
-            )
-            rng      = np.random.default_rng(seed)
-            z        = rng.standard_normal((n_scenarios, 3))
-            chi2     = rng.chisquare(_MC_COPULA_DF, n_scenarios)
-            t_cor    = (z @ _cpu_chol.T) / np.sqrt(chi2[:, None] / _MC_COPULA_DF)
-            u        = tdist.cdf(t_cor, df=_MC_COPULA_DF)
-            q        = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
-            losses   = np.exp(_eff_mu_ln + _eff_sig_ln * q)
-            if _add_cat_jump:
-                _cat_n   = rng.poisson(0.05, n_scenarios)
-                _cat_amp = np.stack(
-                    [_cat_n * 8.0, _cat_n * 3.0, _cat_n * 1.5], axis=1
-                ).astype(np.float32)
-                losses   = losses * (1.0 + _cat_amp)
-            total    = losses.sum(axis=1)
-            backend  = 'numpy-cpu'
+        # Catastrophe jump process (cat_event scenario only).
+        # Poisson(λ=0.05): each scenario has a 5 % chance of a discrete CAT
+        # event.  When it hits, losses are amplified by line-specific factors
+        # (Property ×8, Auto ×3, Liability ×1.5) on top of the copula result.
+        if _add_cat_jump:
+            _cat_n   = rng.poisson(0.05, n_scenarios)
+            _cat_amp = np.stack(
+                [_cat_n * 8.0, _cat_n * 3.0, _cat_n * 1.5], axis=1
+            ).astype(np.float32)
+            losses   = losses * (1.0 + _cat_amp)
+        total    = losses.sum(axis=1)
 
         return {
             'seed':            seed,
             'n_scenarios':     n_scenarios,
             'scenario':        scenario,
             'copula':          f't-copula(df={_MC_COPULA_DF})',
-            'backend':         backend,
+            'backend':         'numpy-cpu',
             'total_loss_mean': float(total.mean()),
             'var_95':          float(np.percentile(total, 95)),
             'var_99':          float(np.percentile(total, 99)),
@@ -1147,7 +1079,7 @@ if RAY_AVAILABLE:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Monte Carlo — Baseline + VaR Evolution + Stress Tests (GPU-accelerated)
+# MAGIC ### Monte Carlo — Baseline + VaR Evolution + Stress Tests (Ray-distributed)
 # MAGIC
 # MAGIC Three complementary simulations dispatched together in a single Ray batch:
 # MAGIC
@@ -1163,13 +1095,13 @@ if RAY_AVAILABLE:
 # MAGIC    - `inflation_shock`: +30 % loss-cost inflation, +15 % CV uncertainty
 # MAGIC
 # MAGIC All `(1 + 12 + 3) × 4 = 64` tasks are dispatched before any are collected.
-# MAGIC Ray queues them 4 at a time (4 × 0.25 GPU = 1.0 GPU full utilization),
-# MAGIC targeting **~90 seconds for 640M total paths** on a single T4.
+# MAGIC Ray queues them across 24 CPU slots (4 workers × 6 CPUs), running up to 24
+# MAGIC tasks concurrently. 640M total paths in ~2-3 minutes on 4 × m5.2xlarge.
 
 # COMMAND ----------
 
-# 4 tasks per run, 10M scenarios each → T4 GPU under heavy load (4 × 0.25 = 1.0 GPU).
-# 10M paths/task: ~600 MB GPU RAM per task, ~3–5 s/task wall-time on T4.
+# 4 tasks per run, 10M scenarios each → distributed across 24 Ray CPU slots.
+# 10M paths/task: ~600 MB RAM per task; 24 concurrent tasks across 4 workers.
 N_TASKS          = 4
 N_PER_TASK       = 10_000_000      # 10× — GPU stress demo; total ~640M paths
 STRESS_SCENARIOS = ['stress_corr', 'cat_event', 'inflation_shock']
@@ -1187,7 +1119,7 @@ if RAY_AVAILABLE:
             'model_type':      'Monte Carlo - t-Copula + Lognormal Marginals (SARIMAX-driven)',
             'n_scenarios':     str(N_RUNS * N_TASKS * N_PER_TASK),
             'n_segments':      '3',
-            'framework':       'Ray + PyTorch GPU',
+            'framework':       'Ray + NumPy CPU',
             'audience':        'actuarial-workshop',
         })
         mlflow.log_params({
@@ -1227,7 +1159,7 @@ if RAY_AVAILABLE:
 
         # Stress scenarios (seeds 300+): 3 scenarios × 4 tasks each.
         # All dispatched before collecting any results — Ray queues all 64 tasks
-        # and keeps 4 running concurrently (full T4 occupancy throughout).
+        # and runs up to 24 concurrently across 4 CPU workers.
         stress_futures: dict = {}
         for _si, _sc in enumerate(STRESS_SCENARIOS):
             stress_futures[_sc] = [
@@ -1414,7 +1346,7 @@ else:
     COPULA_DF    = 4
     rng          = np.random.default_rng(42)
     means        = np.array([12.5, 8.3, 5.7])
-    cv           = np.array([0.35, 0.28, 0.42])
+    cv           = np.array(_garch_cvs)  # GARCH-derived CVs (or defaults)
     sigma2       = np.log(1 + cv**2)
     mu_ln        = np.log(means) - sigma2 / 2
     sigma_ln     = np.sqrt(sigma2)
@@ -1472,15 +1404,532 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 6. Reserve Triangle Validation
+# MAGIC
+# MAGIC The loss development triangle from the DLT pipeline (`gold_reserve_triangle`) provides an
+# MAGIC independent check on SARIMA forecasts. We compare the SARIMA-projected incurred claims against
+# MAGIC actual reserve development to assess **reserve adequacy**.
+# MAGIC
+# MAGIC This connects the new CDC pipeline → Module 4, completing the end-to-end lineage.
+
+# COMMAND ----------
+
+try:
+    _triangle_table = f"{CATALOG}.{SCHEMA}.gold_reserve_triangle"
+    triangle_df = spark.table(_triangle_table)
+    _tri_count = triangle_df.count()
+    print(f"gold_reserve_triangle: {_tri_count:,} rows")
+
+    # Aggregate triangle to get latest cumulative incurred per segment × accident month
+    # (use the maximum dev_lag available for each accident month as the most mature estimate)
+    from pyspark.sql import Window as _RW
+    _max_lag_win = _RW.partitionBy("segment_id", "accident_month").orderBy(F.col("dev_lag").desc())
+    latest_reserves = (
+        triangle_df
+        .withColumn("_rn", F.row_number().over(_max_lag_win))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+        .withColumnRenamed("accident_month", "month")
+        .withColumn("month", F.to_date("month"))
+    )
+
+    # Compare with SARIMA actuals: join on segment_id + month
+    try:
+        _sarima_actuals = (
+            sarima_results_df
+            .filter(F.col("record_type") == "actual")
+            .select("segment_id", "month", "claims_count")
+        )
+        reserve_validation = (
+            latest_reserves
+            .join(_sarima_actuals, on=["segment_id", "month"], how="inner")
+            .withColumn("reserve_adequacy_ratio",
+                F.when(F.col("claims_count") > 0,
+                       F.col("cumulative_incurred") / F.col("claims_count"))
+                 .otherwise(F.lit(None).cast("double")))
+            .select("segment_id", "month", "cumulative_incurred", "cumulative_paid",
+                    "case_reserve", "claims_count", "reserve_adequacy_ratio", "dev_lag")
+        )
+
+        (reserve_validation.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(f"{CATALOG}.{SCHEMA}.reserve_validation"))
+
+        _avg_adequacy = reserve_validation.agg(F.mean("reserve_adequacy_ratio")).collect()[0][0]
+        print(f"Reserve validation saved → {CATALOG}.{SCHEMA}.reserve_validation")
+        print(f"  Average reserve adequacy ratio: {_avg_adequacy:.2f}")
+        print(f"  (>1.0 = over-reserved, <1.0 = under-reserved, ~1.0 = adequate)")
+
+    except NameError:
+        print("SARIMA results not available — skipping reserve adequacy comparison")
+
+except Exception as _tri_err:
+    print(f"Note: gold_reserve_triangle not available ({_tri_err})")
+    print("Reserve validation skipped — run the DLT pipeline first.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Model Registration — MLflow + Unity Catalog
+# MAGIC
+# MAGIC We register both production models to Unity Catalog so Module 5 can deploy
+# MAGIC serving endpoints without re-training:
+# MAGIC
+# MAGIC 1. **SARIMA Champion** — fitted SARIMAX(1,0,1)(1,1,0,12) for `Personal_Auto__Ontario`
+# MAGIC 2. **Monte Carlo Portfolio** — stateless t-Copula + Lognormal simulation
+# MAGIC
+# MAGIC Both get an `@Champion` alias, which the serving endpoints reference.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7a. SARIMA Champion Model
+# MAGIC
+# MAGIC Wrap the best SARIMAX model as `mlflow.pyfunc.PythonModel`, log to MLflow,
+# MAGIC and register to Unity Catalog with `@Champion` alias.
+
+# COMMAND ----------
+
+import os, pickle, tempfile, cloudpickle, scipy
+import statsmodels as _statsmodels
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from mlflow.tracking import MlflowClient
+
+# ── PyFunc wrapper (same interface as Module 5's serving contract) ────────────
+class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
+    """
+    MLflow PyFunc wrapper for a fitted statsmodels SARIMAX model.
+
+    Input:  pandas DataFrame with column `horizon` (int) — months to forecast
+    Output: pandas DataFrame with columns: month_offset, forecast_mean, lo95, hi95
+
+    This pattern works for any classical Python model: statsmodels, lifelines,
+    scikit-survival, arch — wrap it, log it, serve it.
+    """
+
+    def load_context(self, context):
+        """Load the pickled SARIMAX model from the MLflow artifact store."""
+        import pickle
+        import os
+        model_path = os.path.join(context.artifacts["sarimax_model"], "model.pkl")
+        with open(model_path, "rb") as f:
+            self.model_fit = pickle.load(f)
+
+    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate forecast.
+
+        Args:
+            model_input: DataFrame with column `horizon` (int, 1–24)
+
+        Returns:
+            DataFrame with forecast mean and 95% confidence intervals.
+        """
+        horizon = int(model_input["horizon"].iloc[0])
+        horizon = max(1, min(horizon, 24))  # clamp to [1, 24]
+
+        forecast = self.model_fit.get_forecast(steps=horizon)
+        mean_fcst = forecast.predicted_mean
+        ci        = np.asarray(forecast.conf_int(alpha=0.05))
+
+        return pd.DataFrame({
+            "month_offset":   list(range(1, horizon + 1)),
+            "forecast_mean":  list(mean_fcst.round(1)),
+            "forecast_lo95":  list(np.round(ci[:, 0], 1)),
+            "forecast_hi95":  list(np.round(ci[:, 1], 1)),
+        })
+
+# ── Train on Personal_Auto__Ontario (highest volume, primary validation segment)
+try:
+    _reg_claims_pdf = (
+        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+        .filter("segment_id = 'Personal_Auto__Ontario'")
+        .orderBy("month")
+        .select("month", "claims_count")
+        .toPandas()
+    )
+    print(f"Loaded {len(_reg_claims_pdf)} months from gold_claims_monthly")
+except Exception:
+    print("Generating sample data (gold_claims_monthly not available)")
+    np.random.seed(42)
+    _months = pd.date_range("2019-01-01", periods=60, freq="MS")
+    _SEASONALITY = {1: 1.25, 2: 1.20, 3: 1.10, 4: 0.95, 5: 0.90, 6: 0.88,
+                    7: 0.85, 8: 0.87, 9: 0.92, 10: 1.00, 11: 1.10, 12: 1.20}
+    _base = 450 * 1.4
+    _y = [max(0, _base * (1+0.003*i) * _SEASONALITY[m.month] * (1+np.random.normal(0, 0.08)))
+          for i, m in enumerate(_months)]
+    _reg_claims_pdf = pd.DataFrame({"month": _months.date, "claims_count": [int(round(v)) for v in _y]})
+
+_y_train = _reg_claims_pdf["claims_count"].astype(float).values
+
+# ── Switch experiment for SARIMA champion registration ────────────────────────
+mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster")
+
+# Dataset reference for UC lineage
+try:
+    _sarima_reg_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+        name="gold_claims_monthly",
+    )
+    _sarima_reg_log_ds = True
+except Exception:
+    _sarima_reg_log_ds = False
+
+with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sarima_reg_run:
+    if _sarima_reg_log_ds:
+        mlflow.log_input(_sarima_reg_dataset, context="training")
+
+    # ── Fit model ────────────────────────────────────────────────────────────
+    _reg_model = SARIMAX(
+        _y_train,
+        order=(1, 0, 1),
+        seasonal_order=(1, 1, 0, 12),
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    _reg_fit = _reg_model.fit(disp=False, maxiter=200)
+
+    # ── Compute metrics ───────────────────────────────────────────────────────
+    _reg_fitted = _reg_fit.fittedvalues[12:]
+    _reg_actual = _y_train[12:]
+    _reg_mape = float(np.mean(np.abs((_reg_actual - _reg_fitted) / np.clip(_reg_actual, 1, None))) * 100)
+    _reg_rmse = float(np.sqrt(np.mean((_reg_actual - _reg_fitted)**2)))
+
+    # ── Log parameters ────────────────────────────────────────────────────────
+    mlflow.set_tags({
+        "segment_id":      "Personal_Auto__Ontario",
+        "workshop_module": "4",
+        "model_class":     "SARIMAX",
+        "audience":        "actuarial-workshop",
+    })
+    mlflow.log_params({
+        "order_p": 1, "order_d": 0, "order_q": 1,
+        "seasonal_P": 1, "seasonal_D": 1, "seasonal_Q": 0,
+        "seasonal_m": 12,
+        "training_months": len(_y_train),
+        "segment": "Personal_Auto__Ontario",
+    })
+    mlflow.log_metrics({
+        "mape_pct": round(_reg_mape, 2),
+        "rmse":     round(_reg_rmse, 1),
+        "aic":      round(_reg_fit.aic, 2),
+        "bic":      round(_reg_fit.bic, 2),
+    })
+
+    # ── Save forecast plot as artifact ───────────────────────────────────────
+    _fig, _ax = plt.subplots(figsize=(12, 4))
+    _ax.plot(range(len(_y_train)), _y_train, label="Actual", lw=1.5)
+    _ax.plot(range(12, len(_reg_fit.fittedvalues)), _reg_fit.fittedvalues[12:],
+             label="Fitted", lw=1.5, ls="--")
+    _fc = _reg_fit.get_forecast(steps=12)
+    _fc_mean = _fc.predicted_mean
+    _fc_ci   = np.asarray(_fc.conf_int())
+    _t_fc = range(len(_y_train), len(_y_train) + 12)
+    _ax.plot(_t_fc, _fc_mean, label="Forecast (12m)", color="orange", lw=2)
+    _ax.fill_between(_t_fc, _fc_ci[:, 0], _fc_ci[:, 1], alpha=0.2, color="orange")
+    _ax.set_title("SARIMA(1,0,1)(1,1,0,12) — Personal Auto Ontario")
+    _ax.set_xlabel("Month offset")
+    _ax.set_ylabel("Monthly Claims Count")
+    _ax.legend()
+    _ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        _plot_path = os.path.join(_tmpdir, "forecast_plot.png")
+        _fig.savefig(_plot_path, dpi=120, bbox_inches="tight")
+        mlflow.log_artifact(_plot_path, artifact_path="plots")
+    plt.close()
+
+    # ── Save pickled model for PyFunc ─────────────────────────────────────────
+    _SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        _model_pkl_path = os.path.join(_tmpdir, "model.pkl")
+        with open(_model_pkl_path, "wb") as _f:
+            pickle.dump(_reg_fit, _f)
+
+        _input_schema  = mlflow.types.Schema([mlflow.types.ColSpec("integer", "horizon")])
+        _output_schema = mlflow.types.Schema([
+            mlflow.types.ColSpec("integer", "month_offset"),
+            mlflow.types.ColSpec("double",  "forecast_mean"),
+            mlflow.types.ColSpec("double",  "forecast_lo95"),
+            mlflow.types.ColSpec("double",  "forecast_hi95"),
+        ])
+        _signature = mlflow.models.ModelSignature(inputs=_input_schema, outputs=_output_schema)
+
+        mlflow.pyfunc.log_model(
+            artifact_path="sarima_forecaster",
+            python_model=SARIMAXForecaster(),
+            artifacts={"sarimax_model": _tmpdir},
+            signature=_signature,
+            registered_model_name=_SARIMA_MODEL_NAME,
+            pip_requirements=[
+                f"statsmodels=={_statsmodels.__version__}",
+                f"numpy=={np.__version__}",
+                f"scipy=={scipy.__version__}",
+                f"cloudpickle=={cloudpickle.__version__}",
+            ],
+        )
+
+    print(f"\nSARIMA model registered to: {_SARIMA_MODEL_NAME}")
+    print(f"MAPE: {_reg_mape:.1f}%  |  RMSE: {_reg_rmse:.0f}  |  AIC: {_reg_fit.aic:.1f}")
+
+# ── Set @Champion alias ──────────────────────────────────────────────────────
+_client = MlflowClient()
+_sarima_versions = _client.search_model_versions(f"name='{_SARIMA_MODEL_NAME}'")
+_sarima_latest_ver = max(int(v.version) for v in _sarima_versions)
+_client.set_registered_model_alias(name=_SARIMA_MODEL_NAME, alias="Champion", version=_sarima_latest_ver)
+_client.set_model_version_tag(name=_SARIMA_MODEL_NAME, version=str(_sarima_latest_ver),
+                              key="approved_by", value="actuarial-workshop-demo")
+_client.set_model_version_tag(name=_SARIMA_MODEL_NAME, version=str(_sarima_latest_ver),
+                              key="segment", value="Personal_Auto__Ontario")
+print(f"Set @Champion → version {_sarima_latest_ver}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7b. Monte Carlo Portfolio Model
+# MAGIC
+# MAGIC The Monte Carlo simulation is **stateless** — all assumptions arrive in the request.
+# MAGIC The PyFunc wraps the t-Copula + Lognormal simulation code; no pickle is needed.
+# MAGIC
+# MAGIC Default CVs are inlined as static values (`0.35, 0.28, 0.42`). The app always
+# MAGIC sends all 11 parameters explicitly, so defaults only serve standalone validation.
+
+# COMMAND ----------
+
+class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
+    """
+    MLflow PyFunc wrapper for t-Copula + Lognormal Marginals Monte Carlo.
+
+    Parameterised simulation: all assumptions arrive in the request, so analysts
+    can run stressed scenarios (hard market, cat event, parameter uncertainty)
+    without retraining.
+
+    Actuarial design:
+      - t-Copula (df=4): captures tail dependence / common shocks between lines
+      - Lognormal marginals: consistent with the collective risk model (Panjer,
+        Klugman) for skewed, non-negative insurance losses
+      - Cholesky decomposition: enforces positive semi-definite correlation structure
+
+    Input:  DataFrame with one row of scenario parameters
+    Output: DataFrame with one row of portfolio risk metrics
+    """
+
+    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        from scipy.stats import t as tdist, norm as scipy_norm
+
+        row = model_input.iloc[0]
+
+        # ── Read scenario parameters (with static defaults) ──────────────────
+        means = np.array([
+            float(row.get("mean_property_M",  12.5)),
+            float(row.get("mean_auto_M",       8.3)),
+            float(row.get("mean_liability_M",  5.7)),
+        ])
+        cv = np.array([
+            float(row.get("cv_property",  0.35)),
+            float(row.get("cv_auto",      0.28)),
+            float(row.get("cv_liability", 0.42)),
+        ])
+        corr_prop_auto = float(row.get("corr_prop_auto",  0.40))
+        corr_prop_liab = float(row.get("corr_prop_liab",  0.20))
+        corr_auto_liab = float(row.get("corr_auto_liab",  0.30))
+        n_scenarios    = int(row.get("n_scenarios", 10_000))
+        copula_df      = int(row.get("copula_df",   4))
+
+        # Safety bounds
+        n_scenarios = max(1_000, min(n_scenarios, 100_000))
+        copula_df   = max(2,     min(copula_df,   30))
+        means       = np.clip(means, 0.01, 1_000.0)
+        cv          = np.clip(cv,    0.01, 5.0)
+        corr_prop_auto = np.clip(corr_prop_auto, -0.99, 0.99)
+        corr_prop_liab = np.clip(corr_prop_liab, -0.99, 0.99)
+        corr_auto_liab = np.clip(corr_auto_liab, -0.99, 0.99)
+
+        # ── Lognormal parameters ────────────────────────────────────────────
+        sigma2   = np.log(1 + cv**2)
+        mu_ln    = np.log(means) - sigma2 / 2
+        sigma_ln = np.sqrt(sigma2)
+
+        # ── Correlation matrix (Cholesky decomposition) ─────────────────────
+        corr = np.array([
+            [1.0,            corr_prop_auto, corr_prop_liab],
+            [corr_prop_auto, 1.0,            corr_auto_liab],
+            [corr_prop_liab, corr_auto_liab, 1.0           ],
+        ])
+        try:
+            chol = np.linalg.cholesky(corr)
+        except np.linalg.LinAlgError:
+            eigvals, eigvecs = np.linalg.eigh(corr)
+            eigvals = np.maximum(eigvals, 1e-8)
+            corr = eigvecs @ np.diag(eigvals) @ eigvecs.T
+            np.fill_diagonal(corr, 1.0)
+            chol = np.linalg.cholesky(corr)
+
+        # ── t-Copula simulation (Sklar's theorem) ──────────────────────────
+        rng   = np.random.default_rng(42)
+        z     = rng.standard_normal((n_scenarios, 3))
+        chi2  = rng.chisquare(copula_df, n_scenarios)
+        x_cor = z @ chol.T
+        t_cor = x_cor / np.sqrt(chi2[:, None] / copula_df)
+        u     = tdist.cdf(t_cor, df=copula_df)
+        q     = scipy_norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
+        losses = np.exp(mu_ln + sigma_ln * q)
+        total  = losses.sum(axis=1)
+
+        # ── Risk metrics ────────────────────────────────────────────────────
+        var_99_threshold = np.percentile(total, 99)
+
+        return pd.DataFrame([{
+            "expected_loss_M":  round(float(total.mean()), 3),
+            "var_95_M":         round(float(np.percentile(total, 95)),  3),
+            "var_99_M":         round(float(np.percentile(total, 99)),  3),
+            "var_995_M":        round(float(np.percentile(total, 99.5)), 3),
+            "cvar_99_M":        round(float(total[total >= var_99_threshold].mean()), 3),
+            "max_loss_M":       round(float(total.max()), 3),
+            "n_scenarios_used": n_scenarios,
+            "copula":           f"t-copula(df={copula_df})",
+        }])
+
+# ── Validate locally with baseline scenario ──────────────────────────────────
+_mc_baseline_input = pd.DataFrame([{
+    "mean_property_M": 12.5, "mean_auto_M": 8.3, "mean_liability_M": 5.7,
+    "cv_property": _garch_cvs[0] if isinstance(_garch_cvs, list) else float(_garch_cvs[0]),
+    "cv_auto":     _garch_cvs[1] if isinstance(_garch_cvs, list) else float(_garch_cvs[1]),
+    "cv_liability":_garch_cvs[2] if isinstance(_garch_cvs, list) else float(_garch_cvs[2]),
+    "corr_prop_auto": 0.40, "corr_prop_liab": 0.20, "corr_auto_liab": 0.30,
+    "n_scenarios": 10_000, "copula_df": 4,
+}])
+
+_mc_pyfunc = MonteCarloPyFunc()
+_mc_baseline_result = _mc_pyfunc.predict(None, _mc_baseline_input)
+print("Baseline Monte Carlo validation (10,000 scenarios):")
+print(_mc_baseline_result.to_string(index=False))
+
+# COMMAND ----------
+
+# ── Register Monte Carlo model to UC ─────────────────────────────────────────
+_MC_MODEL_NAME = f"{CATALOG}.{SCHEMA}.monte_carlo_portfolio"
+mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_monte_carlo_portfolio")
+
+try:
+    _mc_reg_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+        name="gold_claims_monthly",
+    )
+    _mc_reg_log_ds = True
+except Exception:
+    _mc_reg_log_ds = False
+
+# ── Define MLflow signature ──────────────────────────────────────────────────
+_mc_input_schema = mlflow.types.Schema([
+    mlflow.types.ColSpec("double",  "mean_property_M"),
+    mlflow.types.ColSpec("double",  "mean_auto_M"),
+    mlflow.types.ColSpec("double",  "mean_liability_M"),
+    mlflow.types.ColSpec("double",  "cv_property"),
+    mlflow.types.ColSpec("double",  "cv_auto"),
+    mlflow.types.ColSpec("double",  "cv_liability"),
+    mlflow.types.ColSpec("double",  "corr_prop_auto"),
+    mlflow.types.ColSpec("double",  "corr_prop_liab"),
+    mlflow.types.ColSpec("double",  "corr_auto_liab"),
+    mlflow.types.ColSpec("long",    "n_scenarios"),
+    mlflow.types.ColSpec("long",    "copula_df"),
+])
+_mc_output_schema = mlflow.types.Schema([
+    mlflow.types.ColSpec("double", "expected_loss_M"),
+    mlflow.types.ColSpec("double", "var_95_M"),
+    mlflow.types.ColSpec("double", "var_99_M"),
+    mlflow.types.ColSpec("double", "var_995_M"),
+    mlflow.types.ColSpec("double", "cvar_99_M"),
+    mlflow.types.ColSpec("double", "max_loss_M"),
+    mlflow.types.ColSpec("long",   "n_scenarios_used"),
+    mlflow.types.ColSpec("string", "copula"),
+])
+_mc_signature = mlflow.models.ModelSignature(inputs=_mc_input_schema, outputs=_mc_output_schema)
+
+with mlflow.start_run(run_name="monte_carlo_portfolio_champion") as _mc_reg_run:
+    if _mc_reg_log_ds:
+        mlflow.log_input(_mc_reg_dataset, context="training")
+
+    mlflow.set_tags({
+        "model_class":     "MonteCarloPyFunc",
+        "copula":          "t-copula",
+        "marginals":       "lognormal",
+        "workshop_module": "4",
+        "audience":        "actuarial-workshop",
+    })
+    mlflow.log_params({
+        "copula_df":              4,
+        "n_lines":                3,
+        "default_n_scenarios":    10_000,
+        "mean_property_M_base":   12.5,
+        "mean_auto_M_base":        8.3,
+        "mean_liability_M_base":   5.7,
+        "cv_property_base":       _garch_cvs[0] if isinstance(_garch_cvs, list) else float(_garch_cvs[0]),
+        "cv_auto_base":           _garch_cvs[1] if isinstance(_garch_cvs, list) else float(_garch_cvs[1]),
+        "cv_liability_base":      _garch_cvs[2] if isinstance(_garch_cvs, list) else float(_garch_cvs[2]),
+        "cv_source":              "GARCH(1,1)" if _MC_USE_GARCH_CV else "static",
+        "corr_prop_auto_base":    0.40,
+        "corr_prop_liab_base":    0.20,
+        "corr_auto_liab_base":    0.30,
+    })
+
+    _mc_r = _mc_baseline_result.iloc[0]
+    mlflow.log_metrics({
+        "baseline_expected_loss_M":  float(_mc_r["expected_loss_M"]),
+        "baseline_var_95_M":         float(_mc_r["var_95_M"]),
+        "baseline_var_99_M":         float(_mc_r["var_99_M"]),
+        "baseline_var_995_M":        float(_mc_r["var_995_M"]),
+        "baseline_cvar_99_M":        float(_mc_r["cvar_99_M"]),
+    })
+
+    mlflow.pyfunc.log_model(
+        artifact_path="monte_carlo_pyfunc",
+        python_model=MonteCarloPyFunc(),
+        signature=_mc_signature,
+        registered_model_name=_MC_MODEL_NAME,
+        pip_requirements=[
+            f"scipy=={scipy.__version__}",
+            f"numpy=={np.__version__}",
+        ],
+    )
+
+    print(f"\nMonte Carlo model registered to: {_MC_MODEL_NAME}")
+    print(f"Baseline VaR(99%): ${_mc_r['var_99_M']:.1f}M  |  CVaR(99%): ${_mc_r['cvar_99_M']:.1f}M")
+
+# ── Set @Champion alias ──────────────────────────────────────────────────────
+_mc_versions = _client.search_model_versions(f"name='{_MC_MODEL_NAME}'")
+_mc_latest_ver = max(int(v.version) for v in _mc_versions)
+_client.set_registered_model_alias(name=_MC_MODEL_NAME, alias="Champion", version=_mc_latest_ver)
+_client.set_model_version_tag(name=_MC_MODEL_NAME, version=str(_mc_latest_ver),
+                              key="approved_by", value="actuarial-workshop-demo")
+_client.set_model_version_tag(name=_MC_MODEL_NAME, version=str(_mc_latest_ver),
+                              key="simulation_type", value="t-copula-lognormal")
+print(f"Set @Champion → version {_mc_latest_ver}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Summary
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 72 months | Baseline claim volume forecast |
-# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + 2 exog vars | Forecast with StatCan macro signals |
-# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility, risk capital |
-# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — current period |
+# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
+# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility → MC CVs |
+# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |
 # MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
 # MAGIC | Monte Carlo — stress tests | Ray + PyTorch GPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
+# MAGIC | Reserve validation | Spark join | Triangle × SARIMA | Reserve adequacy vs. forecasted claims |
+# MAGIC | Model registration | MLflow + UC | 2 models (SARIMA + MC) | `@Champion` alias for serving |
 # MAGIC
-# MAGIC **Next:** Module 5 — Log the best SARIMAX model to MLflow, register in UC, and deploy a Model Serving endpoint.
+# MAGIC **Data lineage:** `gold_claims_monthly` (DLT pipeline) → `silver_rolling_features` → Module 3 → `segment_monthly_features` → SARIMAX exog vars
+# MAGIC
+# MAGIC **GARCH → MC:** Fitted volatilities from GARCH(1,1) provide data-driven CVs for Monte Carlo (replacing hardcoded values)
+# MAGIC
+# MAGIC **Next:** Module 5 — Create Model Serving endpoints for both models and configure AI Gateway.

@@ -24,7 +24,7 @@
 # MAGIC ### What We'll Build
 # MAGIC
 # MAGIC ```
-# MAGIC Silver rolling features (Module 2)
+# MAGIC Silver rolling features (DLT pipeline)
 # MAGIC         ↓ register
 # MAGIC UC Feature Table ({catalog}.{schema}.segment_features)
 # MAGIC         ↓ point-in-time join
@@ -51,8 +51,8 @@ from pyspark.sql.window import Window
 dbutils.widgets.text("catalog",      "my_catalog",         "UC Catalog")
 dbutils.widgets.text("schema",       "actuarial_workshop", "UC Schema")
 dbutils.widgets.text("warehouse_id", "",                   "SQL Warehouse ID")
-# job_mode: "true" skips display() calls, Feature Engineering client, training set demo,
-# and Online Table creation. Set to "false" for full interactive demo.
+# job_mode: "true" skips display() calls, Feature Engineering client, and training set demo.
+# Online Table creation is handled by Module 5. Set to "false" for full interactive demo.
 dbutils.widgets.dropdown("job_mode", "false", ["false", "true"], "Job (automated) mode")
 CATALOG       = dbutils.widgets.get("catalog")
 SCHEMA        = dbutils.widgets.get("schema")
@@ -77,22 +77,25 @@ FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
 
 # COMMAND ----------
 
-# Load Silver rolling features (from Module 2) or regenerate
+# Load Silver rolling features (from DLT pipeline) or regenerate
 try:
     silver_features = spark.table(f"{CATALOG}.{SCHEMA}.silver_rolling_features")
     print(f"Loaded from Silver: {silver_features.count()} rows")
 except Exception:
     print("Silver features not found — regenerating (run Module 2 first for full pipeline)")
 
-    # Fallback: generate directly
+    # Fallback: generate directly (matching gold_claims_monthly schema: 40 segments × 72 months)
     from itertools import product as iterproduct
     np.random.seed(42)
     PRODUCT_LINES = ["Personal_Auto","Commercial_Auto","Homeowners","Commercial_Property"]
-    REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Atlantic"]
-    MONTHS        = pd.date_range("2019-01-01", periods=60, freq="MS")
+    REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Manitoba",
+                     "Saskatchewan","New_Brunswick","Nova_Scotia","Prince_Edward_Island","Newfoundland"]
+    MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")
     SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
     BASE          = {"Personal_Auto":450,"Commercial_Auto":180,"Homeowners":320,"Commercial_Property":90}
-    MULT          = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,"Atlantic":0.7}
+    MULT          = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,
+                     "Manitoba":0.85,"Saskatchewan":0.80,"New_Brunswick":0.70,
+                     "Nova_Scotia":0.75,"Prince_Edward_Island":0.60,"Newfoundland":0.65}
 
     rows = []
     for prod, reg in iterproduct(PRODUCT_LINES, REGIONS):
@@ -102,7 +105,7 @@ except Exception:
         for i, (m, v) in enumerate(zip(MONTHS, y_arr)):
             rows.append({
                 "segment_id": f"{prod}__{reg}", "product_line": prod, "region": reg,
-                "month": m.date(), "claims_estimate": int(round(v)),
+                "month": m.date(), "claims_count": int(round(v)),
                 "rolling_3m_mean": float(np.mean(y_arr[max(0,i-2):i+1])),
                 "rolling_6m_mean": float(np.mean(y_arr[max(0,i-5):i+1])),
                 "rolling_12m_mean": float(np.mean(y_arr[max(0,i-11):i+1])),
@@ -130,7 +133,7 @@ if "rolling_3m_std" not in silver_features.columns:
     w3 = _W.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
     silver_features = silver_features.withColumn(
         "rolling_3m_std",
-        _F.coalesce(_F.stddev("claims_estimate").over(w3).cast("double"), _F.lit(0.0)) + _F.lit(1e-6)
+        _F.coalesce(_F.stddev("claims_count").over(w3).cast("double"), _F.lit(0.0)) + _F.lit(1e-6)
     )
 
 if "avg_loss_ratio" not in silver_features.columns:
@@ -142,7 +145,7 @@ if "avg_loss_ratio" not in silver_features.columns:
 if "total_premium" not in silver_features.columns:
     silver_features = silver_features.withColumn(
         "total_premium",
-        (_F.col("claims_estimate").cast("double") / _F.lit(0.65)) * _F.lit(3.5)
+        (_F.col("claims_count").cast("double") / _F.lit(0.65)) * _F.lit(3.5)
     )
 
 feature_df = (
@@ -358,64 +361,7 @@ if not JOB_MODE and 'training_df' in dir():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Publish to Online Table (Real-Time Feature Serving)
-# MAGIC
-# MAGIC The Online Table enables **low-latency feature lookup at inference time**.
-# MAGIC Instead of the model caller needing to pass all features, the serving endpoint
-# MAGIC retrieves them automatically from the Online Table.
-# MAGIC
-# MAGIC Use case: when the Model Serving endpoint (Module 5) scores a new forecast request,
-# MAGIC it looks up the latest rolling features for the requested segment — sub-millisecond latency.
-
-# COMMAND ----------
-
-import requests, json
-
-try:
-    WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-    # dbutils.notebook.entry_point is a JVM API that may not be available on all serverless configs
-    TOKEN = (
-        dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-        .apiToken().get()
-    )
-except Exception as _tok_err:
-    print(f"Could not retrieve API token ({type(_tok_err).__name__}) — skipping Online Table creation.")
-    WORKSPACE_URL = None
-    TOKEN = None
-
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.segment_features_online"
-
-if TOKEN and WORKSPACE_URL:
-    online_table_spec = {
-        "name": ONLINE_TABLE_NAME,
-        "spec": {
-            "source_table_full_name": FEATURE_TABLE,
-            "primary_key_columns":    [{"name": "segment_id"}, {"name": "month"}],
-            "run_triggered": {
-                "triggered_update_spec": {}
-            },
-        },
-    }
-
-    resp = requests.post(
-        f"https://{WORKSPACE_URL}/api/2.0/online-tables",
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        json=online_table_spec,
-    )
-
-    if resp.status_code in (200, 201):
-        print(f"Online Table created: {ONLINE_TABLE_NAME}")
-        print(f"Syncing from: {FEATURE_TABLE}")
-        print(f"Note: initial sync takes ~2-5 minutes")
-    elif resp.status_code == 409:
-        print(f"Online Table already exists: {ONLINE_TABLE_NAME}")
-    else:
-        print(f"Online Table creation response ({resp.status_code}): {resp.text[:300]}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Examine Feature Lineage in Unity Catalog
+# MAGIC ## 4. Examine Feature Lineage in Unity Catalog
 # MAGIC
 # MAGIC Every model that trains on this feature table creates a lineage link in Unity Catalog.
 # MAGIC This answers: *"Which models use this feature? What changes if we update it?"*
@@ -443,10 +389,9 @@ spark.sql(f"""
 # MAGIC
 # MAGIC | Step | What Happened |
 # MAGIC |---|---|
-# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 20 segments |
+# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 40 segments |
 # MAGIC | UC registration | Feature table with timestamp key — enables point-in-time joins |
 # MAGIC | Training set assembly | Point-in-time join guarantees no future leakage |
-# MAGIC | Online Table | Low-latency feature lookup for real-time scoring |
 # MAGIC | Lineage | UC tracks which models consume this feature table |
 # MAGIC
 # MAGIC **Key actuarial guarantee**: The point-in-time join ensures every training observation
@@ -454,4 +399,5 @@ spark.sql(f"""
 # MAGIC for unbiased actuarial models and regulatory compliance.
 # MAGIC
 # MAGIC **Next:** Module 4 — with reliable data and leakage-free features, we're ready to fit
-# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 20 segments.
+# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 40 segments. Module 4 reads
+# MAGIC `segment_monthly_features` to provide exogenous variables for SARIMAX forecasting.

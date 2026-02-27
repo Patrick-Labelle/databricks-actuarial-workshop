@@ -8,12 +8,12 @@ packaged as a single **Databricks Asset Bundle** for one-command deployment.
 
 ## What's in the box
 
-- **DLT medallion pipeline** — three data streams (policy CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
+- **DLT medallion pipeline** — three data streams (reserve development CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
 - **SARIMAX forecasting** — forecasts **monthly claim frequency and severity by product line and province** for reserving, pricing, and capital planning; 40 segments (4 product lines × 10 Canadian provinces), 72-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
 - **GARCH volatility modeling** — models **time-varying uncertainty in claim outcomes by segment** for risk capital and reinsurance; per-segment conditional variance estimation via the `arch` library
-- **t-Copula Monte Carlo** — simulates **portfolio loss distribution** for VaR/CVaR, 12-month capital-at-risk evolution, and catastrophe stress scenarios; 640M-path GPU simulation (Ray-on-Spark + PyTorch)
+- **t-Copula Monte Carlo** — simulates **portfolio loss distribution** for VaR/CVaR, 12-month capital-at-risk evolution, and catastrophe stress scenarios; 640M-path distributed simulation (Ray-on-Spark + NumPy/SciPy)
 - **MLflow + UC Model Registry** — PyFunc-wrapped models, versioned, with `@Champion` alias and AI Gateway-enabled serving endpoints
-- **Unity Catalog Feature Store** — point-in-time joins for leakage-free training sets, Online Table for real-time inference
+- **Unity Catalog Feature Store** — point-in-time joins for leakage-free training sets, Online Table for real-time feature lookup
 - **Streamlit risk dashboard** — claims forecasts, capital requirements, on-demand scoring, stress testing, and catastrophe scenario simulation backed by Lakebase (managed PostgreSQL) for analyst annotations
 
 ---
@@ -34,7 +34,7 @@ packaged as a single **Databricks Asset Bundle** for one-command deployment.
 │   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
 ├── scripts/
 │   ├── fetch_macro_data.py   # Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw
-│   └── lakebase_setup.py     # Local Lakebase setup script (runs from deploy.sh using CLI OAuth JWT)
+│   └── lakebase_setup.py     # Standalone Lakebase setup utility (not called by deploy.sh; DB setup is in Module 5)
 ├── src/
 │   ├── ops/
 │   │   ├── app_setup.py      # UC grants + model serving CAN_QUERY (runs as job task)
@@ -63,12 +63,7 @@ workspace-specific values never touch version control.
 
 ### 2. Install prerequisites
 
-`deploy.sh` requires **Databricks CLI >= 0.287.0** (Lakebase resource support) and
-**`psycopg2-binary`** (local Lakebase database setup):
-
-```bash
-pip install psycopg2-binary
-```
+`deploy.sh` requires **Databricks CLI >= 0.287.0** (Lakebase resource support).
 
 To upgrade the CLI if needed:
 ```bash
@@ -100,26 +95,17 @@ databricks bundle validate --target my-workspace
 >    app's service principal permissions on all UC catalog/schema/tables, Lakebase, and the serving endpoints.
 > 5. Deploys the app source code only after all permissions are in place, so the app starts without permission errors.
 
-Between steps 2 and 4, `deploy.sh` runs `scripts/lakebase_setup.py` locally to
-provision the PostgreSQL database, create the `scenario_annotations` table, and
-grant the app service principal access. This runs locally (not on a Databricks
-cluster) because Lakebase Autoscaling's `databricks_auth` extension only accepts
-standard OAuth JWTs issued by the workspace OIDC endpoint — internal cluster tokens
-are not accepted (see [Lakebase authentication](#lakebase-authentication) below).
-
 The setup job runs the following tasks in order:
-1. **Generate source data** — synthetic policy CDC events + claim incidents → `policy_cdc_raw`, `claims_events_raw`
-2. **Fetch macro data** (parallel after task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
+1. **Generate source data** — synthetic reserve development CDC + claim incidents → `reserve_development_raw`, `claims_events_raw`
+2. **Fetch macro data** (parallel with task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
 3. **Run DLT pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
-   - Policy: `bronze_policy_cdc` → `silver_policies` → `gold_segment_monthly_stats`
+   - Reserves: `bronze_reserve_cdc` → `silver_reserves` → `gold_reserve_triangle` (loss development triangle)
    - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 72 months)
    - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
-4. **Build rolling features** — window aggregates and rolling statistics per segment
-5. **Register Feature Store + Online Table** — leakage-free training set assembly and real-time lookup table
-6. **Fit SARIMAX / GARCH / Monte Carlo** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` from DLT; joins real StatCan macro exogenous variables; compares SARIMA vs SARIMAX MAPE
-7a. **Register SARIMA model** + create Model Serving endpoint
-7b. **Register Monte Carlo model** + create CPU endpoint — parallel with 7a
-8. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal
+4. **Register Feature Store** — leakage-free training set assembly; reads `silver_rolling_features` from DLT; features feed Module 4 SARIMAX as exogenous variables
+5. **Fit SARIMAX / GARCH / Monte Carlo + register models** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` + Feature Store features + `gold_reserve_triangle`; GARCH-derived CVs feed Monte Carlo; reserve validation compares forecasts to actual development; registers both models (SARIMA + MC) to UC with `@Champion` alias
+6. **Prepare app infrastructure** — creates both serving endpoints + AI Gateway, Online Table for low-latency feature lookup, Lakebase PostgreSQL database setup (DB, extension, table, SP role + grants) using `generate_database_credential()`
+7. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal
 
 ---
 
@@ -157,21 +143,21 @@ back to baseline SARIMA. The full pipeline completes successfully in both cases.
 
 ---
 
-## Ray-Enabled Deployment (GPU Monte Carlo)
+## Ray-Enabled Deployment (Distributed Monte Carlo)
 
-`04_classical_stats_at_scale.py` includes Ray-on-Spark code for GPU-accelerated
+`04_classical_stats_at_scale.py` includes Ray-on-Spark code for distributed
 Monte Carlo simulation. By default, the setup job skips the Ray section (`run_ray: "skip"`)
-so the full pipeline runs on serverless. To run with Ray + GPU, use the Ray-enabled variant:
+so the full pipeline runs on serverless. To run with Ray, use the Ray-enabled variant:
 
 ```bash
 ./deploy-ray.sh        # deploys to the Ray-enabled target (~20 min, includes ~5-10 min cluster spin-up)
 ```
 
 The Ray target overrides Task 5 (`fit_statistical_models`) from serverless to a
-**DBR 17.3-gpu-ml** job cluster (1 × `g4dn.xlarge`, NVIDIA Tesla T4), and passes
-`run_ray: "auto"` to the notebook.
+**DBR 16.4-cpu-ml** job cluster (4 × `m5.2xlarge` workers, 8 vCPU / 32 GB each),
+and passes `run_ray: "auto"` to the notebook.
 
-### GPU Monte Carlo details (t-Copula, 640M paths)
+### Distributed Monte Carlo details (t-Copula, 640M paths)
 
 The simulation produces **capital-at-risk and tail-risk metrics** (VaR/CVaR) and **stress-test outcomes** (catastrophe, correlation spike, inflation) for regulatory and internal risk management. All 64 Ray tasks are dispatched simultaneously in a single batch:
 
@@ -185,11 +171,11 @@ The simulation produces **capital-at-risk and tail-risk metrics** (VaR/CVaR) and
    - `inflation_shock`: +30% loss-cost inflation, +15% CV uncertainty
 
 - **t-Copula (df=4)** captures tail dependence between Property, Auto, and Liability lines
-- **100% GPU path:** `torch.distributions.StudentT.cdf()` (CUDA-native, PyTorch 2.7+) — zero CPU-GPU transfers
-- `num_gpus=0.25` + `num_cpus=0.5` fractional allocation: **4 concurrent tasks per T4**; 640M paths in ~90 seconds
-- CPU-only driver + 1 × GPU worker — Ray compute runs entirely on the worker
+- **NumPy/SciPy path:** `scipy.stats.t.cdf()` + `norm.ppf()` for copula and marginals
+- `num_cpus=1` per task: **24 concurrent tasks** across 4 workers (4 × 6 Ray CPUs); 640M paths in ~2-3 minutes
+- CPU-only driver + 4 × CPU workers — Ray compute runs on all workers in parallel
 
-> **Note:** Classic/GPU ML clusters are not available on serverless-only workspaces.
+> **Note:** Classic ML clusters are not available on serverless-only workspaces.
 
 ---
 
@@ -238,13 +224,12 @@ gitignored but force-included in the bundle sync via `databricks.yml`.
 
 | # | Notebook | Key concepts |
 |---|----------|-------------|
-| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API; 3 data streams (policy, claims, macro) |
-| 2 | `02_spark_vs_ray.py` | Pandas API on Spark, applyInPandas, Ray |
-| 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, Online Tables |
-| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (**claim forecasts and volatility by segment**), t-Copula Monte Carlo (**portfolio loss distribution, VaR, stress tests**), reads DLT gold + StatCan macro, Ray+GPU, MLflow |
-| 5 | `05_mlflow_uc_serving.py` | PyFunc, UC Model Registry, Model Serving |
-| 6 | `06_monte_carlo_serving.py` | Monte Carlo as REST API — MLflow PyFunc, UC Model Registry, AI Gateway |
-| 6 (CI/CD) | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
+| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API; 3 data streams (reserves, claims, macro) |
+| 2 | `02_performance_at_scale.py` | Performance at Scale — 4 ETL approaches timed, run-many-models, for-loop anti-patterns |
+| 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, leakage-free training sets |
+| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (**claim forecasts and volatility by segment**), t-Copula Monte Carlo (**portfolio loss distribution, VaR, stress tests**), reads DLT gold + StatCan macro, Ray distributed, MLflow, registers both models to UC |
+| 5 | `05_model_serving.py` | App Infrastructure — serving endpoints + AI Gateway, Online Table, Lakebase setup, monitoring |
+| 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |
 
 All notebooks accept `catalog`, `schema`, and `endpoint_name` as widget parameters
@@ -287,22 +272,23 @@ After running `./deploy.sh`, the following resources are created:
 
 Lakebase Autoscaling endpoints authenticate via the `databricks_auth` PostgreSQL
 extension. This extension validates **standard OAuth JWTs** (RFC 7519 tokens issued
-by the workspace OIDC endpoint), which it receives as the PostgreSQL password. It
-validates the token's signature against the workspace OIDC public keys and maps the
-`sub` claim to the PostgreSQL username.
+by the workspace OIDC endpoint), which it receives as the PostgreSQL password.
 
-**What works:** OAuth JWTs from `databricks auth token` (eyJ... prefix, ~850 chars,
-includes `sub`, `iss`, `aud`, `scope` claims).
+**What works:**
+- `WorkspaceClient().postgres.generate_database_credential()` — returns a valid JWT
+  from any compute type (serverless, classic, interactive). Used by Module 5 (setup job)
+  and by the app at runtime.
+- OAuth JWTs from `databricks auth token` (eyJ... prefix, ~850 chars) — used by
+  `scripts/lakebase_setup.py` for standalone local setup.
 
 **What does NOT work:**
 - Internal Databricks cluster tokens (`apiToken()`, ~36 chars, opaque, no JWT claims)
 - PATs (`dapi...`, also opaque tokens rejected by JWT validation)
 - Serverless `DATABRICKS_TOKEN` (also an opaque internal token)
 
-This is why `scripts/lakebase_setup.py` runs **locally from `deploy.sh`** using the
-CLI's OAuth JWT, rather than from a Databricks job task. The app itself uses
-`generate_database_credential` (which does produce a valid OAuth credential for
-service principals) to authenticate at runtime.
+Module 5 (`prepare_app_infrastructure` task) handles all Lakebase database setup
+using `generate_database_credential()`, so no local psycopg2 install is needed.
+`scripts/lakebase_setup.py` is retained as a standalone utility for manual setup.
 
 ---
 

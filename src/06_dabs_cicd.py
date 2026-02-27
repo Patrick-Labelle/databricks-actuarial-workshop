@@ -36,7 +36,7 @@
 # MAGIC │   └── pipelines.yml       ← DLT pipeline definitions (Module 1)
 # MAGIC ├── src/
 # MAGIC │   ├── 04_classical_stats_at_scale.py
-# MAGIC │   ├── 05_mlflow_uc_serving.py
+# MAGIC │   ├── 05_model_serving.py
 # MAGIC │   ├── 06_dabs_cicd.py
 # MAGIC │   └── monte_carlo.py      ← Reusable Python modules
 # MAGIC ├── tests/
@@ -139,7 +139,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: fit_sarima_garch
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/05_mlflow_uc_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/05_model_serving
 # MAGIC             base_parameters:
 # MAGIC               step: register
 # MAGIC           environment_key: ml_env
@@ -149,7 +149,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: register_champion_model
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/05_mlflow_uc_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/05_model_serving
 # MAGIC             base_parameters:
 # MAGIC               step: deploy_endpoint
 # MAGIC           environment_key: ml_env
@@ -449,7 +449,7 @@ print("\nTypical `databricks bundle deploy` output:")
 print(f"""
 Uploading bundle files to {_bundle_root}/files...
   ./src/04_classical_stats_at_scale.py (5.2 KB)
-  ./src/05_mlflow_uc_serving.py (4.8 KB)
+  ./src/05_model_serving.py (4.8 KB)
   ./src/06_dabs_cicd.py (3.1 KB)
   ./src/monte_carlo.py (1.2 KB)
 

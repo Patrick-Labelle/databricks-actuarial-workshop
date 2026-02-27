@@ -1,5 +1,8 @@
 # ─── DLT Pipeline: Medallion Architecture ────────────────────────────────────
-# Bronze → Silver (SCD Type 2) → Gold (segment monthly stats)
+# Three connected medallion pipelines:
+#   A) Reserve CDC:  reserve_development_raw → bronze_reserve_cdc → silver_reserves → gold_reserve_triangle
+#   B) Claims:       claims_events_raw → bronze_claims → gold_claims_monthly
+#   C) Macro:        macro_indicators_raw → bronze_macro → silver_macro → gold_macro_features
 # Source notebook: src/01_dlt_pipeline_and_jobs.py
 
 resources:

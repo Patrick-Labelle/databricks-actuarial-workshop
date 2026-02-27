@@ -26,6 +26,14 @@ variables:
     description: "Lakebase database name"
     default: actuarial_workshop_db
 
+  online_store_name:
+    description: "Name for the online feature store"
+    default: "actuarial-workshop-online-store"
+
+  online_store_capacity:
+    description: "Capacity tier for the online feature store"
+    default: CU_1
+
   notification_email:
     description: "Email address for job failure notifications (optional)"
     default: ""
@@ -43,7 +51,6 @@ sync:
 targets:
 
   dev:
-    default: true
     mode: development
     variables:
       catalog: my_catalog
