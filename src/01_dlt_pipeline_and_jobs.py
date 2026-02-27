@@ -589,6 +589,41 @@ if IN_DLT:
 
 # COMMAND ----------
 
+if IN_DLT:
+    from pyspark.sql import Window as _RollingWindow
+
+    @dlt.table(
+        name="silver_rolling_features",
+        comment="Rolling statistical features per segment. Feeds Feature Store (Module 3).",
+        table_properties={"quality": "silver"},
+    )
+    def silver_rolling_features():
+        claims = dlt.read("gold_claims_monthly")
+        w3  = _RollingWindow.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
+        w6  = _RollingWindow.partitionBy("segment_id").orderBy("month").rowsBetween(-5, 0)
+        w12 = _RollingWindow.partitionBy("segment_id").orderBy("month").rowsBetween(-11, 0)
+        lag_w = _RollingWindow.partitionBy("segment_id").orderBy("month")
+        return (
+            claims
+            .withColumn("rolling_3m_mean",  F.avg("claims_count").over(w3))
+            .withColumn("rolling_6m_mean",  F.avg("claims_count").over(w6))
+            .withColumn("rolling_12m_mean", F.avg("claims_count").over(w12))
+            .withColumn("rolling_3m_std",   F.stddev("claims_count").over(w3))
+            .withColumn("_prev",  F.lag("claims_count", 1).over(lag_w))
+            .withColumn("_prev12", F.lag("claims_count", 12).over(lag_w))
+            .withColumn("mom_change_pct",
+                F.when(F.col("_prev") != 0,
+                       (F.col("claims_count") - F.col("_prev")) / F.col("_prev") * 100)
+                 .otherwise(F.lit(0.0)))
+            .withColumn("yoy_change_pct",
+                F.when(F.col("_prev12") != 0,
+                       (F.col("claims_count") - F.col("_prev12")) / F.col("_prev12") * 100)
+                 .otherwise(F.lit(0.0)))
+            .drop("_prev", "_prev12")
+        )
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ### Step 6 — Macro Indicators: Bronze → Silver (SCD2) → Gold
 # MAGIC
@@ -947,11 +982,13 @@ except Exception:
 # MAGIC | Gold | `gold_reserve_triangle` | Materialized view; loss development triangle | **Module 4, App** |
 # MAGIC | Bronze | `bronze_claims` | Append-only claim events stream | Gold claims |
 # MAGIC | Gold | `gold_claims_monthly` | Materialized view; segment × month claims | **Module 2, 3, 4** |
+# MAGIC | Silver | `silver_rolling_features` | Rolling window features per segment | **Module 3 Feature Store** |
 # MAGIC | Bronze | `bronze_macro_indicators` | Append-only StatCan macro stream | Silver SCD2 |
 # MAGIC | Silver | `silver_macro_indicators` | SCD Type 2; tracks StatCan revisions | Gold features |
 # MAGIC | Gold | `gold_macro_features` | Pivoted macro features; current versions | **Module 4 exog** |
 # MAGIC
-# MAGIC `gold_claims_monthly` feeds Module 2 (scaling techniques), Module 3 (feature store), and Module 4 (SARIMAX).
+# MAGIC `gold_claims_monthly` feeds Module 2 (performance comparison), Module 3 (feature store), and Module 4 (SARIMAX).
+# MAGIC `silver_rolling_features` computes rolling window statistics from `gold_claims_monthly` and feeds Module 3.
 # MAGIC `gold_reserve_triangle` provides the loss development triangle for reserve adequacy validation in Module 4
 # MAGIC and display in the Streamlit app.
 # MAGIC

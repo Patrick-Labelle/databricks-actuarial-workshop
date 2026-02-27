@@ -9,10 +9,10 @@ A complete 1-day workshop for actuaries and data scientists, demonstrating how t
 | Module | Title | Key Concepts |
 |--------|-------|-------------|
 | 1 | DLT Pipeline + Databricks Workflows | Medallion architecture, Delta Live Tables, SCD Type 2, Job DAGs |
-| 2 | Spark vs Ray: Choosing the Right Parallelism | Pandas API on Spark, `applyInPandas`, Ray tasks, when to use each |
-| 3 | Feature Store + Point-in-Time Joins | UC Feature Store, data leakage prevention, Online Tables |
-| 4 | Classical Stats at Scale | SARIMA/GARCH per-segment, Monte Carlo with Ray, MLflow logging |
-| 5 | MLflow + UC Model Registry + Serving | PyFunc wrappers, Champion alias, Model Serving REST API |
+| 2 | Performance at Scale: Choosing the Right Spark Pattern | Four ETL approaches timed, run-many-models, for-loop anti-patterns, decision framework |
+| 3 | Feature Store + Point-in-Time Joins | UC Feature Store, data leakage prevention, point-in-time joins |
+| 4 | Classical Stats at Scale | SARIMA/GARCH per-segment, Ray-distributed Monte Carlo, MLflow logging, registers both models (SARIMA + MC) to UC Model Registry with Champion alias |
+| 5 | App Infrastructure | Serving endpoints + AI Gateway, Online Table, Lakebase setup, demo all app services |
 | 6 | CI/CD with DABs + Azure DevOps | Asset Bundles, bundle.yml, 3-stage DevOps pipeline |
 | Bonus | Databricks Apps + Lakebase | Streamlit on serverless, Postgres-integrated transactional state |
 
@@ -49,7 +49,7 @@ All notebooks are written for **Serverless Compute** (recommended) or a cluster 
 - Databricks Runtime 15.4 LTS ML or newer
 - Access to Unity Catalog
 
-For Modules 2 and 4 (Ray), the cluster needs Ray pre-installed (included in ML Runtime) or serverless with Ray support. Notebooks include single-node fallback if Ray is unavailable.
+For Module 4 (Ray), the cluster needs Ray pre-installed (included in ML Runtime) or serverless with Ray support. Notebooks include single-node fallback if Ray is unavailable.
 
 ### Python Libraries
 
@@ -57,11 +57,11 @@ The following libraries are used. On serverless, install via notebook-scoped lib
 
 | Library | Used In | Install |
 |---------|---------|---------|
-| `statsmodels>=0.14` | Modules 2, 4, 5 | Pre-installed on ML Runtime |
+| `statsmodels>=0.14` | Module 4 | Pre-installed on ML Runtime |
 | `arch>=7.0` | Module 4 | `%pip install arch` |
-| `mlflow>=2.14` | Modules 4, 5 | Pre-installed on ML Runtime |
+| `mlflow>=2.14` | Modules 4, 5 (MlflowClient) | Pre-installed on ML Runtime |
 | `databricks-feature-engineering` | Module 3 | Pre-installed on DBR 14+ |
-| `ray[default]` | Modules 2, 4 | Pre-installed on ML Runtime |
+| `ray[default]` | Module 4 | Pre-installed on ML Runtime |
 
 ### Unity Catalog Permissions
 
@@ -70,10 +70,10 @@ The notebooks write to `<CATALOG>.<SCHEMA>` (default: `my_catalog.actuarial_work
 - `USE CATALOG` on the target catalog
 - `CREATE SCHEMA` on the target catalog (to create `actuarial_workshop`)
 - `ALL PRIVILEGES` on the target schema (tables, views, feature tables)
-- `CREATE MODEL` privilege (for Module 5, UC Model Registry)
-- `CAN_USE` on a SQL Warehouse (for Online Table creation in Module 3)
+- `CREATE MODEL` privilege (for Module 4, UC Model Registry)
+- `CAN_USE` on a SQL Warehouse (for Online Table creation in Module 5)
 
-For the **Model Serving endpoint** (Module 5) and **Online Table** (Module 3), the user needs permission to create serving endpoints and online tables in the workspace (typically Databricks admin or granted via workspace settings).
+For the **Model Serving endpoints** and **Online Table** (both Module 5), the user needs permission to create serving endpoints and online tables in the workspace (typically Databricks admin or granted via workspace settings).
 
 ---
 
@@ -121,7 +121,7 @@ After running all modules, the following assets will exist in your workspace:
 | `gold_reserve_triangle` | Module 1 (DLT) | Loss development triangle (accident month × dev lag) |
 | `bronze_claims` | Module 1 (DLT) | Raw claim events, append-only |
 | `gold_claims_monthly` | Module 1 (DLT) | Segment × month claims aggregate (40 segments × 72 months) |
-| `silver_rolling_features` | Module 2 | Rolling means, volatility features per segment |
+| `silver_rolling_features` | Module 1 (DLT) | Rolling means, volatility features per segment |
 | `segment_monthly_features` | Module 3 | UC Feature Table (feeds Module 4 SARIMAX as exog vars) |
 | `sarima_forecasts` | Module 4 | SARIMAX forecasts + confidence intervals for all 40 segments |
 | `garch_volatility` | Module 4 | GARCH(1,1) volatility estimates → feeds MC CVs |
@@ -136,20 +136,23 @@ After running all modules, the following assets will exist in your workspace:
 | Experiment | Created By |
 |------------|------------|
 | `actuarial_workshop_claims_sarima` | Module 4 |
-| `actuarial_workshop_sarima_claims_forecaster` | Module 5 |
+| `actuarial_workshop_sarima_claims_forecaster` | Module 4 |
+| `actuarial_workshop_monte_carlo_portfolio` | Module 4 |
 
 ### UC Model Registry
 
 | Model | Created By | Alias |
 |-------|------------|-------|
-| `<CATALOG>.<SCHEMA>.sarima_claims_forecaster` | Module 5 | `@Champion` |
+| `<CATALOG>.<SCHEMA>.sarima_claims_forecaster` | Module 4 | `@Champion` |
+| `<CATALOG>.<SCHEMA>.monte_carlo_portfolio` | Module 4 | `@Champion` |
 
 ### Serving + Feature Infrastructure
 
 | Asset | Created By |
 |-------|------------|
 | Model Serving endpoint `actuarial-workshop-sarima-forecaster` | Module 5 |
-| Online Table `<CATALOG>.<SCHEMA>.segment_features_online` | Module 3 |
+| Model Serving endpoint `actuarial-workshop-monte-carlo` | Module 5 |
+| Online Table `<CATALOG>.<SCHEMA>.segment_features_online` | Module 5 |
 | DLT Pipeline `Actuarial Workshop — DLT Pipeline` | Module 1 (manual step) |
 | Databricks Job `Actuarial Workshop — Orchestration Demo` | Module 1 |
 
@@ -185,7 +188,7 @@ For the Bonus app, all connection values (`PGHOST`, `DATABRICKS_HOST`, `CATALOG`
 - **Synthetic data parameters** (Modules 1, 2, 4): Product lines, regions, date ranges, and loss ratios are all configurable at the top of each notebook's data generation cell.
 - **SARIMA parameters** (Module 4): `ORDER` and `SEASONAL_ORDER` are set conservatively for speed; adjust for better fit.
 - **Monte Carlo paths** (Module 4): `N_PATHS = 10_000` by default; increase for higher-fidelity VaR estimates.
-- **Ray cluster size** (Modules 2, 4): `num_cpus` and `num_gpus` in `setup_ray_cluster()` defaults to serverless; increase for larger workloads.
+- **Ray cluster size** (Module 4): `num_cpus_worker_node` in `setup_ray_cluster()` defaults to serverless; increase for larger workloads.
 
 ---
 
@@ -250,19 +253,19 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 - Multi-task Databricks Job created programmatically via REST API
 - Task value passing between Job tasks
 
-**Key actuarial concept:** Medallion architecture ensures raw policy data is always preserved, SCD Type 2 enables "as-of" queries, and DLT expectations enforce data quality without boilerplate code.
+**Key actuarial concept:** Medallion architecture ensures raw reserve data is always preserved, SCD Type 2 tracks how reserve estimates develop over time (a core actuarial workflow), and DLT expectations enforce data quality without boilerplate code.
 
 ---
 
-### Module 2: Spark vs Ray (`02_spark_vs_ray.py`)
+### Module 2: Performance at Scale (`02_performance_at_scale.py`)
 
 **What it demonstrates:**
-- Pandas API on Spark (`pyspark.pandas`) — write pandas code, run on a distributed cluster
-- `applyInPandas` for per-segment OLS trend fitting (data-parallel)
-- Ray tasks for ARIMA grid search (task-parallel, embarrassingly parallel)
-- When to use each: data-parallel vs task-parallel parallelism
+- Four approaches to rolling-window ETL: plain pandas, Native Spark, Pandas API on Spark, `applyInPandas` — timed side-by-side on small (2,880 rows) and scaled (300K rows) datasets
+- Three approaches to run-many-models (OLS per segment): for-loop, `applyInPandas`, Spark built-in `regr_slope`/`regr_intercept` — showing parallelism trade-offs
+- For-loop anti-patterns: why `withColumn` in a loop is O(N²) and how `select()` + list comprehension fixes it
+- Decision framework: when to use each pattern (Native Spark, `applyInPandas`, Pandas API, Ray, `select()`)
 
-**Key actuarial concept:** The choice of parallelism framework matters. Data transformations scale with Spark; per-model fitting (SARIMA per segment) scales with `applyInPandas`; independent simulations scale with Ray.
+**Key actuarial concept:** Before building models, choose the right Spark pattern. Data transforms scale with native Spark window functions; per-group model fitting scales with `applyInPandas`; simple aggregates use Spark built-ins; and multi-column generation must avoid the `withColumn` loop trap. This module produces no persistent outputs — it's a standalone performance guide.
 
 ---
 
@@ -271,7 +274,6 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 **What it demonstrates:**
 - UC Feature Store table registration with `FeatureEngineeringClient`
 - Point-in-time joins via `timestamp_lookup_key` — no future leakage
-- Online Table for low-latency feature serving at inference
 - Feature lineage tracking in Unity Catalog
 
 **Key actuarial concept:** Point-in-time joins are the production-grade equivalent of "as-of" pricing — every training observation uses only features available at the observation date.
@@ -281,25 +283,27 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 ### Module 4: Classical Stats at Scale (`04_classical_stats_at_scale.py`)
 
 **What it demonstrates:**
-- SARIMA fitting across 20 segments using `applyInPandas` (statsmodels SARIMAX)
-- GARCH volatility modeling with the `arch` library
-- Monte Carlo portfolio simulation with Ray (`@ray.remote`)
+- SARIMAX fitting across 40 segments using `applyInPandas` with Feature Store exogenous variables and StatCan macro data
+- GARCH volatility modeling with the `arch` library — conditional volatilities feed Monte Carlo CVs
+- Ray-distributed Monte Carlo portfolio simulation (`@ray.remote`, NumPy/SciPy) using GARCH-calibrated CVs
+- Reserve validation: SARIMA forecasts vs. actual development from `gold_reserve_triangle`
 - VaR and CVaR computation, results written to Delta + logged to MLflow
 
-**Key actuarial concept:** Classical statistical models (SARIMA, GARCH) remain the right tool for actuarial time series. Databricks enables fitting them at scale across all segments in minutes instead of hours.
+**Key actuarial concept:** Classical statistical models (SARIMAX, GARCH) remain the right tool for actuarial time series. Feature Store provides leakage-free exogenous variables, GARCH-derived volatilities calibrate the Monte Carlo simulation, and reserve validation closes the loop between forecasts and actual development. Both production models (SARIMA + Monte Carlo) are registered to UC with `@Champion` alias, ready for serving.
 
 ---
 
-### Module 5: MLflow + UC Model Registry + Serving (`05_mlflow_uc_serving.py`)
+### Module 5: App Infrastructure (`05_model_serving.py`)
 
 **What it demonstrates:**
-- `mlflow.pyfunc.PythonModel` wrapper for SARIMA — standardized inference interface
-- Unity Catalog Model Registry with semantic versioning and `@Champion` alias
-- Model Serving endpoint creation via REST API
-- Calling the endpoint with a standard REST request
+- Creating both SARIMA and Monte Carlo serving endpoints via REST API
+- AI Gateway configuration via separate `PUT /serving-endpoints/{name}/ai-gateway` call
+- Online Table creation for low-latency feature serving
+- Lakebase PostgreSQL setup using `generate_database_credential()` from the Databricks SDK
+- Demo calls to every service the Streamlit app uses (endpoints, DBSQL, Lakebase)
 - Monitoring via `system.serving.served_entities_request_logs`
 
-**Key actuarial concept:** MLflow PyFunc wraps any statistical model (SARIMA, GARCH, survival) in a standard interface, enabling deployment, A/B testing, and rollback without changing scoring code.
+**Key actuarial concept:** Before an actuarial review app can launch, every data service it depends on must be provisioned and tested. This module creates the complete integration layer — model endpoints, feature serving, transactional state — so the app starts cleanly with full permissions.
 
 ---
 

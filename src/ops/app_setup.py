@@ -3,14 +3,11 @@
 # MAGIC # App Setup Notebook
 # MAGIC ## UC Permission Grants + Model Serving Endpoint Grant
 # MAGIC
-# MAGIC **Run once as part of the `actuarial_workshop_setup` job (Task 7).**
+# MAGIC **Run once as part of the `actuarial_workshop_setup` job (Task 6).**
 # MAGIC
-# MAGIC The Lakebase PostgreSQL database setup (create DB, enable databricks_auth
-# MAGIC extension, create SP role, create table, grant Lakebase privileges) runs
-# MAGIC locally from `deploy.sh` using the CLI's OAuth JWT, which is the only
-# MAGIC credential type accepted by Lakebase Autoscaling's `databricks_auth`
-# MAGIC extension. Internal Databricks cluster tokens are not valid for direct
-# MAGIC PostgreSQL authentication.
+# MAGIC Lakebase PostgreSQL setup (DB, table, extension, SP grants) is handled by
+# MAGIC Module 5 (`prepare_app_infrastructure` task) using the Databricks SDK's
+# MAGIC `generate_database_credential()` for authentication.
 # MAGIC
 # MAGIC ### What this notebook does
 # MAGIC
@@ -91,7 +88,7 @@ print("\nUC grants complete.")
 # COMMAND ----------
 
 # ─── 2. Grant CAN_QUERY on serving endpoints to the app SP ────────────────────
-# Both endpoints are created by Tasks 6a/6b before this task runs.
+# Both endpoints are created by Task 5 (prepare_app_infrastructure) before this task runs.
 _endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME] if ep]
 
 for ep_name in _endpoints_to_grant:

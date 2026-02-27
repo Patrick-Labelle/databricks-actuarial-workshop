@@ -13,8 +13,8 @@ resources:
       name: "Actuarial Workshop — Full Setup"
       description: >-
         One-time setup: generates synthetic data, runs the DLT pipeline,
-        builds the Feature Store, fits SARIMA/GARCH models, registers the
-        model to UC, and creates the serving endpoint.
+        builds the Feature Store, fits SARIMA/GARCH models, registers both
+        models to UC, and creates the serving endpoints with AI Gateway.
 
       tasks:
 
@@ -31,13 +31,12 @@ resources:
           environment_key: default_env
 
         # Task 1b — Fetch real macro data from Statistics Canada
-        # Runs in parallel with nothing — depends only on generate_source_data creating
-        # the schema. Must complete before run_dlt_pipeline so that macro_indicators_raw
-        # exists and is populated when the DLT bronze_macro_indicators streaming table runs.
+        # Runs in parallel with generate_source_data — both handle schema creation
+        # independently (CREATE SCHEMA IF NOT EXISTS). Must complete before
+        # run_dlt_pipeline so that macro_indicators_raw is populated when the
+        # DLT bronze_macro_indicators streaming table runs.
         - task_key: fetch_macro_data
           description: "Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw"
-          depends_on:
-            - task_key: generate_source_data
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
@@ -60,27 +59,16 @@ resources:
             pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
             full_refresh: true
 
-        # Task 3 — Build rolling features (Module 2)
-        - task_key: build_rolling_features
-          description: "Compute rolling means and volatility features per segment"
+        # Task 3 — Register Feature Store table (Module 3)
+        # job_mode=true: writes feature table as plain Delta, skips display() calls,
+        # FeatureEngineeringClient, and training set assembly.
+        # Online Table creation is handled by Module 5 (prepare_app_infrastructure).
+        # These interactive demo sections are preserved for human learners running interactively.
+        # Reads silver_rolling_features produced by the DLT pipeline.
+        - task_key: build_feature_store
+          description: "UC Feature Store registration (Online Table created by Module 5)"
           depends_on:
             - task_key: run_dlt_pipeline
-          notebook_task:
-            notebook_path: ../src/02_spark_vs_ray.py
-            base_parameters:
-              catalog: "${var.catalog}"
-              schema: "${var.schema}"
-              run_ray: "skip"   # Ray on Spark not supported on serverless; interactive demo only
-          environment_key: default_env
-
-        # Task 4 — Register Feature Store table and Online Table (Module 3)
-        # job_mode=true: writes feature table as plain Delta, skips display() calls,
-        # FeatureEngineeringClient, training set assembly, and Online Table creation.
-        # These interactive demo sections are preserved for human learners running interactively.
-        - task_key: build_feature_store
-          description: "UC Feature Store registration + Online Table for low-latency serving"
-          depends_on:
-            - task_key: build_rolling_features
           notebook_task:
             notebook_path: ../src/03_feature_store.py
             base_parameters:
@@ -90,7 +78,7 @@ resources:
               job_mode: "true"
           environment_key: default_env
 
-        # Task 5 — Fit SARIMAX / GARCH / Monte Carlo (Module 4)
+        # Task 4 — Fit SARIMAX / GARCH / Monte Carlo + register models (Module 4)
         # Reads gold_claims_monthly (DLT) and gold_macro_features (DLT, populated by fetch_macro_data).
         # run_ray=skip: setup_ray_cluster is not supported on Serverless (Spark Connect
         # does not expose the Ray-on-Spark RPC interface). The single-node NumPy fallback
@@ -104,7 +92,7 @@ resources:
         # Classic-cluster targets (e2-demo-ray) add job_cluster_key via target override;
         # environment_key cannot coexist with job_cluster_key on classic compute.
         - task_key: fit_statistical_models
-          description: "SARIMAX per segment (+ macro exog), GARCH volatility, Monte Carlo simulation"
+          description: "SARIMAX/GARCH/Monte Carlo + register both models (SARIMA + MC) to UC"
           depends_on:
             - task_key: build_feature_store
           notebook_task:
@@ -115,46 +103,33 @@ resources:
               run_ray: "skip"
               job_mode: "true"
 
-        # Task 6a — Register SARIMA model + create serving endpoint (Module 5)
-        - task_key: register_and_serve_model
-          description: "MLflow PyFunc, UC Model Registry @Champion, Model Serving endpoint"
+        # Task 5 — Prepare all app infrastructure (Module 5)
+        # Creates both serving endpoints + AI Gateway, the Online Table for
+        # low-latency feature lookup, and the Lakebase PostgreSQL database
+        # (DB, extension, table, SP role + grants). Uses the Databricks SDK's
+        # generate_database_credential() to get a valid JWT for Lakebase auth.
+        - task_key: prepare_app_infrastructure
+          description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup"
           depends_on:
             - task_key: fit_statistical_models
           notebook_task:
-            notebook_path: ../src/05_mlflow_uc_serving.py
+            notebook_path: ../src/05_model_serving.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
               endpoint_name: "${var.endpoint_name}"
-          environment_key: ml_env
-
-        # Task 6b — Register Monte Carlo model + create CPU serving endpoint (Module 6)
-        # Runs in parallel with task 6a: both depend on fit_statistical_models.
-        # CPU endpoint is sufficient — scipy t-CDF is not GPU-accelerated.
-        - task_key: register_monte_carlo_endpoint
-          description: "t-Copula PyFunc, UC Model Registry @Champion, CPU Monte Carlo endpoint"
-          depends_on:
-            - task_key: fit_statistical_models
-          notebook_task:
-            notebook_path: ../src/06_monte_carlo_serving.py
-            base_parameters:
-              catalog: "${var.catalog}"
-              schema: "${var.schema}"
               mc_endpoint_name: "${var.mc_endpoint_name}"
+              warehouse_id: "${var.warehouse_id}"
+              pg_database: "${var.pg_database}"
+              app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
           environment_key: ml_env
 
-        # Task 7 — App setup: UC grants + model serving endpoint grants
-        # Runs after both serving endpoints exist so that CAN_QUERY can be granted.
-        #
-        # Lakebase PostgreSQL setup (create DB, extension, SP role, table, grants)
-        # is handled by scripts/lakebase_setup.py running locally from deploy.sh,
-        # using the CLI's OAuth JWT. Internal cluster tokens cannot authenticate
-        # with Lakebase Autoscaling's databricks_auth extension.
+        # Task 6 — App setup: UC grants + model serving endpoint grants
+        # Runs after all app infrastructure exists so that CAN_QUERY can be granted.
         - task_key: setup_app_dependencies
           description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on both serving endpoints"
           depends_on:
-            - task_key: register_and_serve_model
-            - task_key: register_monte_carlo_endpoint
+            - task_key: prepare_app_infrastructure
           notebook_task:
             notebook_path: ../src/ops/app_setup.py
             base_parameters:
@@ -181,6 +156,7 @@ resources:
               - statsmodels>=0.14
               - arch>=7.0
               - mlflow>=2.14
+              - psycopg2-binary
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
     # Scheduled job: refreshes data via DLT then re-fits the SARIMA models.
     actuarial_workshop_refresh:

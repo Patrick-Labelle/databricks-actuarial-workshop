@@ -24,7 +24,7 @@
 # MAGIC ### What We'll Build
 # MAGIC
 # MAGIC ```
-# MAGIC Silver rolling features (Module 2)
+# MAGIC Silver rolling features (DLT pipeline)
 # MAGIC         ↓ register
 # MAGIC UC Feature Table ({catalog}.{schema}.segment_features)
 # MAGIC         ↓ point-in-time join
@@ -51,8 +51,8 @@ from pyspark.sql.window import Window
 dbutils.widgets.text("catalog",      "my_catalog",         "UC Catalog")
 dbutils.widgets.text("schema",       "actuarial_workshop", "UC Schema")
 dbutils.widgets.text("warehouse_id", "",                   "SQL Warehouse ID")
-# job_mode: "true" skips display() calls, Feature Engineering client, training set demo,
-# and Online Table creation. Set to "false" for full interactive demo.
+# job_mode: "true" skips display() calls, Feature Engineering client, and training set demo.
+# Online Table creation is handled by Module 5. Set to "false" for full interactive demo.
 dbutils.widgets.dropdown("job_mode", "false", ["false", "true"], "Job (automated) mode")
 CATALOG       = dbutils.widgets.get("catalog")
 SCHEMA        = dbutils.widgets.get("schema")
@@ -77,7 +77,7 @@ FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
 
 # COMMAND ----------
 
-# Load Silver rolling features (from Module 2) or regenerate
+# Load Silver rolling features (from DLT pipeline) or regenerate
 try:
     silver_features = spark.table(f"{CATALOG}.{SCHEMA}.silver_rolling_features")
     print(f"Loaded from Silver: {silver_features.count()} rows")
@@ -361,64 +361,7 @@ if not JOB_MODE and 'training_df' in dir():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Publish to Online Table (Real-Time Feature Serving)
-# MAGIC
-# MAGIC The Online Table enables **low-latency feature lookup at inference time**.
-# MAGIC Instead of the model caller needing to pass all features, the serving endpoint
-# MAGIC retrieves them automatically from the Online Table.
-# MAGIC
-# MAGIC Use case: when the Model Serving endpoint (Module 5) scores a new forecast request,
-# MAGIC it looks up the latest rolling features for the requested segment — sub-millisecond latency.
-
-# COMMAND ----------
-
-import requests, json
-
-try:
-    WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-    # dbutils.notebook.entry_point is a JVM API that may not be available on all serverless configs
-    TOKEN = (
-        dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-        .apiToken().get()
-    )
-except Exception as _tok_err:
-    print(f"Could not retrieve API token ({type(_tok_err).__name__}) — skipping Online Table creation.")
-    WORKSPACE_URL = None
-    TOKEN = None
-
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.segment_features_online"
-
-if TOKEN and WORKSPACE_URL:
-    online_table_spec = {
-        "name": ONLINE_TABLE_NAME,
-        "spec": {
-            "source_table_full_name": FEATURE_TABLE,
-            "primary_key_columns":    [{"name": "segment_id"}, {"name": "month"}],
-            "run_triggered": {
-                "triggered_update_spec": {}
-            },
-        },
-    }
-
-    resp = requests.post(
-        f"https://{WORKSPACE_URL}/api/2.0/online-tables",
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        json=online_table_spec,
-    )
-
-    if resp.status_code in (200, 201):
-        print(f"Online Table created: {ONLINE_TABLE_NAME}")
-        print(f"Syncing from: {FEATURE_TABLE}")
-        print(f"Note: initial sync takes ~2-5 minutes")
-    elif resp.status_code == 409:
-        print(f"Online Table already exists: {ONLINE_TABLE_NAME}")
-    else:
-        print(f"Online Table creation response ({resp.status_code}): {resp.text[:300]}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Examine Feature Lineage in Unity Catalog
+# MAGIC ## 4. Examine Feature Lineage in Unity Catalog
 # MAGIC
 # MAGIC Every model that trains on this feature table creates a lineage link in Unity Catalog.
 # MAGIC This answers: *"Which models use this feature? What changes if we update it?"*
@@ -449,7 +392,6 @@ spark.sql(f"""
 # MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 40 segments |
 # MAGIC | UC registration | Feature table with timestamp key — enables point-in-time joins |
 # MAGIC | Training set assembly | Point-in-time join guarantees no future leakage |
-# MAGIC | Online Table | Low-latency feature lookup for real-time scoring |
 # MAGIC | Lineage | UC tracks which models consume this feature table |
 # MAGIC
 # MAGIC **Key actuarial guarantee**: The point-in-time join ensures every training observation
