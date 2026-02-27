@@ -1492,7 +1492,7 @@ except Exception as _tri_err:
 
 # COMMAND ----------
 
-import pickle, tempfile, cloudpickle, scipy
+import os, pickle, tempfile, cloudpickle, scipy
 import statsmodels as _statsmodels
 import matplotlib
 matplotlib.use("Agg")
