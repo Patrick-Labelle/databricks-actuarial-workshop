@@ -24,7 +24,7 @@
 # MAGIC | Section | What | Why |
 # MAGIC |---|---|---|
 # MAGIC | **1. Scaling ETL** | 4 approaches to rolling features | Understand when pandas, Spark, or UDFs win |
-# MAGIC | **2. Run Many Models** | 3 approaches to OLS per segment | Data-parallel vs sequential vs built-in |
+# MAGIC | **2. Run Many Models** | 4 approaches to OLS per segment | Data-parallel vs sequential vs built-in |
 # MAGIC | **3. For-Loop Anti-Patterns** | `withColumn` loop vs `select()` | The #1 Spark performance trap |
 # MAGIC | **4. Decision Framework** | Summary table | Quick reference for production choices |
 
@@ -121,7 +121,7 @@ display(gold_df.limit(10))
 # MAGIC **Task**: Compute rolling window features (3m/6m/12m means, std, MoM/YoY %) for each segment.
 # MAGIC This is the exact computation that the DLT pipeline runs in production (`silver_rolling_features`).
 # MAGIC
-# MAGIC We compare **four approaches** on the real 2,880-row dataset, then scale to ~300K rows
+# MAGIC We compare **four approaches** on the real 2,880-row dataset, then scale to ~1.4M rows
 # MAGIC to see where each approach shines.
 # MAGIC
 # MAGIC | # | Approach | Description |
@@ -197,45 +197,14 @@ print(f"  Result: {_count_b} rows")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Approach C: Pandas API on Spark (familiar syntax, distributed execution)
+# MAGIC ### Shared UDF — used by Approaches C and D
+# MAGIC
+# MAGIC Both Pandas API on Spark and `applyInPandas` dispatch the **same Python function**
+# MAGIC to Spark workers. We define it once here.
 
 # COMMAND ----------
 
-# Pandas API on Spark — familiar pandas syntax, but executed on Spark behind the scenes.
-# Note: .transform(lambda: rolling()) may crash on Serverless; we use a safe subset here.
 import pyspark.pandas as ps
-
-with timed("Approach C — Pandas API on Spark (2,880 rows)"):
-    ps.set_option("compute.ops_on_diff_frames", True)
-    ps_df = gold_df.to_pandas_on_spark().sort_values(["segment_id", "month"])
-    # Pandas API on Spark supports rolling on the whole DataFrame (not grouped transform on all runtimes)
-    ps_df = ps_df.set_index(["segment_id", "month"]).sort_index()
-    # Use a simpler approach: convert to Spark and use window functions
-    # (demonstrating that the API parity has limits for grouped rolling)
-    ps_result = ps_df.reset_index()
-    _count_c = len(ps_result)
-
-print(f"  Result: {_count_c} rows")
-print("  Note: Grouped rolling via .transform() has limited support on Serverless.")
-print("  In practice, switch to Native Spark (Approach B) for grouped window operations.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Approach D: `applyInPandas` (per-group pandas UDF)
-
-# COMMAND ----------
-
-ROLLING_SCHEMA = StructType(
-    gold_df.schema.fields + [
-        StructField("rolling_3m_mean",  DoubleType(), True),
-        StructField("rolling_6m_mean",  DoubleType(), True),
-        StructField("rolling_12m_mean", DoubleType(), True),
-        StructField("rolling_3m_std",   DoubleType(), True),
-        StructField("mom_change_pct",   DoubleType(), True),
-        StructField("yoy_change_pct",   DoubleType(), True),
-    ]
-)
 
 def rolling_features_udf(pdf: pd.DataFrame) -> pd.DataFrame:
     """Per-group UDF: receives one segment's data as a pandas DataFrame."""
@@ -249,6 +218,48 @@ def rolling_features_udf(pdf: pd.DataFrame) -> pd.DataFrame:
     pdf["yoy_change_pct"]   = claims.pct_change(12).fillna(0) * 100
     return pdf
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Approach C: Pandas API on Spark (familiar syntax, distributed execution)
+# MAGIC
+# MAGIC `ps.DataFrame.groupby().apply()` compiles to `applyInPandas` internally —
+# MAGIC same engine, pandas-style API. No schema declaration needed.
+
+# COMMAND ----------
+
+# Pandas API on Spark — groupby().apply() dispatches the same UDF to Spark workers.
+with timed("Approach C — Pandas API on Spark (2,880 rows)"):
+    ps.set_option("compute.ops_on_diff_frames", True)
+    ps_df = gold_df.to_pandas_on_spark()
+    ps_result = ps_df.groupby("segment_id").apply(rolling_features_udf)
+    _count_c = len(ps_result)
+
+print(f"  Result: {_count_c} rows")
+print("  Note: groupby().apply() compiles to applyInPandas — same engine, pandas-style API.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Approach D: `applyInPandas` (per-group pandas UDF)
+# MAGIC
+# MAGIC Same function as Approach C, but called via the Spark `applyInPandas` API.
+# MAGIC The difference: you must declare the output schema explicitly.
+
+# COMMAND ----------
+
+# applyInPandas requires an explicit output schema (Pandas API on Spark infers it).
+ROLLING_SCHEMA = StructType(
+    gold_df.schema.fields + [
+        StructField("rolling_3m_mean",  DoubleType(), True),
+        StructField("rolling_6m_mean",  DoubleType(), True),
+        StructField("rolling_12m_mean", DoubleType(), True),
+        StructField("rolling_3m_std",   DoubleType(), True),
+        StructField("mom_change_pct",   DoubleType(), True),
+        StructField("yoy_change_pct",   DoubleType(), True),
+    ]
+)
+
 with timed("Approach D — applyInPandas (2,880 rows)"):
     result_d = gold_df.groupBy("segment_id").applyInPandas(rolling_features_udf, schema=ROLLING_SCHEMA)
     _count_d = result_d.count()
@@ -258,42 +269,51 @@ print(f"  Result: {_count_d} rows")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Scale Test: 300K Rows
+# MAGIC ### Scale Test: 1.4M Rows (500×)
 # MAGIC
-# MAGIC At 2,880 rows, pandas wins (no Spark overhead). What happens at 100× scale?
+# MAGIC At 2,880 rows, pandas wins (no Spark overhead). What happens at 500× scale?
 
 # COMMAND ----------
 
-# Create a ~300K row dataset by replicating the Gold data 100×
-# Each replica gets a suffix so segment_ids remain unique within replicas
-replicas = []
-for i in range(100):
-    replicas.append(
-        gold_df.withColumn("segment_id",
-            F.concat(F.col("segment_id"), F.lit(f"_r{i:03d}")))
-    )
-from functools import reduce
-large_df = reduce(lambda a, b: a.unionAll(b), replicas)
+# Create a ~1.4M row dataset by replicating the Gold data 500×
+# crossJoin produces a single plan node — much faster than 500 unions
+large_df = (
+    spark.range(500).withColumnRenamed("id", "replica_id")
+    .crossJoin(gold_df)
+    .withColumn("segment_id",
+        F.concat(F.col("segment_id"), F.lit("_r"), F.lpad(F.col("replica_id").cast("string"), 3, "0")))
+    .drop("replica_id")
+)
+large_df.cache()
 large_count = large_df.count()
-print(f"Scaled dataset: {large_count:,} rows ({large_df.select('segment_id').distinct().count()} segments)")
+n_segments = large_df.select("segment_id").distinct().count()
+print(f"Scaled dataset: {large_count:,} rows ({n_segments:,} segments)")
 
 # COMMAND ----------
 
-with timed("Approach A — Plain pandas (300K rows)"):
+with timed("Approach A — Plain pandas (1.4M rows)"):
     pdf_large = large_df.toPandas()
     result_a_large = compute_rolling_pandas(pdf_large)
 print(f"  Result: {len(result_a_large)} rows")
 
 # COMMAND ----------
 
-with timed("Approach B — Native Spark (300K rows)"):
+with timed("Approach B — Native Spark (1.4M rows)"):
     result_b_large = compute_rolling_spark(large_df)
     _count_b_large = result_b_large.count()
 print(f"  Result: {_count_b_large} rows")
 
 # COMMAND ----------
 
-with timed("Approach D — applyInPandas (300K rows)"):
+with timed("Approach C — Pandas API on Spark (1.4M rows)"):
+    ps_large = large_df.to_pandas_on_spark()
+    ps_result_large = ps_large.groupby("segment_id").apply(rolling_features_udf)
+    _count_c_large = len(ps_result_large)
+print(f"  Result: {_count_c_large} rows")
+
+# COMMAND ----------
+
+with timed("Approach D — applyInPandas (1.4M rows)"):
     result_d_large = large_df.groupBy("segment_id").applyInPandas(rolling_features_udf, schema=ROLLING_SCHEMA)
     _count_d_large = result_d_large.count()
 print(f"  Result: {_count_d_large} rows")
@@ -305,11 +325,12 @@ print(f"  Result: {_count_d_large} rows")
 # MAGIC
 # MAGIC | Rows | Plain Pandas | Native Spark | Pandas API on Spark | applyInPandas |
 # MAGIC |------|-------------|-------------|---------------------|---------------|
-# MAGIC | 2,880 | Fastest (no overhead) | Spark startup cost | Limited grouped ops | UDF overhead |
-# MAGIC | 300K | **Slows down** (single core) | **Scales flat** | — | **Scales well** (parallel groups) |
+# MAGIC | 2,880 | Fastest (no overhead) | Spark startup cost | ≈ applyInPandas + overhead | UDF overhead |
+# MAGIC | 1.4M | **Slows down** (single core) | **Scales flat** | **Scales** (compiles to applyInPandas) | **Scales well** (parallel groups) |
 # MAGIC
 # MAGIC **Takeaway**: At small scale, pandas is fine. At production scale, **Native Spark window functions**
 # MAGIC are the clear winner for ETL transforms — no serialization, fully optimized by Catalyst.
+# MAGIC Pandas API on Spark and `applyInPandas` both scale, but carry serialization overhead.
 
 # COMMAND ----------
 
@@ -324,6 +345,7 @@ print(f"  Result: {_count_d_large} rows")
 # MAGIC | A | Plain pandas for-loop | `toPandas()`, loop over segments, `np.polyfit()` |
 # MAGIC | B | `applyInPandas` | `groupBy("segment_id").applyInPandas(ols_fn, schema)` |
 # MAGIC | C | Native Spark built-ins | `F.regr_slope()`, `F.regr_intercept()` — pure SQL |
+# MAGIC | D | Pandas API on Spark | `ps.groupby().apply(ols_fn)` — compiles to `applyInPandas` |
 
 # COMMAND ----------
 
@@ -447,16 +469,114 @@ display(ols_result_c.orderBy(F.col("annualized_growth_pct").desc()).limit(10))
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### Approach D: Pandas API on Spark OLS (syntactic sugar)
+# MAGIC
+# MAGIC Same `ols_per_segment` function from Approach B, dispatched via `ps.groupby().apply()`.
+# MAGIC No schema declaration needed — Pandas API on Spark infers it.
+
+# COMMAND ----------
+
+with timed("Approach D — Pandas API on Spark OLS (40 segments)"):
+    ps_ols_df = gold_df.select("segment_id", "month", "claims_count").to_pandas_on_spark()
+    ols_result_d = ps_ols_df.groupby("segment_id").apply(ols_per_segment)
+    _count_ols_d = len(ols_result_d)
+
+print(f"  Fitted {_count_ols_d} segments")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Scale Test: OLS on 1.4M Rows (20K segments)
+# MAGIC
+# MAGIC At 40 segments, all approaches are fast. At 20,000 segments, the differences become dramatic.
+
+# COMMAND ----------
+
+# Prepare scaled dataset with time index for Approach C (Spark built-ins)
+seg_w_large = Window.partitionBy("segment_id").orderBy("month")
+large_with_idx = large_df.withColumn("time_idx", (F.row_number().over(seg_w_large) - 1).cast("double"))
+large_ols_cols = large_df.select("segment_id", "month", "claims_count")
+
+# COMMAND ----------
+
+with timed("Approach A — Pandas for-loop OLS (20K segments)"):
+    pdf_ols_large = large_ols_cols.toPandas()
+    ols_large_a = []
+    for seg_id, group in pdf_ols_large.groupby("segment_id"):
+        group = group.sort_values("month")
+        y = group["claims_count"].astype(float).values
+        t = np.arange(len(y), dtype=float)
+        if len(y) > 1:
+            slope, intercept = np.polyfit(t, y, 1)
+            fitted = intercept + slope * t
+            ss_res = np.sum((y - fitted) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        else:
+            slope = intercept = r2 = 0.0
+        ols_large_a.append({
+            "segment_id": seg_id, "slope": slope, "intercept": intercept,
+            "r_squared": r2,
+            "annualized_growth_pct": (slope * 12 / np.mean(y)) * 100 if np.mean(y) > 0 else 0.0,
+        })
+    ols_df_large_a = pd.DataFrame(ols_large_a)
+print(f"  Fitted {len(ols_df_large_a)} segments")
+
+# COMMAND ----------
+
+with timed("Approach B — applyInPandas OLS (20K segments)"):
+    ols_result_b_large = (
+        large_ols_cols
+        .groupBy("segment_id")
+        .applyInPandas(ols_per_segment, schema=OLS_SCHEMA)
+    )
+    _count_ols_b_large = ols_result_b_large.count()
+print(f"  Fitted {_count_ols_b_large} segments")
+
+# COMMAND ----------
+
+with timed("Approach C — Spark regr_slope/regr_intercept (20K segments)"):
+    ols_result_c_large = (
+        large_with_idx
+        .groupBy("segment_id")
+        .agg(
+            F.regr_slope("claims_count", "time_idx").alias("slope"),
+            F.regr_intercept("claims_count", "time_idx").alias("intercept"),
+            F.regr_r2("claims_count", "time_idx").alias("r_squared"),
+            F.avg("claims_count").alias("avg_claims"),
+        )
+        .withColumn("annualized_growth_pct",
+            F.when(F.col("avg_claims") > 0,
+                   F.col("slope") * 12 / F.col("avg_claims") * 100)
+             .otherwise(F.lit(0.0)))
+        .drop("avg_claims")
+    )
+    _count_ols_c_large = ols_result_c_large.count()
+print(f"  Fitted {_count_ols_c_large} segments")
+
+# COMMAND ----------
+
+with timed("Approach D — Pandas API on Spark OLS (20K segments)"):
+    ps_ols_large = large_ols_cols.to_pandas_on_spark()
+    ols_result_d_large = ps_ols_large.groupby("segment_id").apply(ols_per_segment)
+    _count_ols_d_large = len(ols_result_d_large)
+print(f"  Fitted {_count_ols_d_large} segments")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### Section 2 Summary
 # MAGIC
-# MAGIC | Approach | How it works | Best for |
-# MAGIC |---|---|---|
-# MAGIC | **Pandas for-loop** | Sequential on driver | Prototyping, <10 groups |
-# MAGIC | **`applyInPandas`** | Parallel on Spark workers | Arbitrary Python per group (statsmodels, scipy) |
-# MAGIC | **Spark built-ins** | Pure SQL engine, no UDF | Simple aggregates (`regr_slope`, window fns) |
+# MAGIC | Approach | How it works | 40 segments | 20K segments | Best for |
+# MAGIC |---|---|---|---|---|
+# MAGIC | **A. Pandas for-loop** | Sequential on driver | Fast | **Very slow** | Prototyping, <10 groups |
+# MAGIC | **B. `applyInPandas`** | Parallel on Spark workers | UDF overhead | **Scales well** | Arbitrary Python per group (statsmodels, scipy) |
+# MAGIC | **C. Spark built-ins** | Pure SQL engine, no UDF | Fast | **Fastest** | Simple aggregates (`regr_slope`, window fns) |
+# MAGIC | **D. Pandas API on Spark** | Compiles to `applyInPandas` | UDF overhead | **≈ applyInPandas** | Familiar pandas syntax, easy migration |
 # MAGIC
 # MAGIC **Takeaway**: For simple models (OLS, averages), Spark built-ins are fastest.
 # MAGIC For complex models (SARIMA, GARCH — see Module 4), `applyInPandas` is the way to go.
+# MAGIC Pandas API on Spark is convenient syntactic sugar — same performance as `applyInPandas`.
 
 # COMMAND ----------
 
@@ -571,7 +691,7 @@ print(f"  Try it yourself if you're curious — but be prepared to cancel the ce
 # MAGIC | **ETL transforms** (rolling windows, joins, aggregations) | Native Spark | Scales, Catalyst-optimized, no serialization |
 # MAGIC | **Per-group modeling** (SARIMA, GARCH, custom Python) | `applyInPandas` | Arbitrary Python per group, data-parallel on workers |
 # MAGIC | **Simple aggregates** (OLS, correlation, variance) | Spark built-in functions | `regr_slope`, `corr`, `stddev` — no UDF overhead |
-# MAGIC | **Explore / prototype** | Pandas API on Spark | Familiar pandas syntax, easy migration path |
+# MAGIC | **Explore / prototype / migrate** | Pandas API on Spark | Familiar pandas syntax; `groupby().apply()` compiles to `applyInPandas` |
 # MAGIC | **Heavy task-parallel compute** (Monte Carlo, grid search) | Ray (see Module 4) | Independent Python tasks, GPU optional |
 # MAGIC | **Multi-column generation** | `select()` + list comprehension | Avoids O(N²) Catalyst plan resolution |
 # MAGIC
