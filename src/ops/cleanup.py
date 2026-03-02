@@ -16,7 +16,7 @@
 # MAGIC
 # MAGIC | Asset | Type | Created By |
 # MAGIC |---|---|---|
-# MAGIC | `{catalog}.{schema}` | UC Schema + all tables | Modules 1–5 |
+# MAGIC | `{catalog}.{schema}` | UC Schema + all tables (incl. legacy `garch_volatility`) | Modules 1–5 |
 # MAGIC | `segment_features_online` | Online Table | Module 3 |
 # MAGIC | `actuarial-workshop-sarima-forecaster` | Model Serving endpoint | Module 5 |
 # MAGIC | `actuarial_workshop_sarima_claims_forecaster` | MLflow experiment | Module 5 |
