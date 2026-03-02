@@ -240,15 +240,16 @@ def load_var_timeline():
     return df
 
 def load_garch_volatility(segment_id: str):
-    """Load GARCH conditional volatility for a segment."""
+    """Load GARCH conditional volatility from SARIMA residuals for a segment."""
     df = execute_sql(f"""
-        SELECT month, loss_ratio, cond_volatility, forecast_vol_1m, forecast_vol_12m
-        FROM {CATALOG}.{SCHEMA}.garch_volatility
+        SELECT month, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta
+        FROM {CATALOG}.{SCHEMA}.sarima_forecasts
         WHERE segment_id = '{segment_id}' AND record_type = 'actual'
+          AND cond_volatility IS NOT NULL
         ORDER BY month
     """)
     if not df.empty:
-        for col in ['loss_ratio', 'cond_volatility', 'forecast_vol_1m', 'forecast_vol_12m']:
+        for col in ['cond_volatility', 'arch_lm_pvalue', 'garch_alpha', 'garch_beta']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
@@ -590,7 +591,7 @@ Insurance claims across **40 segments** (product line × Canadian province):
 | Model | Business purpose |
 |---|---|
 | **Claims Forecasting** | Projects monthly claim volumes per segment — used in the Claims Forecast and Quick Forecast tabs |
-| **Volatility Model** | Estimates how unpredictable loss ratios are month-to-month — feeds into capital calculations |
+| **Volatility Model** | GARCH(1,1) on SARIMA residuals — captures time-varying forecast uncertainty, feeds into Monte Carlo capital calculations |
 | **Monte Carlo Simulation** | Runs millions of loss scenarios to compute capital requirements (Expected Loss, SCR, Tail Risk) — powers the Capital Requirements and Stress Testing tabs |
 """)
 
@@ -603,7 +604,7 @@ Raw CDC events
   → Silver (SCD Type 2 policies)
   → Gold (monthly segment stats)
   → Feature Store (point-in-time joins)
-  → SARIMA / GARCH per segment
+  → SARIMA+GARCH per segment
   → Monte Carlo portfolio simulation
   → UC Model Registry (@Champion)
      ├── SARIMA endpoint (Forecasts tab)
@@ -753,11 +754,12 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                         help="Average margin of uncertainty around the monthly forecast. Wider ranges reflect higher uncertainty — normal as the forecast extends further into the future."
                     )
 
-                # GARCH volatility overlay
+                # GARCH volatility overlay (from SARIMA residuals)
                 with st.expander("📊 GARCH Volatility Overlay", expanded=False):
                     st.caption(
-                        "Conditional volatility from GARCH(1,1) — shows how loss ratio variability "
-                        "clusters over time. Higher volatility periods indicate greater uncertainty in claims."
+                        "Conditional volatility from GARCH(1,1) fitted on SARIMA residuals — "
+                        "shows time-varying forecast uncertainty. Higher volatility periods "
+                        "produce wider prediction intervals in the chart above."
                     )
                     garch_df = load_garch_volatility(selected)
                     if not garch_df.empty:
@@ -767,18 +769,29 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                             x=garch_df["month"], y=garch_df["cond_volatility"],
                             mode="lines", name="Conditional Volatility",
                             line=dict(color="#FF6B35", width=2),
-                            hovertemplate="<b>%{x}</b><br>Volatility: %{y:.3f}<extra></extra>",
+                            hovertemplate="<b>%{x}</b><br>Volatility: %{y:.1f} claims<extra></extra>",
                         ))
                         fig_garch.update_layout(
-                            title=f"{selected} — GARCH(1,1) Conditional Volatility",
+                            title=f"{selected} — GARCH(1,1) on SARIMA Residuals",
                             xaxis_title="Month",
-                            yaxis_title="Conditional Volatility (loss ratio log-returns)",
+                            yaxis_title="Conditional Volatility (claims count units)",
                             height=300,
                             hovermode="x unified",
                         )
                         st.plotly_chart(fig_garch, use_container_width=True)
+                        # Show ARCH-LM diagnostic
+                        if 'arch_lm_pvalue' in garch_df.columns:
+                            _pval = garch_df['arch_lm_pvalue'].iloc[0]
+                            if pd.notna(_pval):
+                                _sig = "significant" if _pval < 0.10 else "not significant"
+                                st.caption(f"ARCH-LM p-value: {_pval:.4f} ({_sig} at 10% level)")
+                        if 'garch_alpha' in garch_df.columns and 'garch_beta' in garch_df.columns:
+                            _alpha = garch_df['garch_alpha'].iloc[0]
+                            _beta = garch_df['garch_beta'].iloc[0]
+                            if pd.notna(_alpha) and pd.notna(_beta):
+                                st.caption(f"GARCH parameters: alpha={_alpha:.3f} (news impact), beta={_beta:.3f} (persistence), sum={_alpha+_beta:.3f}")
                     else:
-                        st.info("GARCH volatility data not yet available. Run Module 4 to generate.")
+                        st.info("No significant ARCH effects detected for this segment, or Module 4 has not been run yet.")
 
                 with st.expander("📋 Raw forecast data"):
                     st.markdown("""

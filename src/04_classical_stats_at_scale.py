@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Module 4: Classical Statistical Models at Scale
-# MAGIC ## SARIMAX/GARCH per Segment + Monte Carlo with Ray
+# MAGIC ## SARIMAX + GARCH(1,1) on Residuals + Monte Carlo with Ray
 # MAGIC
 # MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
 # MAGIC *Audience: Actuaries, Data Scientists, Financial Analysts*
@@ -10,16 +10,16 @@
 # MAGIC ### What We'll Cover
 # MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the DLT pipeline (40 segments × 72 months)
 # MAGIC 2. **Macro Integration** — Join real StatCan macro data; visualize claims vs unemployment
-# MAGIC 3. **SARIMAX at Scale** — Per-segment SARIMA + SARIMAX fit; compare MAPE with/without exog
-# MAGIC 4. **GARCH at Scale** — Per-segment volatility modeling with the `arch` library
+# MAGIC 3. **SARIMAX + GARCH at Scale** — Per-segment SARIMA + SARIMAX fit with GARCH(1,1) on residuals for time-varying CIs
+# MAGIC 4. **ARCH-LM Diagnostic** — Engle's test results; why GARCH on residuals is correct
 # MAGIC 5. **Monte Carlo with Ray** — Task-parallel portfolio loss simulation (100k+ paths)
 # MAGIC 6. **Reserve Validation** — SARIMA forecasts vs. actual development from the loss triangle
-# MAGIC 7. **Model Registration** — Register SARIMA + Monte Carlo models to UC with `@Champion` alias
+# MAGIC 7. **Model Registration** — Register SARIMA+GARCH + Monte Carlo models to UC with `@Champion` alias
 # MAGIC
 # MAGIC ---
 # MAGIC ### Why `applyInPandas`?
 # MAGIC
-# MAGIC We have **40 segments** (4 product lines × 10 provinces), each needing its own SARIMAX/GARCH fit.
+# MAGIC We have **40 segments** (4 product lines × 10 provinces), each needing its own SARIMAX fit + GARCH(1,1) on residuals.
 # MAGIC These are **independent** per-group operations. `applyInPandas` lets Spark distribute this work:
 # MAGIC each executor receives a pandas DataFrame for one segment, runs standard Python/statsmodels code,
 # MAGIC and returns results. No Spark ML required — just familiar Python libraries.
@@ -237,7 +237,7 @@ except Exception as _fs_err:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. SARIMAX at Scale — Per-Segment Forecasting with Macro + Feature Store Exogenous Variables
+# MAGIC ## 3. SARIMAX + GARCH at Scale — Per-Segment Forecasting with Volatility Modeling
 # MAGIC
 # MAGIC ### Strategy
 # MAGIC We use `df.groupby("segment_id").applyInPandas(fit_fn, schema)`.
@@ -247,7 +247,8 @@ except Exception as _fs_err:
 # MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` + Feature Store features as exog
 # MAGIC 3. Evaluates out-of-sample MAPE on held-out last 12 months (validation set)
 # MAGIC 4. Refits final model on all 72 months for the 12-month forecast
-# MAGIC 5. Returns a standardized pandas DataFrame with both MAPE metrics for comparison
+# MAGIC 5. Runs **Engle's ARCH-LM test** on residuals; if significant, fits **GARCH(1,1)** for time-varying CIs
+# MAGIC 6. Returns a standardized pandas DataFrame with MAPE metrics, conditional volatility, and GARCH diagnostics
 # MAGIC
 # MAGIC The output schema must be declared upfront so Spark can parallelize safely.
 
@@ -261,31 +262,42 @@ import pyspark.sql.functions as F
 # Output schema for SARIMAX results
 # New fields vs baseline SARIMA: mape_baseline, mape_sarimax, exog_vars
 SARIMA_SCHEMA = StructType([
-    StructField("segment_id",    StringType(), False),
-    StructField("month",         DateType(),   False),
-    StructField("record_type",   StringType(), False),   # "actual" or "forecast"
-    StructField("claims_count",  DoubleType(), True),
-    StructField("forecast_mean", DoubleType(), True),
-    StructField("forecast_lo95", DoubleType(), True),
-    StructField("forecast_hi95", DoubleType(), True),
-    StructField("aic",           DoubleType(), True),
-    StructField("mape",          DoubleType(), True),    # primary MAPE (SARIMAX if available)
-    StructField("mape_baseline", DoubleType(), True),    # SARIMA (no exog)
-    StructField("mape_sarimax",  DoubleType(), True),    # SARIMAX (with macro exog)
-    StructField("exog_vars",     StringType(), True),    # e.g. "unemployment_rate,hpi_growth"
+    StructField("segment_id",      StringType(), False),
+    StructField("month",           DateType(),   False),
+    StructField("record_type",     StringType(), False),   # "actual" or "forecast"
+    StructField("claims_count",    DoubleType(), True),
+    StructField("forecast_mean",   DoubleType(), True),
+    StructField("forecast_lo95",   DoubleType(), True),
+    StructField("forecast_hi95",   DoubleType(), True),
+    StructField("aic",             DoubleType(), True),
+    StructField("mape",            DoubleType(), True),    # primary MAPE (SARIMAX if available)
+    StructField("mape_baseline",   DoubleType(), True),    # SARIMA (no exog)
+    StructField("mape_sarimax",    DoubleType(), True),    # SARIMAX (with macro exog)
+    StructField("exog_vars",       StringType(), True),    # e.g. "unemployment_rate,hpi_growth"
+    StructField("cond_volatility", DoubleType(), True),    # GARCH σ_t on SARIMA residuals
+    StructField("arch_lm_pvalue",  DoubleType(), True),    # Engle's ARCH-LM test p-value
+    StructField("garch_alpha",     DoubleType(), True),    # GARCH α₁ (news impact)
+    StructField("garch_beta",      DoubleType(), True),    # GARCH β₁ (persistence)
 ])
 
 def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     """
-    Fit baseline SARIMA and SARIMAX with macro exogenous variables for one segment.
+    Fit baseline SARIMA and SARIMAX with macro exogenous variables for one segment,
+    then fit GARCH(1,1) on the SARIMA residuals to capture time-varying volatility.
 
     Train/validation split: first 60 months for training, last 12 for out-of-sample MAPE.
     Final model is refit on all 72 months for the 12-month forecast.
+
+    GARCH on residuals: After the final SARIMAX fit, run Engle's ARCH-LM test on the
+    residuals. If significant (p < 0.10), fit GARCH(1,1) to produce time-varying
+    prediction intervals and conditional volatility estimates for Monte Carlo CVs.
 
     Exogenous forecast: last 3-month average held flat (appropriate for a 12-month horizon;
     in production, use Bank of Canada / StatCan projections for the exog forecast).
     """
     from statsmodels.tsa.statespace.sarimax import SARIMAX
+    from arch import arch_model
+    from statsmodels.stats.diagnostic import het_arch
     import warnings
     warnings.filterwarnings("ignore")
 
@@ -370,7 +382,51 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 
     except Exception:
         # Return NaN forecasts — allows the pipeline to continue for all segments
-        pass
+        fit_final = None
+
+    # ── GARCH(1,1) on SARIMA residuals ────────────────────────────────────────
+    # Filter mean dynamics first (SARIMAX), then model the residual volatility.
+    # This is the econometrically correct approach — fitting GARCH on mean-filtered
+    # residuals. Standalone GARCH on raw data contaminates volatility estimates
+    # with unmodeled mean dynamics.
+    arch_lm_pval = garch_alpha_val = garch_beta_val = np.nan
+    cond_vol_actual = [None] * len(y)      # per-month conditional volatility (actuals)
+    cond_vol_fcast  = [None] * 12          # per-month GARCH forecast vol (forecast horizon)
+    _garch_fit = None
+
+    if fit_final is not None:
+        try:
+            resid = fit_final.resid[12:]  # skip seasonal burn-in (first 12 months)
+            # Engle's ARCH-LM test: null = no ARCH effects in residuals
+            _lm_stat, arch_lm_pval, _fstat, _fpval = het_arch(resid, nlags=4)
+            arch_lm_pval = float(arch_lm_pval)
+
+            if arch_lm_pval < 0.10:
+                # Significant ARCH effects — fit GARCH(1,1) on mean-filtered residuals
+                am = arch_model(resid, mean='Zero', vol='Garch', p=1, q=1, dist='normal')
+                _garch_fit = am.fit(disp='off', show_warning=False)
+
+                garch_alpha_val = float(_garch_fit.params.get('alpha[1]', np.nan))
+                garch_beta_val  = float(_garch_fit.params.get('beta[1]', np.nan))
+
+                # Align conditional volatility to full 72-month series
+                # (first 12 months are NaN due to seasonal burn-in)
+                _cv = _garch_fit.conditional_volatility
+                cond_vol_actual = [None] * 12 + [float(v) for v in _cv]
+
+                # Forecast GARCH volatility 12 months ahead
+                _garch_fc = _garch_fit.forecast(horizon=12, reindex=False)
+                _garch_var = np.asarray(_garch_fc.variance).flatten()[:12]
+                _garch_vol = np.sqrt(_garch_var)
+                cond_vol_fcast = [float(v) for v in _garch_vol]
+
+                # Time-varying CIs: replace statsmodels constant CIs
+                fcast_ci = pd.DataFrame({
+                    "lower": np.asarray(fcast_mean) - 1.96 * _garch_vol,
+                    "upper": np.asarray(fcast_mean) + 1.96 * _garch_vol,
+                })
+        except Exception:
+            pass  # GARCH cols stay NaN — statsmodels CIs are kept as-is
 
     # ── Build output DataFrame ────────────────────────────────────────────────
     last_month     = months.max()
@@ -381,33 +437,41 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     _primary_mape = mape_sarimax if has_exog and not np.isnan(mape_sarimax) else mape_baseline
 
     actuals_rows = pd.DataFrame({
-        "segment_id":    segment_id,
-        "month":         months.dt.date,
-        "record_type":   "actual",
-        "claims_count":  y.tolist(),
-        "forecast_mean": [None] * len(y),
-        "forecast_lo95": [None] * len(y),
-        "forecast_hi95": [None] * len(y),
-        "aic":           [None] * len(y),
-        "mape":          [None] * len(y),
-        "mape_baseline": [None] * len(y),
-        "mape_sarimax":  [None] * len(y),
-        "exog_vars":     [None] * len(y),
+        "segment_id":      segment_id,
+        "month":           months.dt.date,
+        "record_type":     "actual",
+        "claims_count":    y.tolist(),
+        "forecast_mean":   [None] * len(y),
+        "forecast_lo95":   [None] * len(y),
+        "forecast_hi95":   [None] * len(y),
+        "aic":             [None] * len(y),
+        "mape":            [None] * len(y),
+        "mape_baseline":   [None] * len(y),
+        "mape_sarimax":    [None] * len(y),
+        "exog_vars":       [None] * len(y),
+        "cond_volatility": cond_vol_actual,
+        "arch_lm_pvalue":  [arch_lm_pval if not np.isnan(arch_lm_pval) else None] * len(y),
+        "garch_alpha":     [garch_alpha_val if not np.isnan(garch_alpha_val) else None] * len(y),
+        "garch_beta":      [garch_beta_val if not np.isnan(garch_beta_val) else None] * len(y),
     })
 
     forecast_rows = pd.DataFrame({
-        "segment_id":    segment_id,
-        "month":         forecast_months.date,
-        "record_type":   "forecast",
-        "claims_count":  [None] * 12,
-        "forecast_mean": list(fcast_mean),
-        "forecast_lo95": list(np.asarray(fcast_ci)[:, 0]),
-        "forecast_hi95": list(np.asarray(fcast_ci)[:, 1]),
-        "aic":           [aic] * 12,
-        "mape":          [_primary_mape] * 12,
-        "mape_baseline": [mape_baseline] * 12,
-        "mape_sarimax":  [mape_sarimax]  * 12,
-        "exog_vars":     [exog_vars_str] * 12,
+        "segment_id":      segment_id,
+        "month":           forecast_months.date,
+        "record_type":     "forecast",
+        "claims_count":    [None] * 12,
+        "forecast_mean":   list(fcast_mean),
+        "forecast_lo95":   list(np.asarray(fcast_ci)[:, 0]),
+        "forecast_hi95":   list(np.asarray(fcast_ci)[:, 1]),
+        "aic":             [aic] * 12,
+        "mape":            [_primary_mape] * 12,
+        "mape_baseline":   [mape_baseline] * 12,
+        "mape_sarimax":    [mape_sarimax]  * 12,
+        "exog_vars":       [exog_vars_str] * 12,
+        "cond_volatility": cond_vol_fcast,
+        "arch_lm_pvalue":  [arch_lm_pval if not np.isnan(arch_lm_pval) else None] * 12,
+        "garch_alpha":     [garch_alpha_val if not np.isnan(garch_alpha_val) else None] * 12,
+        "garch_beta":      [garch_beta_val if not np.isnan(garch_beta_val) else None] * 12,
     })
 
     return pd.concat([actuals_rows, forecast_rows], ignore_index=True)
@@ -415,10 +479,10 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Run SARIMAX Across All 40 Segments
+# MAGIC ### Run SARIMAX + GARCH Across All 40 Segments
 # MAGIC
-# MAGIC Spark distributes one segment per task. Each task fits two models (SARIMA + SARIMAX)
-# MAGIC and returns MAPE for both — enabling a direct accuracy comparison in MLflow.
+# MAGIC Spark distributes one segment per task. Each task fits SARIMA + SARIMAX + GARCH(1,1)
+# MAGIC on residuals, returning MAPE for both mean models and conditional volatility estimates.
 
 # COMMAND ----------
 
@@ -444,7 +508,7 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         mlflow.log_input(_claims_dataset, context="training")
     mlflow.set_tags({
         "workshop_module": "4",
-        "model_type":      "SARIMAX(1,0,1)(1,1,0,12)",
+        "model_type":      "SARIMAX(1,0,1)(1,1,0,12)+GARCH(1,1)",
         "segments":        "40",
         "horizon_months":  "12",
         "exog_vars":       "unemployment_rate,hpi_growth" if HAS_MACRO else "none",
@@ -455,7 +519,7 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         # Driver-side: collect to pandas, fit in a Python loop.
         # Avoids applyInPandas which requires statsmodels on the remote Serverless
         # compute — a separate Python environment that %pip install cannot reach.
-        print("job_mode=true: using driver-side pandas groupby.apply() for SARIMAX")
+        print("job_mode=true: using driver-side pandas groupby.apply() for SARIMAX+GARCH")
         claims_pdf = claims_with_macro.toPandas()
         sarima_result_pdf = (
             claims_pdf
@@ -500,10 +564,19 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         "segments_fitted":          40,
     })
 
-    print(f"SARIMAX complete | Total rows: {total_rows}")
+    # Count segments with GARCH fitted
+    _garch_seg_count = (
+        sarima_results_df
+        .filter(F.col("record_type") == "forecast")
+        .filter(F.col("garch_alpha").isNotNull())
+        .select("segment_id").distinct().count()
+    )
+
+    print(f"SARIMAX+GARCH complete | Total rows: {total_rows}")
     print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
     print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
     print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
+    print(f"  GARCH(1,1) fitted:     {_garch_seg_count}/40 segments (ARCH-LM p < 0.10)")
     print(f"MLflow run: {run.info.run_id}")
 
 if not JOB_MODE:
@@ -527,153 +600,55 @@ print(f"Saved to {CATALOG}.{SCHEMA}.sarima_forecasts")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. GARCH at Scale — Volatility Modeling
+# MAGIC ## 4. ARCH-LM Diagnostic — GARCH(1,1) on SARIMA Residuals
 # MAGIC
-# MAGIC GARCH (Generalized AutoRegressive Conditional Heteroskedasticity) models **variance clustering** in loss ratios —
-# MAGIC the tendency for volatile periods to cluster together. This is critical for:
-# MAGIC - **Risk capital** calculations (Solvency II internal models)
-# MAGIC - **Reinsurance pricing** (tail risk quantification)
-# MAGIC - **Premium rate adequacy** stress testing
+# MAGIC ### Why GARCH on Residuals (Not on Raw Data)?
 # MAGIC
-# MAGIC We fit a **GARCH(1,1)** to the loss ratio of each segment and extract conditional volatility forecasts.
+# MAGIC The SARIMAX fit above models the **conditional mean** of claims. The residuals
+# MAGIC from that fit represent the *unexplained* variation — if those residuals show
+# MAGIC **volatility clustering** (quiet periods followed by volatile periods), a GARCH
+# MAGIC model can capture that time-varying uncertainty.
+# MAGIC
+# MAGIC **Engle's ARCH-LM test** (1982) checks whether squared residuals are autocorrelated:
+# MAGIC - **H₀:** No ARCH effects (homoskedastic residuals)
+# MAGIC - **H₁:** ARCH effects present (heteroskedastic — volatility clusters)
+# MAGIC - If p-value < 0.10, we fit **GARCH(1,1)** on the residuals
+# MAGIC
+# MAGIC This is the **econometrically correct** approach:
+# MAGIC 1. Filter the mean first (SARIMA) → then model the variance (GARCH)
+# MAGIC 2. Standalone GARCH on raw data contaminates volatility with unmodeled mean dynamics
+# MAGIC 3. GARCH on residuals produces **time-varying prediction intervals** and properly
+# MAGIC    calibrated coefficients of variation for Monte Carlo
+# MAGIC
+# MAGIC **Regulatory context:** Solvency II internal models, IFRS 17 risk adjustments, and
+# MAGIC OSFI MCT all require volatility estimates — but always on **mean-filtered** series.
 
 # COMMAND ----------
 
-GARCH_SCHEMA = StructType([
-    StructField("segment_id",          StringType(), False),
-    StructField("month",               DateType(),   False),
-    StructField("record_type",         StringType(), False),
-    StructField("loss_ratio",          DoubleType(), True),
-    StructField("cond_volatility",     DoubleType(), True),
-    StructField("forecast_vol_1m",     DoubleType(), True),
-    StructField("forecast_vol_12m",    DoubleType(), True),
-    StructField("omega",               DoubleType(), True),
-    StructField("alpha",               DoubleType(), True),
-    StructField("beta",                DoubleType(), True),
-    StructField("log_likelihood",      DoubleType(), True),
-])
-
-def fit_garch_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fit GARCH(1,1) to loss ratio returns for one segment.
-    Uses the `arch` library — standard actuarial Python tooling.
-    """
-    from arch import arch_model
-    import warnings
-    warnings.filterwarnings("ignore")
-
-    segment_id = pdf["segment_id"].iloc[0]
-    pdf = pdf.sort_values("month").reset_index(drop=True)
-
-    lr = pdf["loss_ratio"].astype(float).values
-    months = pd.to_datetime(pdf["month"])
-
-    # Work on log-returns of loss ratio (stationarity)
-    lr_returns = np.diff(np.log(np.clip(lr, 0.01, None))) * 100  # in pct
-
-    result_rows = []
-    omega_val = alpha_val = beta_val = ll_val = np.nan
-    cond_vols = [np.nan] + [np.nan] * len(lr_returns)
-
-    try:
-        am = arch_model(lr_returns, vol="Garch", p=1, q=1, dist="normal")
-        res = am.fit(disp="off", show_warning=False)
-
-        omega_val = float(res.params["omega"])
-        alpha_val = float(res.params["alpha[1]"])
-        beta_val  = float(res.params["beta[1]"])
-        ll_val    = float(res.loglikelihood)
-
-        # Conditional volatility (annualized, scaled to loss ratio units)
-        cond_vols = [np.nan] + list(res.conditional_volatility)
-
-        # Forecast: 1-month and 12-month ahead volatility
-        fc = res.forecast(horizon=12, reindex=False)
-        # Handle both DataFrame and ndarray variance output across arch versions
-        var_arr = np.asarray(fc.variance)
-        vol_1m  = float(np.sqrt(var_arr.flat[0]))
-        vol_12m = float(np.sqrt(var_arr.flat[11] if var_arr.size > 11 else var_arr.flat[-1]))
-
-    except Exception:
-        vol_1m = vol_12m = np.nan
-
-    for i, (m, lr_val, cv) in enumerate(zip(months, lr, cond_vols)):
-        result_rows.append({
-            "segment_id":       segment_id,
-            "month":            m.date(),
-            "record_type":      "actual",
-            "loss_ratio":       float(lr_val),
-            "cond_volatility":  float(cv) if not np.isnan(cv) else None,
-            "forecast_vol_1m":  vol_1m if i == len(months) - 1 else None,
-            "forecast_vol_12m": vol_12m if i == len(months) - 1 else None,
-            "omega":            omega_val,
-            "alpha":            alpha_val,
-            "beta":             beta_val,
-            "log_likelihood":   ll_val,
-        })
-
-    return pd.DataFrame(result_rows)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Run GARCH Across All Segments
-
-# COMMAND ----------
-
-with mlflow.start_run(run_name="garch_all_segments") as run:
-    if _log_input:
-        mlflow.log_input(_claims_dataset, context="training")
-    n_segments = claims_df.select("segment_id").distinct().count()
-    mlflow.set_tags({
-        "workshop_module": "4",
-        "model_type":      "GARCH(1,1)",
-        "segments":        str(n_segments),
-        "audience":        "actuarial-workshop",
-    })
-
-    if JOB_MODE:
-        print("job_mode=true: using driver-side pandas groupby.apply() for GARCH")
-        garch_result_pdf = (
-            claims_df.toPandas()
-            .groupby("segment_id", group_keys=False)
-            .apply(fit_garch_per_segment)
-            .reset_index(drop=True)
-        )
-        garch_results_df = spark.createDataFrame(garch_result_pdf, schema=GARCH_SCHEMA)
-    else:
-        garch_results_df = (
-            claims_df
-            .groupby("segment_id")
-            .applyInPandas(fit_garch_per_segment, schema=GARCH_SCHEMA)
-        )
-
-    garch_count = garch_results_df.count()
-
-    # Average persistence (alpha + beta) — key GARCH risk metric; close to 1 = long memory
-    avg_persistence = (
-        garch_results_df
-        .filter(F.col("record_type") == "actual")
-        .agg(F.mean((F.col("alpha") + F.col("beta"))).alias("avg_persistence"))
-        .collect()[0]["avg_persistence"]
-    )
-
-    mlflow.log_metric("avg_garch_persistence", round(avg_persistence, 4))
-    mlflow.log_metric("segments_fitted", n_segments)
-    print(f"GARCH complete | Rows: {garch_count} | Segments: {n_segments} | Avg persistence (α+β): {avg_persistence:.4f}")
+# Summarize ARCH-LM results across all 40 segments
+_arch_summary = (
+    sarima_results_df
+    .filter(F.col("record_type") == "forecast")
+    .select("segment_id", "arch_lm_pvalue", "garch_alpha", "garch_beta")
+    .distinct()
+    .orderBy("arch_lm_pvalue")
+)
+_arch_count = _arch_summary.filter(F.col("arch_lm_pvalue") < 0.10).count()
+_arch_total = _arch_summary.filter(F.col("arch_lm_pvalue").isNotNull()).count()
+print(f"ARCH-LM summary: {_arch_count}/{_arch_total} segments show significant ARCH effects (p < 0.10)")
+print("Segments with GARCH(1,1) fitted have time-varying CIs in sarima_forecasts.")
 
 if not JOB_MODE:
-    display(garch_results_df.orderBy("segment_id", "month").limit(30))
-
-# COMMAND ----------
-
-(garch_results_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.garch_volatility"))
-
-print(f"Saved to {CATALOG}.{SCHEMA}.garch_volatility")
+    # Show per-segment GARCH diagnostics
+    _garch_fitted = (
+        _arch_summary
+        .filter(F.col("garch_alpha").isNotNull())
+        .withColumn("persistence", F.col("garch_alpha") + F.col("garch_beta"))
+        .orderBy("arch_lm_pvalue")
+    )
+    if _garch_fitted.count() > 0:
+        print(f"\nGARCH(1,1) fitted segments (top 10 by ARCH-LM significance):")
+        display(_garch_fitted.limit(10))
 
 # COMMAND ----------
 
@@ -693,8 +668,8 @@ print(f"Saved to {CATALOG}.{SCHEMA}.garch_volatility")
 # MAGIC | Monte Carlo fit | Poor | **Excellent** |
 # MAGIC
 # MAGIC We simulate a **3-segment correlated portfolio** (Property, Auto, Liability):
-# MAGIC - **100,000 annual loss scenarios** using a **t-Copula + lognormal marginals** (see below)
-# MAGIC - Each Ray task handles **1,000 scenarios** → 100 tasks run in parallel on GPU workers
+# MAGIC - **10M annual loss scenarios per task** using a **t-Copula + lognormal marginals** (see below)
+# MAGIC - Each Ray task handles **10M scenarios** → tasks run in parallel across CPU workers
 # MAGIC - Aggregate: VaR(99.5%), CVaR, Expected Loss — standard Solvency II / IFRS 17 metrics
 # MAGIC
 # MAGIC ### Why t-Copula, Not Gaussian Copula?
@@ -770,7 +745,7 @@ else:
 # MAGIC %md
 # MAGIC ### Define Monte Carlo Task (t-Copula + Lognormal Marginals)
 # MAGIC
-# MAGIC Each `@ray.remote` task simulates **100,000 correlated loss scenarios** using:
+# MAGIC Each `@ray.remote` task simulates **10M correlated loss scenarios** using:
 # MAGIC 1. **t-Copula (df=4)** for joint dependence — captures tail co-movement between lines
 # MAGIC 2. **Lognormal marginals** — standard for insurance aggregate losses (skewed, non-negative)
 # MAGIC
@@ -895,39 +870,46 @@ except NameError:
 import numpy as np
 import pandas as pd
 
-# ── GARCH → Monte Carlo Bridge: derive CVs from fitted volatilities ──────────
-# Instead of hardcoded CVs, aggregate GARCH conditional volatilities by line of
-# business to produce data-driven coefficients of variation for the MC simulation.
-# This connects the GARCH output directly to Monte Carlo input.
+# ── GARCH → Monte Carlo Bridge: derive CVs from SARIMA residual volatilities ─
+# The GARCH(1,1) fitted on SARIMA residuals (inside fit_sarimax_per_segment)
+# produces conditional volatility in claims_count units.  The textbook CV is
+# simply σ/μ — no ad-hoc scaling needed because the units are already correct.
 _DEFAULT_CV = [0.35, 0.28, 0.42]  # fallback if GARCH results unavailable
 try:
-    _garch_pd = garch_results_df.toPandas()
-    _garch_pd["product_line"] = _garch_pd["segment_id"].str.split("__").str[0]
+    _sarima_cv_pd = sarima_results_df.toPandas()
+    _sarima_cv_pd["product_line"] = _sarima_cv_pd["segment_id"].str.split("__").str[0]
 
-    # Aggregate conditional volatility by product line → MC segment mapping
-    _garch_vol = (
-        _garch_pd[_garch_pd["cond_volatility"].notna()]
-        .groupby("product_line")["cond_volatility"]
-        .mean()
-    )
+    # Filter to actuals with GARCH conditional volatility
+    _actual_garch = _sarima_cv_pd[
+        (_sarima_cv_pd["record_type"] == "actual") &
+        (_sarima_cv_pd["cond_volatility"].notna())
+    ]
 
-    # Map product lines to MC segments (Property, Auto, Liability proxy)
-    _prop_vol = np.mean([_garch_vol.get("Homeowners", 0.35),
-                          _garch_vol.get("Commercial_Property", 0.42)])
-    _auto_vol = np.mean([_garch_vol.get("Personal_Auto", 0.28),
-                          _garch_vol.get("Commercial_Auto", 0.30)])
-    # Liability proxied as average of Property and Auto volatility
-    _liab_vol = 0.5 * (_prop_vol + _auto_vol)
+    if len(_actual_garch) > 0:
+        # CV = mean(σ_t) / mean(claims_count) per product line (textbook definition)
+        _cv_by_line = (
+            _actual_garch
+            .groupby("product_line")
+            .apply(lambda g: g["cond_volatility"].mean() / max(g["claims_count"].mean(), 1.0))
+        )
 
-    # Scale GARCH volatility (in log-return %) to CV space (typically 0.1–0.6)
-    # GARCH conditional vol is in % of log-returns; scale to CV by dividing by 100
-    # and applying a floor/ceiling for stability
-    _garch_cvs = np.clip(
-        np.array([_prop_vol, _auto_vol, _liab_vol]) / 100.0 * 3.0,  # empirical scaling
-        0.15, 0.60,
-    ).tolist()
-    print(f"GARCH-derived CVs: Property={_garch_cvs[0]:.3f}, Auto={_garch_cvs[1]:.3f}, Liability={_garch_cvs[2]:.3f}")
-    _MC_USE_GARCH_CV = True
+        # Map product lines to MC segments (Property, Auto, Liability proxy)
+        _prop_cv = np.mean([_cv_by_line.get("Homeowners", 0.35),
+                             _cv_by_line.get("Commercial_Property", 0.42)])
+        _auto_cv = np.mean([_cv_by_line.get("Personal_Auto", 0.28),
+                             _cv_by_line.get("Commercial_Auto", 0.30)])
+        _liab_cv = 0.5 * (_prop_cv + _auto_cv)
+
+        _garch_cvs = np.clip(
+            np.array([_prop_cv, _auto_cv, _liab_cv]),
+            0.15, 0.60,
+        ).tolist()
+        print(f"GARCH-derived CVs (σ/μ): Property={_garch_cvs[0]:.3f}, Auto={_garch_cvs[1]:.3f}, Liability={_garch_cvs[2]:.3f}")
+        _MC_USE_GARCH_CV = True
+    else:
+        print("No segments with GARCH conditional volatility — using default CVs")
+        _garch_cvs = _DEFAULT_CV
+        _MC_USE_GARCH_CV = False
 except (NameError, Exception) as _garch_cv_err:
     print(f"GARCH CVs not available ({_garch_cv_err}) — using default CVs: {_DEFAULT_CV}")
     _garch_cvs = _DEFAULT_CV
@@ -1103,7 +1085,7 @@ if RAY_AVAILABLE:
 # 4 tasks per run, 10M scenarios each → distributed across 24 Ray CPU slots.
 # 10M paths/task: ~600 MB RAM per task; 24 concurrent tasks across 4 workers.
 N_TASKS          = 4
-N_PER_TASK       = 10_000_000      # 10× — GPU stress demo; total ~640M paths
+N_PER_TASK       = 10_000_000      # 10M paths per task; total ~640M paths
 STRESS_SCENARIOS = ['stress_corr', 'cat_event', 'inflation_shock']
 N_RUNS           = 1 + len(_forecast_months) + len(STRESS_SCENARIOS)
 
@@ -1339,7 +1321,7 @@ if RAY_AVAILABLE:
         print(f'\nStress scenarios saved → {CATALOG}.{SCHEMA}.stress_test_scenarios')
 
 else:
-    # Fallback: single-node t-Copula simulation without Ray (Serverless / no GPU)
+    # Fallback: single-node t-Copula simulation without Ray (Serverless / no Ray cluster)
     print('\nRunning single-node Monte Carlo (Ray not available on this cluster)\n')
     from scipy.stats import t as tdist, norm as scipy_norm
     N_SCENARIOS  = 100_000
@@ -1494,6 +1476,7 @@ except Exception as _tri_err:
 
 import os, pickle, tempfile, cloudpickle, scipy
 import statsmodels as _statsmodels
+import arch as _arch_pkg
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1503,26 +1486,32 @@ from mlflow.tracking import MlflowClient
 # ── PyFunc wrapper (same interface as Module 5's serving contract) ────────────
 class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
     """
-    MLflow PyFunc wrapper for a fitted statsmodels SARIMAX model.
+    MLflow PyFunc wrapper for a fitted SARIMAX + optional GARCH(1,1) model.
 
     Input:  pandas DataFrame with column `horizon` (int) — months to forecast
     Output: pandas DataFrame with columns: month_offset, forecast_mean, lo95, hi95
 
-    This pattern works for any classical Python model: statsmodels, lifelines,
-    scikit-survival, arch — wrap it, log it, serve it.
+    When a GARCH pickle is present, prediction intervals are time-varying
+    (wider at longer horizons due to GARCH volatility persistence).
+    When absent, falls back to constant statsmodels CIs.
     """
 
     def load_context(self, context):
-        """Load the pickled SARIMAX model from the MLflow artifact store."""
+        """Load the pickled SARIMAX model and optional GARCH model."""
         import pickle
         import os
         model_path = os.path.join(context.artifacts["sarimax_model"], "model.pkl")
         with open(model_path, "rb") as f:
             self.model_fit = pickle.load(f)
+        garch_path = os.path.join(context.artifacts["sarimax_model"], "garch.pkl")
+        self.garch_fit = None
+        if os.path.exists(garch_path):
+            with open(garch_path, "rb") as f:
+                self.garch_fit = pickle.load(f)
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         """
-        Generate forecast.
+        Generate forecast with time-varying CIs when GARCH is available.
 
         Args:
             model_input: DataFrame with column `horizon` (int, 1–24)
@@ -1535,13 +1524,22 @@ class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
 
         forecast = self.model_fit.get_forecast(steps=horizon)
         mean_fcst = forecast.predicted_mean
-        ci        = np.asarray(forecast.conf_int(alpha=0.05))
+
+        if self.garch_fit is not None:
+            # Time-varying CIs from GARCH forecast volatility
+            fc = self.garch_fit.forecast(horizon=horizon, reindex=False)
+            garch_vol = np.sqrt(np.asarray(fc.variance).flatten()[:horizon])
+            lo95 = np.asarray(mean_fcst) - 1.96 * garch_vol
+            hi95 = np.asarray(mean_fcst) + 1.96 * garch_vol
+        else:
+            ci = np.asarray(forecast.conf_int(alpha=0.05))
+            lo95, hi95 = ci[:, 0], ci[:, 1]
 
         return pd.DataFrame({
             "month_offset":   list(range(1, horizon + 1)),
-            "forecast_mean":  list(mean_fcst.round(1)),
-            "forecast_lo95":  list(np.round(ci[:, 0], 1)),
-            "forecast_hi95":  list(np.round(ci[:, 1], 1)),
+            "forecast_mean":  list(np.round(mean_fcst, 1)),
+            "forecast_lo95":  list(np.round(lo95, 1)),
+            "forecast_hi95":  list(np.round(hi95, 1)),
         })
 
 # ── Train on Personal_Auto__Ontario (highest volume, primary validation segment)
@@ -1594,6 +1592,22 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
     )
     _reg_fit = _reg_model.fit(disp=False, maxiter=200)
 
+    # ── Fit GARCH(1,1) on registration segment's residuals ───────────────────
+    from arch import arch_model
+    from statsmodels.stats.diagnostic import het_arch
+    _reg_resid = _reg_fit.resid[12:]  # skip seasonal burn-in
+    _reg_garch_fit = None
+    try:
+        _lm_stat, _lm_pval, _, _ = het_arch(_reg_resid, nlags=4)
+        if _lm_pval < 0.10:
+            _am = arch_model(_reg_resid, mean='Zero', vol='Garch', p=1, q=1, dist='normal')
+            _reg_garch_fit = _am.fit(disp='off', show_warning=False)
+            print(f"GARCH fitted on registration segment (ARCH-LM p={_lm_pval:.4f})")
+        else:
+            print(f"No significant ARCH effects on registration segment (p={_lm_pval:.4f}) — GARCH skipped")
+    except Exception as _garch_reg_err:
+        print(f"GARCH fit failed on registration segment: {_garch_reg_err}")
+
     # ── Compute metrics ───────────────────────────────────────────────────────
     _reg_fitted = _reg_fit.fittedvalues[12:]
     _reg_actual = _y_train[12:]
@@ -1601,10 +1615,12 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
     _reg_rmse = float(np.sqrt(np.mean((_reg_actual - _reg_fitted)**2)))
 
     # ── Log parameters ────────────────────────────────────────────────────────
+    _model_type_tag = "SARIMAX(1,0,1)(1,1,0,12)+GARCH(1,1)" if _reg_garch_fit else "SARIMAX(1,0,1)(1,1,0,12)"
     mlflow.set_tags({
         "segment_id":      "Personal_Auto__Ontario",
         "workshop_module": "4",
         "model_class":     "SARIMAX",
+        "model_type":      _model_type_tag,
         "audience":        "actuarial-workshop",
     })
     mlflow.log_params({
@@ -1613,6 +1629,7 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
         "seasonal_m": 12,
         "training_months": len(_y_train),
         "segment": "Personal_Auto__Ontario",
+        "garch_fitted": _reg_garch_fit is not None,
     })
     mlflow.log_metrics({
         "mape_pct": round(_reg_mape, 2),
@@ -1632,7 +1649,7 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
     _t_fc = range(len(_y_train), len(_y_train) + 12)
     _ax.plot(_t_fc, _fc_mean, label="Forecast (12m)", color="orange", lw=2)
     _ax.fill_between(_t_fc, _fc_ci[:, 0], _fc_ci[:, 1], alpha=0.2, color="orange")
-    _ax.set_title("SARIMA(1,0,1)(1,1,0,12) — Personal Auto Ontario")
+    _ax.set_title(f"{_model_type_tag} — Personal Auto Ontario")
     _ax.set_xlabel("Month offset")
     _ax.set_ylabel("Monthly Claims Count")
     _ax.legend()
@@ -1645,12 +1662,18 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
         mlflow.log_artifact(_plot_path, artifact_path="plots")
     plt.close()
 
-    # ── Save pickled model for PyFunc ─────────────────────────────────────────
+    # ── Save pickled models for PyFunc ────────────────────────────────────────
     _SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
     with tempfile.TemporaryDirectory() as _tmpdir:
         _model_pkl_path = os.path.join(_tmpdir, "model.pkl")
         with open(_model_pkl_path, "wb") as _f:
             pickle.dump(_reg_fit, _f)
+
+        # Pickle GARCH model alongside SARIMAX (if fitted)
+        if _reg_garch_fit is not None:
+            _garch_pkl_path = os.path.join(_tmpdir, "garch.pkl")
+            with open(_garch_pkl_path, "wb") as _f:
+                pickle.dump(_reg_garch_fit, _f)
 
         _input_schema  = mlflow.types.Schema([mlflow.types.ColSpec("integer", "horizon")])
         _output_schema = mlflow.types.Schema([
@@ -1672,11 +1695,13 @@ with mlflow.start_run(run_name="sarima_personal_auto_ontario_champion") as _sari
                 f"numpy=={np.__version__}",
                 f"scipy=={scipy.__version__}",
                 f"cloudpickle=={cloudpickle.__version__}",
+                f"arch=={_arch_pkg.__version__}",
             ],
         )
 
-    print(f"\nSARIMA model registered to: {_SARIMA_MODEL_NAME}")
+    print(f"\nSARIMA+GARCH model registered to: {_SARIMA_MODEL_NAME}")
     print(f"MAPE: {_reg_mape:.1f}%  |  RMSE: {_reg_rmse:.0f}  |  AIC: {_reg_fit.aic:.1f}")
+    print(f"GARCH included: {_reg_garch_fit is not None}")
 
 # ── Set @Champion alias ──────────────────────────────────────────────────────
 _client = MlflowClient()
@@ -1873,7 +1898,7 @@ with mlflow.start_run(run_name="monte_carlo_portfolio_champion") as _mc_reg_run:
         "cv_property_base":       _garch_cvs[0] if isinstance(_garch_cvs, list) else float(_garch_cvs[0]),
         "cv_auto_base":           _garch_cvs[1] if isinstance(_garch_cvs, list) else float(_garch_cvs[1]),
         "cv_liability_base":      _garch_cvs[2] if isinstance(_garch_cvs, list) else float(_garch_cvs[2]),
-        "cv_source":              "GARCH(1,1)" if _MC_USE_GARCH_CV else "static",
+        "cv_source":              "GARCH(1,1) on SARIMA residuals" if _MC_USE_GARCH_CV else "static",
         "corr_prop_auto_base":    0.40,
         "corr_prop_liab_base":    0.20,
         "corr_auto_liab_base":    0.30,
@@ -1921,15 +1946,15 @@ print(f"Set @Champion → version {_mc_latest_ver}")
 # MAGIC |---|---|---|---|
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 72 months | Baseline claim volume forecast |
 # MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
-# MAGIC | GARCH(1,1) | arch + applyInPandas | 40 segments | Loss ratio volatility → MC CVs |
-# MAGIC | Monte Carlo — baseline | Ray + PyTorch GPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |
-# MAGIC | Monte Carlo — VaR evolution | Ray + PyTorch GPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
-# MAGIC | Monte Carlo — stress tests | Ray + PyTorch GPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
+# MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 40 segments | Time-varying CIs + MC CVs (σ/μ) |
+# MAGIC | Monte Carlo — baseline | Ray + NumPy CPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |
+# MAGIC | Monte Carlo — VaR evolution | Ray + NumPy CPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
+# MAGIC | Monte Carlo — stress tests | Ray + NumPy CPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
 # MAGIC | Reserve validation | Spark join | Triangle × SARIMA | Reserve adequacy vs. forecasted claims |
-# MAGIC | Model registration | MLflow + UC | 2 models (SARIMA + MC) | `@Champion` alias for serving |
+# MAGIC | Model registration | MLflow + UC | 2 models (SARIMA+GARCH + MC) | `@Champion` alias for serving |
 # MAGIC
 # MAGIC **Data lineage:** `gold_claims_monthly` (DLT pipeline) → `silver_rolling_features` → Module 3 → `segment_monthly_features` → SARIMAX exog vars
 # MAGIC
-# MAGIC **GARCH → MC:** Fitted volatilities from GARCH(1,1) provide data-driven CVs for Monte Carlo (replacing hardcoded values)
+# MAGIC **GARCH → MC:** GARCH(1,1) fitted on SARIMA residuals provides dimensionally correct CVs (σ/μ) for Monte Carlo — no ad-hoc scaling
 # MAGIC
 # MAGIC **Next:** Module 5 — Create Model Serving endpoints for both models and configure AI Gateway.

@@ -11,7 +11,7 @@ A complete 1-day workshop for actuaries and data scientists, demonstrating how t
 | 1 | DLT Pipeline + Databricks Workflows | Medallion architecture, Delta Live Tables, SCD Type 2, Job DAGs |
 | 2 | Performance at Scale: Choosing the Right Spark Pattern | Four ETL approaches timed, run-many-models, for-loop anti-patterns, decision framework |
 | 3 | Feature Store + Point-in-Time Joins | UC Feature Store, data leakage prevention, point-in-time joins |
-| 4 | Classical Stats at Scale | SARIMA/GARCH per-segment, Ray-distributed Monte Carlo, MLflow logging, registers both models (SARIMA + MC) to UC Model Registry with Champion alias |
+| 4 | Classical Stats at Scale | SARIMAX + GARCH(1,1) on residuals per-segment, Ray-distributed Monte Carlo (NumPy CPU), MLflow logging, registers both models (SARIMA+GARCH + MC) to UC Model Registry with Champion alias |
 | 5 | App Infrastructure | Serving endpoints + AI Gateway, Online Table, Lakebase setup, demo all app services |
 | 6 | CI/CD with DABs + Azure DevOps | Asset Bundles, bundle.yml, 3-stage DevOps pipeline |
 | Bonus | Databricks Apps + Lakebase | Streamlit on serverless, Postgres-integrated transactional state |
@@ -123,9 +123,8 @@ After running all modules, the following assets will exist in your workspace:
 | `gold_claims_monthly` | Module 1 (DLT) | Segment × month claims aggregate (40 segments × 72 months) |
 | `silver_rolling_features` | Module 1 (DLT) | Rolling means, volatility features per segment |
 | `segment_monthly_features` | Module 3 | UC Feature Table (feeds Module 4 SARIMAX as exog vars) |
-| `sarima_forecasts` | Module 4 | SARIMAX forecasts + confidence intervals for all 40 segments |
-| `garch_volatility` | Module 4 | GARCH(1,1) volatility estimates → feeds MC CVs |
-| `monte_carlo_results` | Module 4 | Monte Carlo simulation (GARCH-calibrated CVs), VaR, CVaR |
+| `sarima_forecasts` | Module 4 | SARIMAX forecasts + GARCH(1,1) conditional volatility + confidence intervals for all 40 segments |
+| `monte_carlo_results` | Module 4 | Monte Carlo simulation (GARCH-calibrated CVs from SARIMA residuals), VaR, CVaR |
 | `reserve_validation` | Module 4 | Reserve adequacy: SARIMA forecasts vs. actual development |
 | `regional_claims_forecast` | Module 4 | Regional breakdown of projected claims |
 | `portfolio_risk_timeline` | Module 4 | 12-month SARIMA-driven VaR evolution |
@@ -187,8 +186,8 @@ For the Bonus app, all connection values (`PGHOST`, `DATABRICKS_HOST`, `CATALOG`
 
 - **Synthetic data parameters** (Modules 1, 2, 4): Product lines, regions, date ranges, and loss ratios are all configurable at the top of each notebook's data generation cell.
 - **SARIMA parameters** (Module 4): `ORDER` and `SEASONAL_ORDER` are set conservatively for speed; adjust for better fit.
-- **Monte Carlo paths** (Module 4): `N_PATHS = 10_000` by default; increase for higher-fidelity VaR estimates.
-- **Ray cluster size** (Module 4): `num_cpus_worker_node` in `setup_ray_cluster()` defaults to serverless; increase for larger workloads.
+- **Monte Carlo paths** (Module 4): `N_PER_TASK = 10_000_000` with 4 tasks per run; adjust for fidelity vs. speed.
+- **Ray cluster size** (Module 4): `num_cpus_worker_node` in `setup_ray_cluster()` controls parallelism; increase for larger workloads. Falls back to single-node NumPy when Ray is unavailable.
 
 ---
 
@@ -284,12 +283,12 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 
 **What it demonstrates:**
 - SARIMAX fitting across 40 segments using `applyInPandas` with Feature Store exogenous variables and StatCan macro data
-- GARCH volatility modeling with the `arch` library — conditional volatilities feed Monte Carlo CVs
-- Ray-distributed Monte Carlo portfolio simulation (`@ray.remote`, NumPy/SciPy) using GARCH-calibrated CVs
+- GARCH(1,1) on SARIMA residuals — Engle's ARCH-LM test, time-varying prediction intervals, dimensionally correct CVs (σ/μ) for Monte Carlo
+- Ray-distributed Monte Carlo portfolio simulation (`@ray.remote`, NumPy/SciPy CPU) using GARCH-calibrated CVs
 - Reserve validation: SARIMA forecasts vs. actual development from `gold_reserve_triangle`
 - VaR and CVaR computation, results written to Delta + logged to MLflow
 
-**Key actuarial concept:** Classical statistical models (SARIMAX, GARCH) remain the right tool for actuarial time series. Feature Store provides leakage-free exogenous variables, GARCH-derived volatilities calibrate the Monte Carlo simulation, and reserve validation closes the loop between forecasts and actual development. Both production models (SARIMA + Monte Carlo) are registered to UC with `@Champion` alias, ready for serving.
+**Key actuarial concept:** Classical statistical models (SARIMAX, GARCH) remain the right tool for actuarial time series. The econometrically correct approach is GARCH on mean-filtered residuals (not standalone on raw data). Feature Store provides leakage-free exogenous variables, GARCH-derived volatilities from SARIMA residuals calibrate the Monte Carlo simulation, and reserve validation closes the loop between forecasts and actual development. Both production models (SARIMA+GARCH + Monte Carlo) are registered to UC with `@Champion` alias, ready for serving.
 
 ---
 
@@ -326,12 +325,12 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 - Streamlit application running on Databricks Apps (serverless, UC-integrated, SSO)
 - Lakebase (managed Postgres on Databricks) for transactional analyst annotations
 - Reading from Delta tables and calling the live Model Serving endpoint
-- Three-tab actuarial review UI: SARIMA Forecasts, Monte Carlo Risk, and Model Serving
+- Five-tab actuarial review UI: Claims Forecast, Capital Requirements, Quick Forecast, Stress Testing, and Catastrophe & Reserves
 - Databricks SDK (`WorkspaceClient`) for SQL execution and model serving — no PAT tokens
 - JWT-based user identity extraction for Lakebase row-level attribution
 
 **App features:**
-- **Tab 1 — SARIMA Forecasts**: Per-segment historical loss ratios with SARIMA forecast overlay and 95% confidence intervals. Forecast cutoff marker, history statistics, and raw data expander. Analyst can write notes that are persisted to Lakebase.
+- **Tab 1 — Claims Forecast**: Per-segment historical claims with SARIMA forecast overlay and 95% confidence intervals (time-varying when GARCH is fitted). GARCH volatility overlay, forecast cutoff marker, history statistics, and raw data expander. Analyst can write notes that are persisted to Lakebase.
 - **Tab 2 — Monte Carlo Risk**: Portfolio-level VaR (99%), CVaR (99%), and Expected Loss from Monte Carlo simulation. Bar chart of risk metrics, loss distribution histogram, and Solvency II context.
 - **Tab 3 — Model Serving**: Live call to the deployed `actuarial-workshop-sarima-forecaster` endpoint via `WorkspaceClient.serving_endpoints.query()`. Renders forecast results with confidence intervals and an explainer on the PyFunc wrapper pattern.
 - **Sidebar**: Source data context (Delta tables, Lakebase, model endpoint), pipeline reference, and analyst annotation history.
