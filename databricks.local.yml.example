@@ -23,9 +23,11 @@ targets:
       pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional
 
-  # ── Optional: Ray-enabled variant (classic ML cluster for Module 4) ──────────
-  # Identical to my-workspace above, except Task 5 (fit_statistical_models) runs
-  # on a classic DBR 17.4 ML job cluster so that Ray-on-Spark can execute.
+  # ── Optional: Ray-enabled variant (classic ML cluster for Modules 4+5) ──────
+  # Identical to my-workspace above, except Task 5 (fit_statistical_models) and
+  # Task 6 (prepare_app_infrastructure) run on a classic DBR 16.4 ML job cluster.
+  # Task 5 needs Ray-on-Spark for distributed Monte Carlo; Task 6 needs
+  # psycopg2-binary for Lakebase setup (unreliable on Serverless ml_env).
   # All other tasks remain on serverless.  Use ./deploy-ray.sh to deploy.
   #
   # Note: classic cluster spin-up adds ~5-10 min to the setup job.
@@ -64,3 +66,8 @@ targets:
                 base_parameters:
                   run_ray: "auto"    # Ray-on-Spark works on classic ML clusters
                   job_mode: "false"  # use applyInPandas (works on classic cluster)
+            # Reuse the ML cluster for Module 5 — psycopg2-binary installs
+            # reliably via %pip on classic clusters; Serverless ml_env is flaky.
+            - task_key: prepare_app_infrastructure
+              job_cluster_key: ray_ml_cluster
+              environment_key: ""

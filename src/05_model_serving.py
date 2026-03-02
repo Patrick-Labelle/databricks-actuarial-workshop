@@ -38,6 +38,13 @@
 
 # COMMAND ----------
 
+# Install dependencies — psycopg2-binary is needed for Lakebase PostgreSQL setup.
+# On classic clusters (e2-demo-ray target), %pip install is the only mechanism;
+# on Serverless, the ml_env spec also lists these but %pip provides a fallback.
+%pip install psycopg2-binary mlflow --quiet
+
+# COMMAND ----------
+
 import mlflow
 import requests
 import json
