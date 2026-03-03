@@ -135,11 +135,11 @@ def load_var_timeline():
 
 
 def load_garch_volatility(segment_id: str):
-    """Load GARCH conditional volatility from SARIMA residuals for a segment."""
+    """Load GARCH conditional volatility (actuals + forecasts) from SARIMA residuals for a segment."""
     df = execute_sql(f"""
-        SELECT month, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta
+        SELECT month, record_type, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta
         FROM {CATALOG}.{SCHEMA}.sarima_forecasts
-        WHERE segment_id = '{segment_id}' AND record_type = 'actual'
+        WHERE segment_id = '{segment_id}'
           AND cond_volatility IS NOT NULL
         ORDER BY month
     """)

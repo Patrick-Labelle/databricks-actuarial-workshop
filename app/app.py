@@ -29,7 +29,7 @@ Insurance claims across **40 segments** (product line × Canadian province):
 |---|---|
 | **Product lines** | Personal Auto, Commercial Auto, Homeowners, Commercial Property |
 | **Provinces** | All 10 Canadian provinces |
-| **Period** | Jan 2019 – Dec 2024 (72 months) |
+| **Period** | Jan 2019 – Dec 2025 (84 months) |
 | **Macro data** | StatCan unemployment, housing price index, housing starts |
 """)
 

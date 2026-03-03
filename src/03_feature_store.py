@@ -84,18 +84,18 @@ try:
 except Exception:
     print("Silver features not found — regenerating (run Module 2 first for full pipeline)")
 
-    # Fallback: generate directly (matching gold_claims_monthly schema: 40 segments × 72 months)
+    # Fallback: generate directly (matching gold_claims_monthly schema: 40 segments × 84 months)
     from itertools import product as iterproduct
     np.random.seed(42)
     PRODUCT_LINES = ["Personal_Auto","Commercial_Auto","Homeowners","Commercial_Property"]
     REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Manitoba",
                      "Saskatchewan","New_Brunswick","Nova_Scotia","Prince_Edward_Island","Newfoundland"]
-    MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")
+    MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")
     SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
-    BASE          = {"Personal_Auto":450,"Commercial_Auto":180,"Homeowners":320,"Commercial_Property":90}
-    MULT          = {"Ontario":1.4,"Quebec":1.1,"British_Columbia":1.2,"Alberta":1.0,
-                     "Manitoba":0.85,"Saskatchewan":0.80,"New_Brunswick":0.70,
-                     "Nova_Scotia":0.75,"Prince_Edward_Island":0.60,"Newfoundland":0.65}
+    BASE          = {"Personal_Auto":26000,"Commercial_Auto":10500,"Homeowners":18500,"Commercial_Property":5200}
+    MULT          = {"Ontario":3.19,"Quebec":1.85,"British_Columbia":1.15,"Alberta":1.0,
+                     "Manitoba":0.30,"Saskatchewan":0.25,"New_Brunswick":0.17,
+                     "Nova_Scotia":0.22,"Prince_Edward_Island":0.04,"Newfoundland":0.11}
 
     rows = []
     for prod, reg in iterproduct(PRODUCT_LINES, REGIONS):

@@ -120,7 +120,7 @@ After running all modules, the following assets will exist in your workspace:
 | `silver_reserves` | Module 1 (DLT) | SCD Type 2 reserve history (Apply Changes) |
 | `gold_reserve_triangle` | Module 1 (DLT) | Loss development triangle (accident month × dev lag) |
 | `bronze_claims` | Module 1 (DLT) | Raw claim events, append-only |
-| `gold_claims_monthly` | Module 1 (DLT) | Segment × month claims aggregate (40 segments × 72 months) |
+| `gold_claims_monthly` | Module 1 (DLT) | Segment × month claims aggregate (40 segments × 84 months) |
 | `silver_rolling_features` | Module 1 (DLT) | Rolling means, volatility features per segment |
 | `segment_monthly_features` | Module 3 | UC Feature Table (feeds Module 4 SARIMAX as exog vars) |
 | `sarima_forecasts` | Module 4 | SARIMAX forecasts + GARCH(1,1) conditional volatility + confidence intervals for all 40 segments |
@@ -330,10 +330,12 @@ ops/cleanup.py — removes all assets (run post-workshop only)
 - JWT-based user identity extraction for Lakebase row-level attribution
 
 **App features:**
-- **Tab 1 — Claims Forecast**: Per-segment historical claims with SARIMA forecast overlay and 95% confidence intervals (time-varying when GARCH is fitted). GARCH volatility overlay, forecast cutoff marker, history statistics, and raw data expander. Analyst can write notes that are persisted to Lakebase.
-- **Tab 2 — Monte Carlo Risk**: Portfolio-level VaR (99%), CVaR (99%), and Expected Loss from Monte Carlo simulation. Bar chart of risk metrics, loss distribution histogram, and Solvency II context.
-- **Tab 3 — Model Serving**: Live call to the deployed `actuarial-workshop-sarima-forecaster` endpoint via `WorkspaceClient.serving_endpoints.query()`. Renders forecast results with confidence intervals and an explainer on the PyFunc wrapper pattern.
-- **Sidebar**: Source data context (Delta tables, Lakebase, model endpoint), pipeline reference, and analyst annotation history.
+- **Tab 1 — Claims Forecast**: Per-segment historical claims with SARIMA forecast overlay on a dual-axis Plotly chart. Left y-axis shows claims count (actuals + forecast + 95% CI band); right y-axis overlays GARCH conditional volatility (σ_t) as an orange filled area, so the CI band visually widens/narrows with time-varying uncertainty. Includes forecast cutoff marker, MAPE accuracy metric, GARCH diagnostics expander (ARCH-LM p-value, α, β, persistence), raw data table, and analyst annotation form persisted to Lakebase.
+- **Tab 2 — Capital Requirements**: Portfolio-level VaR (99%), VaR (99.5% / SCR), CVaR (99%), and Expected Loss from Monte Carlo simulation. Bar chart of risk metrics, loss distribution histogram with threshold markers, and Solvency II / IFRS 17 context.
+- **Tab 3 — Quick Forecast**: Live call to the deployed SARIMA endpoint via `WorkspaceClient.serving_endpoints.query()`. Adjustable forecast horizon (1–24 months), results table with confidence intervals, line chart with shaded CI band, CI-widening warning, and CSV download.
+- **Tab 4 — Stress Testing**: Interactive Monte Carlo scenario builder — adjust expected losses, loss volatility (CVs), inter-line correlations, simulation paths, and copula tail sensitivity. Calls the Monte Carlo endpoint live. Shows 4 metric cards with delta vs. baseline, comparative bar chart, and detailed results table.
+- **Tab 5 — Catastrophe & Reserves**: Pre-modelled CAT stress tests (CAT event, systemic, inflation) with side-by-side comparison, 12-month capital requirement outlook (VaR timeline chart), custom CAT scenario submission (9 presets including Hurricane, Earthquake, Flood, etc. with return-period multipliers), regional claims forecast bar chart, and loss development triangle with development factors.
+- **Sidebar**: Portfolio context (40 segments, 4 product lines, 10 provinces, Jan 2019–Dec 2025, 84 months), macro data sources (StatCan unemployment, HPI, housing starts), model descriptions, architecture diagram, and attribution.
 
 **Authentication architecture:**
 - SQL queries: `WorkspaceClient` with `statement_execution.execute_statement()` — uses the forwarded user token automatically in Databricks Apps context
