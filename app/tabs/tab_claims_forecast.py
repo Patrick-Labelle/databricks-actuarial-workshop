@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from db import load_segments, load_forecasts, load_segment_stats, load_garch_volatility
 from endpoints import email_from_token
@@ -14,9 +15,11 @@ def render(tab):
 
         with st.expander("ℹ️ About this forecast", expanded=False):
             st.markdown("""
-**What this shows:** Projected monthly claim volumes for the selected product line and region, based on 6 years of historical claims data (Jan 2019 – Dec 2024).
+**What this shows:** Projected monthly claim volumes for the selected product line and region, based on 7 years of historical claims data (Jan 2019 – Dec 2025).
 
 **The shaded band** is the forecast uncertainty range — the model expects 95% of actual future months to fall within this range. A wider band means higher uncertainty, which is normal for longer forecast horizons.
+
+**The orange area** (right axis) shows GARCH conditional volatility — when it rises, the confidence band widens accordingly.
 
 **The dashed line** shows the most likely (point estimate) outcome each month.
 
@@ -70,28 +73,54 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                     actuals   = df[df["record_type"] == "actual"]
                     forecasts = df[df["record_type"] == "forecast"]
 
-                    fig = go.Figure()
+                    # Load GARCH volatility (actuals + forecasts)
+                    garch_df = load_garch_volatility(selected)
+                    has_garch = not garch_df.empty
+
+                    # ── Integrated dual-axis chart ────────────────────────────
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                    # Left y-axis: claims
                     fig.add_trace(go.Scatter(
                         x=actuals["month"], y=actuals["claims_count"],
                         mode="lines+markers", name="Actual claims",
                         line=dict(color="#1f77b4"),
                         hovertemplate="<b>%{x}</b><br>Actual: %{y:,.0f} claims<extra></extra>",
-                    ))
+                    ), secondary_y=False)
+
                     fig.add_trace(go.Scatter(
                         x=forecasts["month"], y=forecasts["forecast_mean"],
                         mode="lines+markers", name="Projected claims",
                         line=dict(color="#FF3419", dash="dash"),
                         hovertemplate="<b>%{x}</b><br>Forecast: %{y:,.0f} claims<extra></extra>",
-                    ))
+                    ), secondary_y=False)
+
+                    # CI band
                     fig.add_trace(go.Scatter(
                         x=pd.concat([forecasts["month"], forecasts["month"][::-1]]),
                         y=pd.concat([forecasts["forecast_hi95"], forecasts["forecast_lo95"][::-1]]),
                         fill="toself", fillcolor="rgba(255,52,25,0.15)",
                         line=dict(color="rgba(255,0,0,0)"),
-                        name="Forecast range (95% confidence)",
+                        name="Forecast range (95% CI)",
                         hoverinfo="skip",
-                    ))
-                    # Add a vertical marker at the forecast start
+                    ), secondary_y=False)
+
+                    # Right y-axis: GARCH conditional volatility as filled area
+                    if has_garch:
+                        fig.add_trace(go.Scatter(
+                            x=garch_df["month"],
+                            y=garch_df["cond_volatility"],
+                            mode="lines", name="GARCH Volatility (σ_t)",
+                            line=dict(color="#FF6B35", width=1.5),
+                            fill="tozeroy",
+                            fillcolor="rgba(255,107,53,0.15)",
+                            hovertemplate="<b>%{x}</b><br>Volatility: %{y:,.1f}<extra></extra>",
+                        ), secondary_y=True)
+                        _garch_note = ""
+                    else:
+                        _garch_note = " (CIs are constant — no significant ARCH effects detected)"
+
+                    # Vertical forecast-start marker
                     if not actuals.empty and not forecasts.empty:
                         cutoff = str(actuals["month"].max())
                         fig.add_shape(
@@ -104,15 +133,24 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                             text="Forecast start", showarrow=False,
                             yanchor="bottom", font=dict(color="grey", size=11),
                         )
+
                     fig.update_layout(
-                        title=f"{selected} — Claims Forecast",
-                        xaxis_title="Month",
-                        yaxis_title="Monthly Claims",
-                        height=420,
+                        title=f"{selected} — Claims Forecast with GARCH Volatility",
+                        height=460,
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                         hovermode="x unified",
                     )
+                    fig.update_xaxes(title_text="Month")
+                    fig.update_yaxes(title_text="Monthly Claims", secondary_y=False)
+                    fig.update_yaxes(
+                        title_text="Conditional Volatility (σ_t)",
+                        secondary_y=True,
+                        showgrid=False,
+                    )
+
                     st.plotly_chart(fig, use_container_width=True)
+                    if _garch_note:
+                        st.caption(f"Note{_garch_note}")
 
                     col1, col2, col3 = st.columns(3)
                     if "mape" in df.columns:
@@ -135,41 +173,26 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                             help="Average margin of uncertainty around the monthly forecast. Wider ranges reflect higher uncertainty — normal as the forecast extends further into the future."
                         )
 
-                    # GARCH volatility overlay (from SARIMA residuals)
-                    with st.expander("📊 GARCH Volatility Overlay", expanded=False):
-                        st.caption(
-                            "Conditional volatility from GARCH(1,1) fitted on SARIMA residuals — "
-                            "shows time-varying forecast uncertainty. Higher volatility periods "
-                            "produce wider prediction intervals in the chart above."
-                        )
-                        garch_df = load_garch_volatility(selected)
-                        if not garch_df.empty:
-                            fig_garch = go.Figure()
-                            fig_garch.add_trace(go.Scatter(
-                                x=garch_df["month"], y=garch_df["cond_volatility"],
-                                mode="lines", name="Conditional Volatility",
-                                line=dict(color="#FF6B35", width=2),
-                                hovertemplate="<b>%{x}</b><br>Volatility: %{y:.1f} claims<extra></extra>",
-                            ))
-                            fig_garch.update_layout(
-                                title=f"{selected} — GARCH(1,1) on SARIMA Residuals",
-                                xaxis_title="Month",
-                                yaxis_title="Conditional Volatility (claims count units)",
-                                height=300,
-                                hovermode="x unified",
-                            )
-                            st.plotly_chart(fig_garch, use_container_width=True)
-                            # Show ARCH-LM diagnostic
-                            if 'arch_lm_pvalue' in garch_df.columns:
-                                _pval = garch_df['arch_lm_pvalue'].iloc[0]
-                                if pd.notna(_pval):
-                                    _sig = "significant" if _pval < 0.10 else "not significant"
-                                    st.caption(f"ARCH-LM p-value: {_pval:.4f} ({_sig} at 10% level)")
-                            if 'garch_alpha' in garch_df.columns and 'garch_beta' in garch_df.columns:
-                                _alpha = garch_df['garch_alpha'].iloc[0]
-                                _beta = garch_df['garch_beta'].iloc[0]
-                                if pd.notna(_alpha) and pd.notna(_beta):
-                                    st.caption(f"GARCH parameters: alpha={_alpha:.3f} (news impact), beta={_beta:.3f} (persistence), sum={_alpha+_beta:.3f}")
+                    # GARCH diagnostic details (collapsed)
+                    with st.expander("📊 GARCH Diagnostics", expanded=False):
+                        if has_garch:
+                            _pval = garch_df['arch_lm_pvalue'].iloc[0] if 'arch_lm_pvalue' in garch_df.columns else None
+                            _alpha = garch_df['garch_alpha'].iloc[0] if 'garch_alpha' in garch_df.columns else None
+                            _beta = garch_df['garch_beta'].iloc[0] if 'garch_beta' in garch_df.columns else None
+
+                            if pd.notna(_pval):
+                                _sig = "significant" if _pval < 0.10 else "not significant"
+                                st.caption(f"ARCH-LM p-value: {_pval:.4f} ({_sig} at 10% level)")
+                            if pd.notna(_alpha) and pd.notna(_beta):
+                                st.caption(
+                                    f"GARCH parameters: α={_alpha:.3f} (news impact), "
+                                    f"β={_beta:.3f} (persistence), α+β={_alpha+_beta:.3f}"
+                                )
+                                st.caption(
+                                    "α measures how quickly new shocks affect volatility; "
+                                    "β measures how long high-volatility regimes persist. "
+                                    "α+β close to 1.0 indicates highly persistent volatility."
+                                )
                         else:
                             st.info("No significant ARCH effects detected for this segment, or Module 4 has not been run yet.")
 

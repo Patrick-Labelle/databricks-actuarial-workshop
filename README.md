@@ -9,7 +9,7 @@ packaged as a single **Databricks Asset Bundle** for one-command deployment.
 ## What's in the box
 
 - **DLT medallion pipeline** — three data streams (reserve development CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
-- **SARIMAX forecasting** — forecasts **monthly claim frequency and severity by product line and province** for reserving, pricing, and capital planning; 40 segments (4 product lines × 10 Canadian provinces), 72-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
+- **SARIMAX forecasting** — forecasts **monthly claim frequency and severity by product line and province** for reserving, pricing, and capital planning; 40 segments (4 product lines × 10 Canadian provinces), 84-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
 - **GARCH volatility modeling** — models **time-varying uncertainty in claim outcomes by segment** for risk capital and reinsurance; per-segment conditional variance estimation via the `arch` library
 - **t-Copula Monte Carlo** — simulates **portfolio loss distribution** for VaR/CVaR, 12-month capital-at-risk evolution, and catastrophe stress scenarios; 640M-path distributed simulation (Ray-on-Spark + NumPy/SciPy)
 - **MLflow + UC Model Registry** — PyFunc-wrapped models, versioned, with `@Champion` alias and AI Gateway-enabled serving endpoints
@@ -100,7 +100,7 @@ The setup job runs the following tasks in order:
 2. **Fetch macro data** (parallel with task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
 3. **Run DLT pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
    - Reserves: `bronze_reserve_cdc` → `silver_reserves` → `gold_reserve_triangle` (loss development triangle)
-   - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 72 months)
+   - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 84 months)
    - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
 4. **Register Feature Store** — leakage-free training set assembly; reads `silver_rolling_features` from DLT; features feed Module 4 SARIMAX as exogenous variables
 5. **Fit SARIMAX / GARCH / Monte Carlo + register models** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` + Feature Store features + `gold_reserve_triangle`; GARCH-derived CVs feed Monte Carlo; reserve validation compares forecasts to actual development; registers both models (SARIMA + MC) to UC with `@Champion` alias
@@ -260,8 +260,8 @@ After running `./deploy.sh`, the following resources are created:
 | VaR timeline | `{catalog}.{schema}.portfolio_risk_timeline` (12-month SARIMA-driven) |
 | Stress scenarios | `{catalog}.{schema}.stress_test_scenarios` (CAT, systemic risk, inflation) |
 | Regional forecast | `{catalog}.{schema}.regional_claims_forecast` |
-| Claims landing zone | `{catalog}.{schema}.claims_events_raw` (~1.5M synthetic claim incidents) |
-| Claims DLT bronze/gold | `bronze_claims` / `gold_claims_monthly` (40 segments × 72 months) |
+| Claims landing zone | `{catalog}.{schema}.claims_events_raw` (~42M synthetic claim incidents) |
+| Claims DLT bronze/gold | `bronze_claims` / `gold_claims_monthly` (40 segments × 84 months) |
 | Macro landing zone | `{catalog}.{schema}.macro_indicators_raw` |
 | Macro DLT bronze/silver/gold | `bronze_macro_indicators` / `silver_macro_indicators` (SCD2) / `gold_macro_features` |
 | SARIMAX forecasts | `{catalog}.{schema}.sarima_forecasts` (actuals + 12-month forecasts, mape_baseline, mape_sarimax) |

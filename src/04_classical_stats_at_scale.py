@@ -8,7 +8,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC ### What We'll Cover
-# MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the DLT pipeline (40 segments × 72 months)
+# MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the DLT pipeline (40 segments × 84 months)
 # MAGIC 2. **Macro Integration** — Join real StatCan macro data; visualize claims vs unemployment
 # MAGIC 3. **SARIMAX + GARCH at Scale** — Per-segment SARIMA + SARIMAX fit with GARCH(1,1) on residuals for time-varying CIs
 # MAGIC 4. **ARCH-LM Diagnostic** — Engle's test results; why GARCH on residuals is correct
@@ -56,7 +56,7 @@
 # MAGIC
 # MAGIC Data flows directly from the DLT pipeline (Module 1) — no synthetic generation needed.
 # MAGIC The `gold_claims_monthly` table provides **real** claim counts, loss ratios, and premium
-# MAGIC exposures for **40 segments** (4 product lines × 10 provinces) × **72 months** (Jan 2019 – Dec 2024).
+# MAGIC exposures for **40 segments** (4 product lines × 10 provinces) × **84 months** (Jan 2019 – Dec 2025).
 # MAGIC
 # MAGIC ```
 # MAGIC DLT Pipeline (Module 1)
@@ -99,29 +99,29 @@ REGIONS       = [
     "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
     "Prince_Edward_Island", "Newfoundland",
 ]
-MONTHS        = pd.date_range("2019-01-01", periods=72, freq="MS")  # Jan 2019 – Dec 2024
+MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")  # Jan 2019 – Dec 2025
 
 # Base claim levels (monthly, Alberta reference — used by Monte Carlo bridge weight blending)
 BASE_CLAIMS = {
-    "Personal_Auto":       450,
-    "Commercial_Auto":     180,
-    "Homeowners":          320,
-    "Commercial_Property":  90,
+    "Personal_Auto":       26_000,
+    "Commercial_Auto":     10_500,
+    "Homeowners":          18_500,
+    "Commercial_Property":  5_200,
 }
 
 # ─── Read from DLT gold layer ─────────────────────────────────────────────────
 # gold_claims_monthly is produced by the DLT pipeline (task: run_dlt_pipeline in jobs.yml).
-# Expected: 40 segments × 72 months = 2,880 rows with claims_count, loss_ratio, earned_premium.
+# Expected: 40 segments × 84 months = 3,360 rows with claims_count, loss_ratio, earned_premium.
 claims_df = (
     spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
-    .filter(F.col("month").between("2019-01-01", "2024-12-01"))
+    .filter(F.col("month").between("2019-01-01", "2025-12-01"))
 )
 claims_df.createOrReplaceTempView("claims_ts")
 
 n_segments = claims_df.select("segment_id").distinct().count()
 n_rows     = claims_df.count()
 print(f"Segments: {n_segments} (expected 40 = 4 product lines × 10 provinces)")
-print(f"Rows:     {n_rows} (expected 2,880 = 40 × 72 months)")
+print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
 if not JOB_MODE:
     display(claims_df.orderBy("segment_id", "month").limit(30))
 
@@ -148,7 +148,7 @@ if not JOB_MODE:
 try:
     macro_df = spark.table(f"{CATALOG}.{SCHEMA}.gold_macro_features")
     macro_count = macro_df.count()
-    print(f"gold_macro_features: {macro_count:,} rows (expected ~720 = 10 provinces × 72 months)")
+    print(f"gold_macro_features: {macro_count:,} rows (expected ~840 = 10 provinces × 84 months)")
 
     claims_with_macro = (
         claims_df
@@ -246,7 +246,7 @@ except Exception as _fs_err:
 # MAGIC 1. Fits baseline `SARIMA(1,0,1)(1,1,0,12)` — monthly seasonality, no exog
 # MAGIC 2. Fits `SARIMAX(1,0,1)(1,1,0,12)` with `unemployment_rate` + `hpi_growth` + Feature Store features as exog
 # MAGIC 3. Evaluates out-of-sample MAPE on held-out last 12 months (validation set)
-# MAGIC 4. Refits final model on all 72 months for the 12-month forecast
+# MAGIC 4. Refits final model on all 84 months for the 12-month forecast
 # MAGIC 5. Runs **Engle's ARCH-LM test** on residuals; if significant, fits **GARCH(1,1)** for time-varying CIs
 # MAGIC 6. Returns a standardized pandas DataFrame with MAPE metrics, conditional volatility, and GARCH diagnostics
 # MAGIC
@@ -285,8 +285,8 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     Fit baseline SARIMA and SARIMAX with macro exogenous variables for one segment,
     then fit GARCH(1,1) on the SARIMA residuals to capture time-varying volatility.
 
-    Train/validation split: first 60 months for training, last 12 for out-of-sample MAPE.
-    Final model is refit on all 72 months for the 12-month forecast.
+    Train/validation split: first 72 months for training, last 12 for out-of-sample MAPE.
+    Final model is refit on all 84 months for the 12-month forecast.
 
     GARCH on residuals: After the final SARIMAX fit, run Engle's ARCH-LM test on the
     residuals. If significant (p < 0.10), fit GARCH(1,1) to produce time-varying
@@ -322,8 +322,8 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     has_exog  = not exog_data.isna().all().any()
     exog_arr  = exog_data.values.astype(float) if has_exog else None
 
-    # Train/validation split (60 train, 12 validation)
-    n_train, n_val = 60, 12
+    # Train/validation split (72 train, 12 validation)
+    n_train, n_val = 72, 12
     y_train = y[:n_train]
     y_val   = y[n_train:]
 
@@ -359,7 +359,7 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 mape_sarimax = mape_baseline   # fall back gracefully
 
-        # ── Final model: refit on full 72 months for forecasting ─────────────
+        # ── Final model: refit on full 84 months for forecasting ─────────────
         if has_exog:
             m_final = SARIMAX(y, exog=exog_arr, order=(1,0,1), seasonal_order=(1,1,0,12),
                               enforce_stationarity=False, enforce_invertibility=False)
@@ -409,7 +409,7 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
                 garch_alpha_val = float(_garch_fit.params.get('alpha[1]', np.nan))
                 garch_beta_val  = float(_garch_fit.params.get('beta[1]', np.nan))
 
-                # Align conditional volatility to full 72-month series
+                # Align conditional volatility to full series
                 # (first 12 months are NaN due to seasonal burn-in)
                 _cv = _garch_fit.conditional_volatility
                 cond_vol_actual = [None] * 12 + [float(v) for v in _cv]
@@ -770,8 +770,8 @@ else:
 # at static calibration values.
 #
 # Product-line → MC-segment mapping (weighted by BASE_CLAIMS volume):
-#   Property  = Homeowners (320) + Commercial_Property (90)
-#   Auto      = Personal_Auto (450) + Commercial_Auto (180)
+#   Property  = Homeowners (18500) + Commercial_Property (5200)
+#   Auto      = Personal_Auto (26000) + Commercial_Auto (10500)
 #   Liability = 0.5×Property + 0.5×Auto growth (proxied; no direct SARIMA data)
 #
 # Regional dimension: SARIMA forecasts are also aggregated by region → saved to
@@ -823,8 +823,8 @@ try:
     _forecast_months = sorted(_forecast_agg["month"].unique())  # 12 datetime.date values
 
     # Weights for product-line → MC segment blending
-    _W_PROP = {"Homeowners": 320, "Commercial_Property": 90}
-    _W_AUTO = {"Personal_Auto": 450, "Commercial_Auto": 180}
+    _W_PROP = {"Homeowners": 18500, "Commercial_Property": 5200}
+    _W_AUTO = {"Personal_Auto": 26000, "Commercial_Auto": 10500}
 
     def _sarima_growth_for_month(month_date) -> np.ndarray:
         """Return growth vector [property, auto, liability] for a forecast month."""
@@ -1555,7 +1555,7 @@ try:
 except Exception:
     print("Generating sample data (gold_claims_monthly not available)")
     np.random.seed(42)
-    _months = pd.date_range("2019-01-01", periods=60, freq="MS")
+    _months = pd.date_range("2019-01-01", periods=72, freq="MS")
     _SEASONALITY = {1: 1.25, 2: 1.20, 3: 1.10, 4: 0.95, 5: 0.90, 6: 0.88,
                     7: 0.85, 8: 0.87, 9: 0.92, 10: 1.00, 11: 1.10, 12: 1.20}
     _base = 450 * 1.4
@@ -1944,7 +1944,7 @@ print(f"Set @Champion → version {_mc_latest_ver}")
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
-# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 72 months | Baseline claim volume forecast |
+# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 84 months | Baseline claim volume forecast |
 # MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
 # MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 40 segments | Time-varying CIs + MC CVs (σ/μ) |
 # MAGIC | Monte Carlo — baseline | Ray + NumPy CPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |

@@ -124,21 +124,23 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
     ]
-    # Accident months: Jan 2019 – Dec 2024 (72 months, matching claims data)
-    ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=72, freq="MS")
+    # Accident months: Jan 2019 – Dec 2025 (84 months, matching claims data)
+    ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
     # Base ultimate incurred by product line (per accident month, Alberta reference)
+    # Scaled ~50x to match ~500K claims/month volume
     BASE_ULTIMATE = {
-        "Personal_Auto":       3_200_000,
-        "Commercial_Auto":     1_800_000,
-        "Homeowners":          2_700_000,
-        "Commercial_Property": 1_300_000,
+        "Personal_Auto":       185_000_000,
+        "Commercial_Auto":     105_000_000,
+        "Homeowners":          155_000_000,
+        "Commercial_Property":  73_000_000,
     }
+    # Population-weighted province multipliers (2025 Stats Canada, relative to Alberta = 1.00)
     REGION_MULT = {
-        "Ontario": 1.40, "Quebec": 1.10, "British_Columbia": 1.20,
-        "Alberta": 1.00, "Manitoba": 0.85, "Saskatchewan": 0.80,
-        "New_Brunswick": 0.70, "Nova_Scotia": 0.75,
-        "Prince_Edward_Island": 0.60, "Newfoundland": 0.65,
+        "Ontario": 3.19, "Quebec": 1.85, "British_Columbia": 1.15,
+        "Alberta": 1.00, "Manitoba": 0.30, "Saskatchewan": 0.25,
+        "New_Brunswick": 0.17, "Nova_Scotia": 0.22,
+        "Prince_Edward_Island": 0.04, "Newfoundland": 0.11,
     }
 
     # Development pattern: cumulative paid % of ultimate at each dev lag (months)
@@ -168,7 +170,7 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
 
             # Max development lags available depends on how old the accident month is
             # (newer months have fewer lags observed)
-            max_lag = min(12, 72 - month_idx)
+            max_lag = min(12, len(ACCIDENT_MONTHS) - month_idx)
             if max_lag < 1:
                 continue
 
@@ -234,10 +236,11 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
 # ── Helper: generate synthetic claim incident data ────────────────────────────
 def generate_claims_events_data(spark, catalog: str, schema: str):
     """
-    Generate individual claim incident records for Jan 2019 – Dec 2024.
+    Generate individual claim incident records for Jan 2019 – Dec 2025.
 
-    Volume calibrated to Alberta Open Data 2013 loss ratios and IBC provincial
-    market shares. Each row is one claim event. Writes to claims_events_raw,
+    Volume calibrated to Alberta Open Data 2013 loss ratios with population-weighted
+    provincial multipliers (~500K claims/month, ~42M total). Each row is one claim
+    event. Writes to claims_events_raw per-segment batch to manage memory,
     which feeds the DLT bronze_claims → gold_claims_monthly pipeline.
 
     Returns the Spark DataFrame.
@@ -254,14 +257,15 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
     ]
-    MONTHS = pd.date_range("2019-01-01", periods=72, freq="MS")
+    MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
     # Monthly claim counts for Alberta (region multiplier = 1.00)
+    # Scaled ~58x for ~500K claims/month across all provinces
     BASE_CLAIMS = {
-        "Personal_Auto":       450,
-        "Commercial_Auto":     180,
-        "Homeowners":          320,
-        "Commercial_Property":  90,
+        "Personal_Auto":       26_000,
+        "Commercial_Auto":     10_500,
+        "Homeowners":          18_500,
+        "Commercial_Property":  5_200,
     }
     # Alberta Open Data 2013: loss ratio calibration
     LOSS_RATIO_TARGET = {
@@ -277,18 +281,18 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Homeowners":          8_400.0,
         "Commercial_Property": 14_000.0,
     }
-    # IBC provincial market shares (relative volume multiplier)
+    # Population-weighted province multipliers (2025 Stats Canada, relative to Alberta = 1.00)
     REGION_MULTIPLIER = {
-        "Ontario":              1.40,
-        "Quebec":               1.10,
-        "British_Columbia":     1.20,
+        "Ontario":              3.19,
+        "Quebec":               1.85,
+        "British_Columbia":     1.15,
         "Alberta":              1.00,
-        "Manitoba":             0.85,
-        "Saskatchewan":         0.80,
-        "New_Brunswick":        0.70,
-        "Nova_Scotia":          0.75,
-        "Prince_Edward_Island": 0.60,
-        "Newfoundland":         0.65,
+        "Manitoba":             0.30,
+        "Saskatchewan":         0.25,
+        "New_Brunswick":        0.17,
+        "Nova_Scotia":          0.22,
+        "Prince_Edward_Island": 0.04,
+        "Newfoundland":         0.11,
     }
     CLAIM_TYPES = {
         "Personal_Auto":       ["Collision", "Comprehensive", "Bodily_Injury"],
@@ -297,14 +301,28 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Commercial_Property": ["Fire", "Water", "Wind", "Equipment"],
     }
 
-    segment_frames = []
+    claims_schema = StructType([
+        StructField("claim_id",              IntegerType(), False),
+        StructField("product_line",          StringType(),  False),
+        StructField("region",                StringType(),  False),
+        StructField("loss_date",             StringType(),  False),
+        StructField("claim_amount",          DoubleType(),  True),
+        StructField("monthly_prem_exposure", DoubleType(),  True),
+        StructField("claim_type",            StringType(),  True),
+        StructField("ingested_at",           StringType(),  False),
+    ])
+
+    # Write per-segment batch to avoid >10 GB in-memory DataFrame for ~42M rows
+    claim_id_offset = 0
+    first = True
+    total_count = 0
     for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
         base       = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
         loss_ratio = LOSS_RATIO_TARGET[prod]
         avg_sev    = AVG_SEVERITY[prod]
         ctypes     = CLAIM_TYPES[prod]
 
-        # Poisson number of claims per month (vectorized for all 72 months at once)
+        # Poisson number of claims per month (vectorized for all months at once)
         n_per_month = np.random.poisson(base, size=len(MONTHS))
         total_n     = int(n_per_month.sum())
         if total_n == 0:
@@ -322,7 +340,8 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         # Assign loss_date = first of the claim's month
         loss_dates = np.repeat([m.strftime("%Y-%m-%d") for m in MONTHS], n_per_month)
 
-        segment_frames.append(pd.DataFrame({
+        segment_pdf = pd.DataFrame({
+            "claim_id":              range(claim_id_offset + 1, claim_id_offset + total_n + 1),
             "product_line":          prod,
             "region":                region,
             "loss_date":             loss_dates,
@@ -330,32 +349,21 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
             "monthly_prem_exposure": np.round(prems, 2),
             "claim_type":            [ctypes[i] for i in type_idx],
             "ingested_at":           pd.Timestamp.now().isoformat(),
-        }))
+        })
+        claim_id_offset += total_n
+        total_count += total_n
 
-    pdf = pd.concat(segment_frames, ignore_index=True)
-    pdf.insert(0, "claim_id", range(1, len(pdf) + 1))
+        sdf = spark.createDataFrame(segment_pdf, schema=claims_schema)
+        mode = "overwrite" if first else "append"
+        (sdf.write
+            .format("delta")
+            .mode(mode)
+            .option("overwriteSchema", "true" if first else "false")
+            .saveAsTable(f"{catalog}.{schema}.claims_events_raw"))
+        first = False
 
-    claims_schema = StructType([
-        StructField("claim_id",              IntegerType(), False),
-        StructField("product_line",          StringType(),  False),
-        StructField("region",                StringType(),  False),
-        StructField("loss_date",             StringType(),  False),
-        StructField("claim_amount",          DoubleType(),  True),
-        StructField("monthly_prem_exposure", DoubleType(),  True),
-        StructField("claim_type",            StringType(),  True),
-        StructField("ingested_at",           StringType(),  False),
-    ])
-
-    sdf = spark.createDataFrame(pdf, schema=claims_schema)
-    (sdf.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(f"{catalog}.{schema}.claims_events_raw"))
-
-    count = sdf.count()
-    print(f"Generated {count:,} claim events → {catalog}.{schema}.claims_events_raw")
-    return sdf
+    print(f"Generated {total_count:,} claim events → {catalog}.{schema}.claims_events_raw")
+    return spark.table(f"{catalog}.{schema}.claims_events_raw")
 
 
 # Run OUTSIDE the DLT context to seed data
