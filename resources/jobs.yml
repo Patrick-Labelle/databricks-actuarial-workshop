@@ -108,6 +108,10 @@ resources:
         # low-latency feature lookup, and the Lakebase PostgreSQL database
         # (DB, extension, table, SP role + grants). Uses the Databricks SDK's
         # generate_database_credential() to get a valid JWT for Lakebase auth.
+        #
+        # Serverless: uses ml_env (psycopg2-binary in spec + %pip fallback).
+        # Ray targets: overridden to reuse the classic ML cluster where %pip
+        # install works reliably (environment_key ignored when job_cluster_key set).
         - task_key: prepare_app_infrastructure
           description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup"
           depends_on:
