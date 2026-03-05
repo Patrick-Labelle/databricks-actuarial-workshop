@@ -160,8 +160,8 @@ fe = FeatureEngineeringClient()
 try:
     fe.create_table(
         name             = FEATURE_TABLE,
-        primary_keys     = ["segment_id", "month"],
-        timestamp_keys   = ["month_ts"],           # Enables point-in-time joins
+        primary_keys     = ["segment_id", "month", "month_ts"],
+        timestamp_keys   = ["month_ts"],
         df               = feature_df,
         description      = (
             "Monthly actuarial risk features per segment (product × region). "
