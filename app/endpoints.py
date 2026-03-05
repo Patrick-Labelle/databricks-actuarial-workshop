@@ -1,6 +1,3 @@
-import base64
-import json
-
 import streamlit as st
 import pandas as pd
 
@@ -45,19 +42,9 @@ def call_monte_carlo_endpoint(scenario: dict) -> dict | None:
         predictions = response.predictions
         if predictions:
             p = predictions[0] if isinstance(predictions, list) else predictions
-            return {k: float(v) if k != "copula" else v for k, v in p.items()}
+            _str_keys = {"copula", "model_type", "simulation_mode"}
+            return {k: v if k in _str_keys else float(v) for k, v in p.items()}
         return None
     except Exception as exc:
         st.warning(f"Monte Carlo endpoint unavailable: {exc}")
         return None
-
-
-def email_from_token(token: str) -> str:
-    """Decode the JWT payload (without verification) to extract the user identity."""
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        return payload.get("sub", payload.get("email", ""))
-    except Exception:
-        return ""

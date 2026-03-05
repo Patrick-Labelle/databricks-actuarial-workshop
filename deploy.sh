@@ -9,7 +9,7 @@
 #      (app/app.yaml is uploaded as source and does not receive DAB variable
 #      substitution, so catalog/schema/pg_database are injected via this file).
 #   2. `databricks bundle deploy` — provisions all bundle-managed resources
-#      (Lakebase instance, jobs, DLT pipeline, app resource).
+#      (Lakebase instance, jobs, declarative pipeline, app resource).
 #   3. If a fresh app was created with compute STOPPED, call `apps start` to
 #      start the compute and clear the bundle's initial-deployment lock.
 #   4. `databricks bundle run actuarial_workshop_setup` — runs the setup job,
@@ -52,9 +52,14 @@ ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('endpoint_name',{}).get('value','actuarial-workshop-sarima-forecaster'))")
 MC_ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('mc_endpoint_name',{}).get('value','actuarial-workshop-monte-carlo'))")
+GENIE_SPACE_ID=$(echo "$VALIDATE_JSON" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('genie_space_id',{}).get('value',''))")
+LLM_ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('llm_endpoint_name',{}).get('value','databricks-meta-llama-3-3-70b-instruct'))")
 
 echo "==> Generating app/_bundle_config.py (initial — LAKEBASE_HOST added after lakebase setup)"
 echo "    CATALOG=${CATALOG}, SCHEMA=${SCHEMA}, PG_DATABASE=${PG_DATABASE}, ENDPOINT_NAME=${ENDPOINT_NAME}, MC_ENDPOINT_NAME=${MC_ENDPOINT_NAME}"
+echo "    GENIE_SPACE_ID=${GENIE_SPACE_ID:-<empty>}, LLM_ENDPOINT_NAME=${LLM_ENDPOINT_NAME}"
 # LAKEBASE_ENDPOINT_PATH is the resource path used by the SDK's
 # w.postgres.generate_database_credential(endpoint=...) call.
 # Format: projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}
@@ -70,6 +75,8 @@ ENDPOINT_NAME = '${ENDPOINT_NAME}'
 MC_ENDPOINT_NAME = '${MC_ENDPOINT_NAME}'
 LAKEBASE_ENDPOINT_PATH = '${LAKEBASE_ENDPOINT_PATH}'
 LAKEBASE_HOST = ''
+GENIE_SPACE_ID = '${GENIE_SPACE_ID}'
+LLM_ENDPOINT_NAME = '${LLM_ENDPOINT_NAME}'
 EOF
 
 # Extract app name, workspace source path, and CLI profile from validate output.
@@ -145,6 +152,8 @@ ENDPOINT_NAME = '${ENDPOINT_NAME}'
 MC_ENDPOINT_NAME = '${MC_ENDPOINT_NAME}'
 LAKEBASE_ENDPOINT_PATH = '${LAKEBASE_ENDPOINT_PATH}'
 LAKEBASE_HOST = '${LAKEBASE_HOST}'
+GENIE_SPACE_ID = '${GENIE_SPACE_ID}'
+LLM_ENDPOINT_NAME = '${LLM_ENDPOINT_NAME}'
 EOF
 
     # Push the updated _bundle_config.py to the workspace bundle path

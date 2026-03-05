@@ -102,7 +102,7 @@ _Technical: t-Copula Monte Carlo endpoint, same model as the Portfolio Risk tab.
             else:
                 st.warning(
                     "Monte Carlo endpoint not available. "
-                    "Start it from Module 6 or wait for the setup job to complete."
+                    "Start it from Module 4 or wait for the setup job to complete."
                 )
 
         _result = st.session_state.get("scenario_result")

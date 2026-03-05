@@ -1,14 +1,14 @@
 # Databricks Actuarial Demo
 
 An end-to-end actuarial modeling solution on the Databricks Lakehouse — synthetic
-insurance portfolio data, a full DLT medallion pipeline, and statistical models that
+insurance portfolio data, a full declarative medallion pipeline, and statistical models that
 **forecast claims, model volatility, and simulate portfolio loss** (SARIMAX/GARCH/Monte Carlo),
 plus MLflow model registry, model serving, and a Streamlit risk dashboard —
 packaged as a single **Databricks Asset Bundle** for one-command deployment.
 
 ## What's in the box
 
-- **DLT medallion pipeline** — three data streams (reserve development CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
+- **Spark Declarative Pipelines (SDP) (medallion)** — three data streams (reserve development CDC, claims events, Statistics Canada macro indicators) through Bronze → Silver (SCD Type 2) → Gold
 - **SARIMAX forecasting** — forecasts **monthly claim frequency and severity by product line and province** for reserving, pricing, and capital planning; 40 segments (4 product lines × 10 Canadian provinces), 84-month history, real macro exogenous variables (unemployment, HPI, housing starts) from Statistics Canada
 - **GARCH volatility modeling** — models **time-varying uncertainty in claim outcomes by segment** for risk capital and reinsurance; per-segment conditional variance estimation via the `arch` library
 - **t-Copula Monte Carlo** — simulates **portfolio loss distribution** for VaR/CVaR, 12-month capital-at-risk evolution, and catastrophe stress scenarios; 640M-path distributed simulation (Ray-on-Spark + NumPy/SciPy)
@@ -25,21 +25,26 @@ packaged as a single **Databricks Asset Bundle** for one-command deployment.
 ├── databricks.yml            # Bundle config — variables, sync, includes
 ├── databricks.local.yml.example  # Template for your workspace-specific target
 ├── deploy.sh                 # End-to-end deploy: bundle deploy → Lakebase setup → setup job → app deploy
-├── deploy-ray.sh             # Thin wrapper: deploys to the Ray-enabled target
 ├── destroy.sh                # Full teardown: workspace assets + bundle destroy
 ├── resources/
-│   ├── pipeline.yml          # DLT pipeline (Bronze → Silver → Gold)
+│   ├── pipeline.yml          # Declarative pipeline (Bronze → Silver → Gold)
 │   ├── jobs.yml              # Orchestration jobs (setup + monthly refresh)
 │   ├── app.yml               # Databricks App resource + SP authorizations
 │   └── lakebase.yml          # Lakebase (managed PostgreSQL) instance
 ├── scripts/
-│   ├── fetch_macro_data.py   # Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw
-│   └── lakebase_setup.py     # Standalone Lakebase setup utility (not called by deploy.sh; DB setup is in Module 5)
-├── src/
+│   ├── fetch_macro_data.py   # Fetch StatCan unemployment, HPI, housing starts → raw_macro_indicators
+│   └── lakebase_setup.py     # Standalone Lakebase setup utility (not called by deploy.sh; DB setup is in Module 4)
+├── src/                       # Job-only notebooks (no display(), no interactive sections)
 │   ├── ops/
 │   │   ├── app_setup.py      # UC grants + model serving CAN_QUERY (runs as job task)
+│   │   ├── register_agent.py # Register chatbot as Databricks Agent
 │   │   └── cleanup.py        # Schema and resource cleanup notebook
-│   └── 01–07_*.py            # Demo notebooks (Modules 1–6 + Bonus)
+│   ├── 01_data_pipeline.py          # Data generation + SDP pipeline definitions
+│   ├── 02_feature_store.py          # UC Feature Store registration
+│   ├── 03_classical_stats_at_scale.py  # SARIMAX/GARCH/Monte Carlo + MLflow
+│   └── 04_model_serving.py          # Endpoints, Online Table, Lakebase setup
+├── interactive_workshop/      # Interactive versions with visualizations + learning notes
+│   └── 01–07_*.py            # All 7 modules (02, 06, 07 are interactive-only)
 ├── app/
 │   ├── app.py                # Streamlit application
 │   ├── app.yaml              # App command + valueFrom resource injections
@@ -96,13 +101,13 @@ databricks bundle validate --target my-workspace
 > 5. Deploys the app source code only after all permissions are in place, so the app starts without permission errors.
 
 The setup job runs the following tasks in order:
-1. **Generate source data** — synthetic reserve development CDC + claim incidents → `reserve_development_raw`, `claims_events_raw`
-2. **Fetch macro data** (parallel with task 1) — Statistics Canada unemployment, HPI, housing starts → `macro_indicators_raw`
-3. **Run DLT pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
+1. **Generate source data** — synthetic reserve development CDC + claim incidents → `raw_reserve_development`, `raw_claims_events`
+2. **Fetch macro data** (parallel with task 1) — Statistics Canada unemployment, HPI, housing starts → `raw_macro_indicators`
+3. **Run declarative pipeline** (after tasks 1 + 2) — Bronze → Silver (SCD Type 2) → Gold across three data streams:
    - Reserves: `bronze_reserve_cdc` → `silver_reserves` → `gold_reserve_triangle` (loss development triangle)
    - Claims: `bronze_claims` → `gold_claims_monthly` (40 segments × 84 months)
    - Macro: `bronze_macro_indicators` → `silver_macro_indicators` (SCD2) → `gold_macro_features`
-4. **Register Feature Store** — leakage-free training set assembly; reads `silver_rolling_features` from DLT; features feed Module 4 SARIMAX as exogenous variables
+4. **Register Feature Store** — leakage-free training set assembly; reads `silver_rolling_features` from the declarative pipeline; features feed Module 3 SARIMAX as exogenous variables
 5. **Fit SARIMAX / GARCH / Monte Carlo + register models** — fits claim-forecast and volatility models by segment, then portfolio loss simulation; reads `gold_claims_monthly` + Feature Store features + `gold_reserve_triangle`; GARCH-derived CVs feed Monte Carlo; reserve validation compares forecasts to actual development; registers both models (SARIMA + MC) to UC with `@Champion` alias
 6. **Prepare app infrastructure** — creates both serving endpoints + AI Gateway, Online Table for low-latency feature lookup, Lakebase PostgreSQL database setup (DB, extension, table, SP role + grants) using `generate_database_credential()`
 7. **App setup** — grant UC `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY` on both serving endpoints to the app service principal
@@ -111,15 +116,15 @@ The setup job runs the following tasks in order:
 
 ## Statistics Canada Macro Data Integration
 
-The SARIMAX models in `04_classical_stats_at_scale.py` **forecast monthly claim counts and severity by product line and province** for reserving, pricing, and capital planning. They use real macroeconomic data from Statistics Canada as exogenous variables, flowing through the same DLT medallion pipeline as the claims data:
+The SARIMAX models in `03_classical_stats_at_scale.py` **forecast monthly claim counts and severity by product line and province** for reserving, pricing, and capital planning. They use real macroeconomic data from Statistics Canada as exogenous variables, flowing through the same declarative medallion pipeline as the claims data:
 
 ```
-scripts/fetch_macro_data.py  →  macro_indicators_raw
-                                   ↓ (DLT streaming)
+scripts/fetch_macro_data.py  →  raw_macro_indicators
+                                   ↓ (SDP streaming)
                             bronze_macro_indicators
-                                   ↓ (DLT apply_changes, SCD Type 2)
+                                   ↓ (SDP apply_changes, SCD Type 2)
                             silver_macro_indicators     ← tracks StatCan revisions
-                                   ↓ (DLT materialized view)
+                                   ↓ (SDP materialized view)
                             gold_macro_features         ← joined to claims before SARIMAX fitting
 ```
 
@@ -137,34 +142,27 @@ MLflow logs `avg_mape_baseline_pct`, `avg_mape_sarimax_pct`, and `avg_mape_impro
 for direct before/after comparison in the experiment UI.
 
 **Network-restricted workspaces:** `scripts/fetch_macro_data.py` is fault-tolerant.
-If `www150.statcan.gc.ca` is unreachable, the script creates an empty `macro_indicators_raw`
-table and exits cleanly. The DLT pipeline runs on the empty table, and the model falls
+If `www150.statcan.gc.ca` is unreachable, the script creates an empty `raw_macro_indicators`
+table and exits cleanly. The declarative pipeline runs on the empty table, and the model falls
 back to baseline SARIMA. The full pipeline completes successfully in both cases.
 
 ---
 
-## Ray-Enabled Deployment (Distributed Monte Carlo)
+## Distributed Monte Carlo (Ray-on-Spark, t-Copula, 640M paths)
 
-`04_classical_stats_at_scale.py` includes Ray-on-Spark code for distributed
-Monte Carlo simulation. By default, the setup job skips the Ray section (`run_ray: "skip"`)
-so the full pipeline runs on serverless. To run with Ray, use the Ray-enabled variant:
+Modules 2–4 run on a **classic DBR 16.4 ML job cluster** with Ray-on-Spark
+for distributed Monte Carlo simulation. The cluster is defined in
+`databricks.local.yml` and referenced by `job_cluster_key: ray_ml_cluster`
+in the job tasks.
 
-```bash
-./deploy-ray.sh        # deploys to the Ray-enabled target (~20 min, includes ~5-10 min cluster spin-up)
-```
-
-The Ray target overrides Task 5 (`fit_statistical_models`) from serverless to a
-**DBR 16.4-cpu-ml** job cluster (4 × `m5.2xlarge` workers, 8 vCPU / 32 GB each),
-and passes `run_ray: "auto"` to the notebook.
-
-### Distributed Monte Carlo details (t-Copula, 640M paths)
+> **Requirement:** Classic compute (not serverless-only workspaces).
 
 The simulation produces **capital-at-risk and tail-risk metrics** (VaR/CVaR) and **stress-test outcomes** (catastrophe, correlation spike, inflation) for regulatory and internal risk management. All 64 Ray tasks are dispatched simultaneously in a single batch:
 
-1. **Baseline** (static means): 4 tasks × 10M = **40M paths** → `monte_carlo_results`
+1. **Baseline** (static means): 4 tasks × 10M = **40M paths** → `predictions_monte_carlo`
 2. **12-month VaR evolution** (SARIMA-driven means): 12 months × 4 tasks × 10M = **480M paths**
-   → `portfolio_risk_timeline`
-3. **Stress scenarios** (3 × 4 tasks × 10M = **120M paths**) → `stress_test_scenarios`:
+   → `predictions_risk_timeline`
+3. **Stress scenarios** (3 × 4 tasks × 10M = **120M paths**) → `predictions_stress_scenarios`:
    - `cat_event`: 1-in-250yr catastrophe — Property 3.5×, Auto 1.8×, Liability 1.4×, stressed ρ,
      Poisson(λ=0.05) jump process
    - `stress_corr`: systemic/contagion risk — correlations spike to 0.65–0.75
@@ -174,8 +172,6 @@ The simulation produces **capital-at-risk and tail-risk metrics** (VaR/CVaR) and
 - **NumPy/SciPy path:** `scipy.stats.t.cdf()` + `norm.ppf()` for copula and marginals
 - `num_cpus=1` per task: **24 concurrent tasks** across 4 workers (4 × 6 Ray CPUs); 640M paths in ~2-3 minutes
 - CPU-only driver + 4 × CPU workers — Ray compute runs on all workers in parallel
-
-> **Note:** Classic ML clusters are not available on serverless-only workspaces.
 
 ---
 
@@ -222,20 +218,24 @@ gitignored but force-included in the bundle sync via `databricks.yml`.
 
 ## Notebooks
 
+### Job Pipeline (`src/`)
+
+| # | Notebook | Job Task | Key concepts |
+|---|----------|----------|-------------|
+| 1 | `01_data_pipeline.py` | `generate_source_data` | SDP, Medallion, SCD Type 2; 3 data streams (reserves, claims, macro) |
+| 2 | `02_feature_store.py` | `build_feature_store` | UC Feature Store, point-in-time joins |
+| 3 | `03_classical_stats_at_scale.py` | `fit_statistical_models` | SARIMAX/GARCH, t-Copula Monte Carlo, Ray distributed, MLflow |
+| 4 | `04_model_serving.py` | `prepare_app_infrastructure` | Serving endpoints + AI Gateway, Online Table, Lakebase |
+
+### Interactive Only (`interactive_workshop/`)
+
 | # | Notebook | Key concepts |
 |---|----------|-------------|
-| 1 | `01_dlt_pipeline_and_jobs.py` | DLT, Medallion, SCD Type 2, Jobs API; 3 data streams (reserves, claims, macro) |
-| 2 | `02_performance_at_scale.py` | Performance at Scale — 4 ETL approaches timed, run-many-models, for-loop anti-patterns |
-| 3 | `03_feature_store.py` | UC Feature Store, point-in-time joins, leakage-free training sets |
-| 4 | `04_classical_stats_at_scale.py` | SARIMAX/GARCH (**claim forecasts and volatility by segment**), t-Copula Monte Carlo (**portfolio loss distribution, VaR, stress tests**), reads DLT gold + StatCan macro, Ray distributed, MLflow, registers both models to UC |
-| 5 | `05_model_serving.py` | App Infrastructure — serving endpoints + AI Gateway, Online Table, Lakebase setup, monitoring |
+| 2 | `02_performance_at_scale.py` | 4 ETL approaches timed, run-many-models, for-loop anti-patterns |
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
-| Bonus | `07_databricks_apps.py` | Databricks Apps, Lakebase |
+| 7 | `07_databricks_apps.py` | Databricks Apps, Lakebase |
 
-All notebooks accept `catalog`, `schema`, and `endpoint_name` as widget parameters
-(passed automatically by the bundle jobs). They can also be run interactively by
-cloning or uploading the `src/` directory — the widget defaults at the top of each
-notebook allow standalone execution without the bundle.
+Interactive versions of all job pipeline modules (01, 03, 04, 05) are also in `interactive_workshop/` with `display()` calls and learning notes.
 
 ---
 
@@ -247,24 +247,26 @@ After running `./deploy.sh`, the following resources are created:
 |----------|------|
 | Lakebase instance | `actuarial-workshop-lakebase` |
 | Lakebase database | `actuarial_workshop_db` |
-| DLT Pipeline | `actuarial-workshop-medallion` |
+| Declarative Pipeline | `actuarial-workshop-medallion` |
 | Setup Job | `Actuarial Workshop — Full Setup` |
 | Monthly Refresh Job | `Actuarial Workshop — Monthly Model Refresh` |
 | SARIMA Serving Endpoint | value of `endpoint_name` variable |
 | Monte Carlo Serving Endpoint | value of `mc_endpoint_name` variable |
 | Databricks App | `actuarial-workshop` |
-| Feature Table | `{catalog}.{schema}.segment_monthly_features` |
+| Feature Table | `{catalog}.{schema}.features_segment_monthly` |
 | UC Model (SARIMA) | `{catalog}.{schema}.sarima_claims_forecaster` |
 | UC Model (Monte Carlo) | `{catalog}.{schema}.monte_carlo_portfolio` |
-| Monte Carlo results | `{catalog}.{schema}.monte_carlo_results` (40M baseline paths) |
-| VaR timeline | `{catalog}.{schema}.portfolio_risk_timeline` (12-month SARIMA-driven) |
-| Stress scenarios | `{catalog}.{schema}.stress_test_scenarios` (CAT, systemic risk, inflation) |
-| Regional forecast | `{catalog}.{schema}.regional_claims_forecast` |
-| Claims landing zone | `{catalog}.{schema}.claims_events_raw` (~42M synthetic claim incidents) |
-| Claims DLT bronze/gold | `bronze_claims` / `gold_claims_monthly` (40 segments × 84 months) |
-| Macro landing zone | `{catalog}.{schema}.macro_indicators_raw` |
-| Macro DLT bronze/silver/gold | `bronze_macro_indicators` / `silver_macro_indicators` (SCD2) / `gold_macro_features` |
-| SARIMAX forecasts | `{catalog}.{schema}.sarima_forecasts` (actuals + 12-month forecasts, mape_baseline, mape_sarimax) |
+| Monte Carlo results | `{catalog}.{schema}.predictions_monte_carlo` (40M baseline paths) |
+| VaR timeline | `{catalog}.{schema}.predictions_risk_timeline` (12-month SARIMA-driven) |
+| Stress scenarios | `{catalog}.{schema}.predictions_stress_scenarios` (CAT, systemic risk, inflation) |
+| Surplus evolution | `{catalog}.{schema}.predictions_surplus_evolution` (regime-switching) |
+| Reserve validation | `{catalog}.{schema}.predictions_reserve_validation` (reserve adequacy validation) |
+| Regime parameters | `{catalog}.{schema}.predictions_regime_parameters` (regime-switching model parameters) |
+| Claims landing zone | `{catalog}.{schema}.raw_claims_events` (~42M synthetic claim incidents) |
+| Claims SDP bronze/gold | `bronze_claims` / `gold_claims_monthly` (40 segments × 84 months) |
+| Macro landing zone | `{catalog}.{schema}.raw_macro_indicators` |
+| Macro SDP bronze/silver/gold | `bronze_macro_indicators` / `silver_macro_indicators` (SCD2) / `gold_macro_features` |
+| SARIMAX forecasts | `{catalog}.{schema}.predictions_sarima` (actuals + 12-month forecasts, mape_baseline, mape_sarimax) |
 
 ---
 
@@ -276,7 +278,7 @@ by the workspace OIDC endpoint), which it receives as the PostgreSQL password.
 
 **What works:**
 - `WorkspaceClient().postgres.generate_database_credential()` — returns a valid JWT
-  from any compute type (serverless, classic, interactive). Used by Module 5 (setup job)
+  from any compute type (serverless, classic, interactive). Used by Module 4 (setup job)
   and by the app at runtime.
 - OAuth JWTs from `databricks auth token` (eyJ... prefix, ~850 chars) — used by
   `scripts/lakebase_setup.py` for standalone local setup.
@@ -286,7 +288,7 @@ by the workspace OIDC endpoint), which it receives as the PostgreSQL password.
 - PATs (`dapi...`, also opaque tokens rejected by JWT validation)
 - Serverless `DATABRICKS_TOKEN` (also an opaque internal token)
 
-Module 5 (`prepare_app_infrastructure` task) handles all Lakebase database setup
+Module 4 (`prepare_app_infrastructure` task) handles all Lakebase database setup
 using `generate_database_credential()`, so no local psycopg2 install is needed.
 `scripts/lakebase_setup.py` is retained as a standalone utility for manual setup.
 
@@ -310,7 +312,7 @@ Removes all deployed resources in the correct order:
 | Databricks App | Bundle destroy |
 | Lakebase instance (+ all databases) | Bundle destroy (async delete) |
 | Setup + Monthly Refresh jobs | Bundle destroy |
-| DLT pipeline | Bundle destroy |
+| Declarative pipeline | Bundle destroy |
 | Workspace bundle folder | `databricks workspace delete --recursive` |
 
 > **Note:** `destroy.sh` only removes resources deployed in the current target.

@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 
 from auth import get_workspace_client, get_psycopg2, get_psycopg2_error
-from config import LAKEBASE_ENDPOINT_PATH, PG_DATABASE_DEFAULT, _BC_LAKEBASE_HOST
+from config import LAKEBASE_ENDPOINT_PATH, PG_DATABASE_DEFAULT, LAKEBASE_HOST
 
 _lakebase_cred_cache: dict = {"token": None, "expires_at": 0.0}
 
@@ -16,7 +16,7 @@ def _get_lakebase_host() -> str:
     Falls back to LAKEBASE_HOST from _bundle_config.py, which is written by
     deploy.sh after lakebase_setup.py resolves and confirms the hostname.
     """
-    return os.environ.get("PGHOST") or _BC_LAKEBASE_HOST
+    return os.environ.get("PGHOST") or LAKEBASE_HOST
 
 
 def _get_lakebase_credential() -> tuple:

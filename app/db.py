@@ -41,7 +41,7 @@ def execute_sql(statement: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_segments():
-    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.sarima_forecasts ORDER BY 1")
+    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.predictions_sarima ORDER BY 1")
     if not df.empty:
         return df["segment_id"].tolist()
     return []
@@ -51,7 +51,7 @@ def load_segments():
 def load_forecasts(segment_id: str):
     return execute_sql(f"""
         SELECT month, record_type, claims_count, forecast_mean, forecast_lo95, forecast_hi95
-        FROM {CATALOG}.{SCHEMA}.sarima_forecasts
+        FROM {CATALOG}.{SCHEMA}.predictions_sarima
         WHERE segment_id = '{segment_id}'
         ORDER BY month
     """)
@@ -66,7 +66,7 @@ def load_monte_carlo_summary():
             AVG(var_995_M)    AS var_995,
             AVG(cvar_99_M)    AS cvar_99,
             MAX(max_loss_M)   AS max_loss
-        FROM {CATALOG}.{SCHEMA}.monte_carlo_results
+        FROM {CATALOG}.{SCHEMA}.predictions_monte_carlo
     """)
     if not df.empty:
         for col in df.columns:
@@ -75,16 +75,6 @@ def load_monte_carlo_summary():
     return pd.Series({
         'expected_loss': 0, 'var_99': 0, 'var_995': 0, 'cvar_99': 0, 'max_loss': 0
     })
-
-
-@st.cache_data(ttl=600)
-def load_monte_carlo_distribution():
-    """Load per-simulation total loss for portfolio loss distribution chart."""
-    return execute_sql(f"""
-        SELECT mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M
-        FROM {CATALOG}.{SCHEMA}.monte_carlo_results
-        ORDER BY mean_loss_M
-    """)
 
 
 @st.cache_data(ttl=600)
@@ -106,10 +96,10 @@ def load_segment_stats(segment_id: str):
 
 @st.cache_data(ttl=600)
 def load_stress_scenarios():
-    """Load pre-computed stress test scenario comparison from Module 4."""
+    """Load pre-computed stress test scenario comparison from Module 3."""
     df = execute_sql(f"""
         SELECT scenario_label, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline
-        FROM {CATALOG}.{SCHEMA}.stress_test_scenarios
+        FROM {CATALOG}.{SCHEMA}.predictions_stress_scenarios
         ORDER BY var_995_M DESC
     """)
     if not df.empty:
@@ -121,10 +111,10 @@ def load_stress_scenarios():
 
 @st.cache_data(ttl=600)
 def load_var_timeline():
-    """Load the 12-month SARIMA-driven VaR evolution from Module 4."""
+    """Load the 12-month SARIMA-driven VaR evolution from Module 3."""
     df = execute_sql(f"""
         SELECT forecast_month, month_idx, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline
-        FROM {CATALOG}.{SCHEMA}.portfolio_risk_timeline
+        FROM {CATALOG}.{SCHEMA}.predictions_risk_timeline
         ORDER BY month_idx
     """)
     if not df.empty:
@@ -138,7 +128,7 @@ def load_garch_volatility(segment_id: str):
     """Load GARCH conditional volatility (actuals + forecasts) from SARIMA residuals for a segment."""
     df = execute_sql(f"""
         SELECT month, record_type, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta
-        FROM {CATALOG}.{SCHEMA}.sarima_forecasts
+        FROM {CATALOG}.{SCHEMA}.predictions_sarima
         WHERE segment_id = '{segment_id}'
           AND cond_volatility IS NOT NULL
         ORDER BY month
@@ -150,20 +140,8 @@ def load_garch_volatility(segment_id: str):
     return df
 
 
-def load_regional_forecast():
-    """Load regional claims forecast from Module 4."""
-    df = execute_sql(f"""
-        SELECT region, forecast_month, total_forecast_claims
-        FROM {CATALOG}.{SCHEMA}.regional_claims_forecast
-        ORDER BY region, forecast_month
-    """)
-    if not df.empty:
-        df['total_forecast_claims'] = pd.to_numeric(df['total_forecast_claims'], errors='coerce')
-    return df
-
-
 def load_reserve_triangle():
-    """Load the loss development triangle from the DLT pipeline."""
+    """Load the loss development triangle from the declarative pipeline."""
     df = execute_sql(f"""
         SELECT segment_id, product_line, region, accident_month, dev_lag,
                cumulative_paid, cumulative_incurred, case_reserve
@@ -175,3 +153,19 @@ def load_reserve_triangle():
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
+
+
+@st.cache_data(ttl=600)
+def load_surplus_evolution():
+    """Load multi-period surplus trajectory from Module 3 regime-switching simulation."""
+    df = execute_sql(f"""
+        SELECT month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability
+        FROM {CATALOG}.{SCHEMA}.predictions_surplus_evolution
+        ORDER BY month
+    """)
+    if not df.empty:
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+

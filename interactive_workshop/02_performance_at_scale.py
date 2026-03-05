@@ -28,6 +28,8 @@
 # MAGIC | **3. For-Loop Anti-Patterns** | `withColumn` loop vs `select()` | The #1 Spark performance trap |
 # MAGIC | **4. Decision Framework** | Summary table | Quick reference for production choices |
 
+# MAGIC
+# MAGIC > **Interactive notebook** — This module is for learning only and is not part of the automated job pipeline.
 # COMMAND ----------
 
 # MAGIC %md
@@ -119,7 +121,7 @@ display(gold_df.limit(10))
 # MAGIC ## Section 1: Scaling ETL — Rolling Features
 # MAGIC
 # MAGIC **Task**: Compute rolling window features (3m/6m/12m means, std, MoM/YoY %) for each segment.
-# MAGIC This is the exact computation that the DLT pipeline runs in production (`silver_rolling_features`).
+# MAGIC This is the exact computation that the declarative pipeline runs in production (`silver_rolling_features`).
 # MAGIC
 # MAGIC We compare **four approaches** on the real 2,880-row dataset, then scale to ~1.4M rows
 # MAGIC to see where each approach shines.
@@ -200,8 +202,6 @@ print(f"  Result: {_count_b} rows")
 
 # COMMAND ----------
 
-import pyspark.pandas as ps
-
 def rolling_features_udf(pdf: pd.DataFrame) -> pd.DataFrame:
     """Per-group UDF: receives one segment's data as a pandas DataFrame."""
     pdf = pdf.sort_values("month").copy()
@@ -256,6 +256,8 @@ print(f"  Result: {_count_c} rows")
 # MAGIC explicit schema, then return to ps.
 
 # COMMAND ----------
+
+import pyspark.pandas as ps
 
 # Bridge pattern: ps → Spark applyInPandas → ps (bypasses brittle schema inference)
 with timed("Approach D — Pandas API on Spark bridge (2,880 rows)"):
@@ -737,6 +739,6 @@ print(f"  Try it yourself if you're curious — but be prepared to cancel the ce
 # MAGIC | **Heavy task-parallel compute** (Monte Carlo, grid search) | Ray (see Module 4) | Independent Python tasks, GPU optional |
 # MAGIC | **Multi-column generation** | `select()` + list comprehension | Avoids O(N²) Catalyst plan resolution |
 # MAGIC
-# MAGIC **Next:** Module 3 — with reliable, scaled Gold data and rolling features from the DLT pipeline,
+# MAGIC **Next:** Module 3 — with reliable, scaled Gold data and rolling features from the declarative pipeline,
 # MAGIC we register them in the Unity Catalog Feature Store with point-in-time correctness.
 # MAGIC The features from `silver_rolling_features` feed Module 4's SARIMAX models as exogenous variables.

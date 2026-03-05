@@ -1,29 +1,42 @@
 # ─── Jobs: Actuarial Workshop ─────────────────────────────────────────────────
 # Two jobs:
 #   1. actuarial_workshop_setup     — one-time full setup (Modules 1–5)
-#   2. actuarial_workshop_refresh   — monthly model refresh (DLT + Module 4)
+#   2. actuarial_workshop_refresh   — monthly model refresh (SDP pipeline + Module 4)
+#
+# Modules 3-5 run on a classic DBR 16.4 ML job cluster (ray_ml_cluster)
+# for Ray-on-Spark distributed Monte Carlo and reliable psycopg2 installs.
 
 resources:
   jobs:
 
     # ── Full Setup Job ─────────────────────────────────────────────────────────
-    # Run once to build all assets: source data, DLT pipeline, features,
+    # Run once to build all assets: source data, declarative pipeline, features,
     # statistical models, and the serving endpoint.
     actuarial_workshop_setup:
       name: "Actuarial Workshop — Full Setup"
       description: >-
-        One-time setup: generates synthetic data, runs the DLT pipeline,
+        One-time setup: generates synthetic data, runs the declarative pipeline,
         builds the Feature Store, fits SARIMA/GARCH models, registers both
         models to UC, and creates the serving endpoints with AI Gateway.
+
+      job_clusters:
+        - job_cluster_key: ray_ml_cluster
+          new_cluster:
+            spark_version: "16.4.x-cpu-ml-scala2.12"
+            node_type_id: "m5d.xlarge"
+            num_workers: 4
+            aws_attributes:
+              first_on_demand: 1
+              availability: SPOT_WITH_FALLBACK
 
       tasks:
 
         # Task 1 — Generate synthetic source data (reserve CDC + claim events)
-        # Runs notebook 01 in standalone (non-DLT) mode to write reserve_development_raw + claims_events_raw
+        # Runs notebook 01 in standalone (non-SDP) mode to write raw_reserve_development + raw_claims_events
         - task_key: generate_source_data
-          description: "Generate synthetic reserve CDC + claims data → reserve_development_raw, claims_events_raw"
+          description: "Generate synthetic reserve CDC + claims data → raw_reserve_development, raw_claims_events"
           notebook_task:
-            notebook_path: ../src/01_dlt_pipeline_and_jobs.py
+            notebook_path: ../src/01_data_pipeline.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -33,10 +46,10 @@ resources:
         # Task 1b — Fetch real macro data from Statistics Canada
         # Runs in parallel with generate_source_data — both handle schema creation
         # independently (CREATE SCHEMA IF NOT EXISTS). Must complete before
-        # run_dlt_pipeline so that macro_indicators_raw is populated when the
-        # DLT bronze_macro_indicators streaming table runs.
+        # run_dlt_pipeline so that raw_macro_indicators is populated when the
+        # SDP bronze_macro_indicators streaming table runs.
         - task_key: fetch_macro_data
-          description: "Fetch StatCan unemployment, HPI, housing starts → macro_indicators_raw"
+          description: "Fetch StatCan unemployment, HPI, housing starts → raw_macro_indicators"
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
@@ -44,14 +57,14 @@ resources:
               schema: "${var.schema}"
           environment_key: default_env
 
-        # Task 2 — Run the DLT pipeline (Bronze → Silver → Gold)
+        # Task 2 — Run the declarative pipeline (Bronze → Silver → Gold)
         # full_refresh: true because generate_source_data recreates source tables via
         # CREATE OR REPLACE TABLE, which invalidates any existing streaming checkpoint.
-        # A full refresh clears DLT checkpoints and re-reads the source from scratch.
-        # Depends on fetch_macro_data so macro_indicators_raw is populated before
+        # A full refresh clears SDP checkpoints and re-reads the source from scratch.
+        # Depends on fetch_macro_data so raw_macro_indicators is populated before
         # bronze_macro_indicators → silver_macro_indicators → gold_macro_features run.
         - task_key: run_dlt_pipeline
-          description: "DLT: Bronze → Silver (SCD Type 2) → Gold (reserve triangle + claims + macro)"
+          description: "SDP: Bronze → Silver (SCD Type 2) → Gold (reserve triangle + claims + macro)"
           depends_on:
             - task_key: generate_source_data
             - task_key: fetch_macro_data
@@ -60,64 +73,48 @@ resources:
             full_refresh: true
 
         # Task 3 — Register Feature Store table (Module 3)
-        # job_mode=true: writes feature table as plain Delta, skips display() calls,
-        # FeatureEngineeringClient, and training set assembly.
+        # Uses the classic ML cluster for FeatureEngineeringClient compatibility.
         # Online Table creation is handled by Module 5 (prepare_app_infrastructure).
-        # These interactive demo sections are preserved for human learners running interactively.
-        # Reads silver_rolling_features produced by the DLT pipeline.
         - task_key: build_feature_store
           description: "UC Feature Store registration (Online Table created by Module 5)"
           depends_on:
             - task_key: run_dlt_pipeline
+          job_cluster_key: ray_ml_cluster
           notebook_task:
-            notebook_path: ../src/03_feature_store.py
+            notebook_path: ../src/02_feature_store.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
               warehouse_id: "${var.warehouse_id}"
-              job_mode: "true"
-          environment_key: default_env
 
         # Task 4 — Fit SARIMAX / GARCH / Monte Carlo + register models (Module 4)
-        # Reads gold_claims_monthly (DLT) and gold_macro_features (DLT, populated by fetch_macro_data).
-        # run_ray=skip: setup_ray_cluster is not supported on Serverless (Spark Connect
-        # does not expose the Ray-on-Spark RPC interface). The single-node NumPy fallback
-        # produces identical outputs and is sufficient for the workshop and model registration.
-        # job_mode=true: use driver-side pandas groupby.apply() for SARIMAX/GARCH instead of
-        # applyInPandas. On Serverless, %pip install only reaches the notebook kernel (client),
-        # not the remote compute (server) where applyInPandas UDFs execute. Driver-side fitting
-        # produces identical outputs and works reliably on all Serverless runtimes.
-        #
-        # No environment_key: the notebook handles its own %pip install for job_mode=true.
-        # Classic-cluster targets (e2-demo-ray) add job_cluster_key via target override;
-        # environment_key cannot coexist with job_cluster_key on classic compute.
+        # Reads gold_claims_monthly (SDP) and gold_macro_features (SDP, populated by fetch_macro_data).
+        # Runs on the classic ML cluster for Ray-on-Spark distributed Monte Carlo
+        # (640M paths across 4 workers) and applyInPandas (statsmodels on workers).
         - task_key: fit_statistical_models
           description: "SARIMAX/GARCH/Monte Carlo + register both models (SARIMA + MC) to UC"
           depends_on:
             - task_key: build_feature_store
+          job_cluster_key: ray_ml_cluster
           notebook_task:
-            notebook_path: ../src/04_classical_stats_at_scale.py
+            notebook_path: ../src/03_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
-              run_ray: "skip"
-              job_mode: "true"
 
         # Task 5 — Prepare all app infrastructure (Module 5)
         # Creates both serving endpoints + AI Gateway, the Online Table for
         # low-latency feature lookup, and the Lakebase PostgreSQL database
         # (DB, extension, table, SP role + grants). Uses the Databricks SDK's
         # generate_database_credential() to get a valid JWT for Lakebase auth.
-        #
-        # Serverless: uses ml_env (psycopg2-binary in spec + %pip fallback).
-        # Ray targets: overridden to reuse the classic ML cluster where %pip
-        # install works reliably (environment_key ignored when job_cluster_key set).
+        # Runs on the classic ML cluster where psycopg2-binary installs reliably.
         - task_key: prepare_app_infrastructure
           description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup"
           depends_on:
             - task_key: fit_statistical_models
+          job_cluster_key: ray_ml_cluster
           notebook_task:
-            notebook_path: ../src/05_model_serving.py
+            notebook_path: ../src/04_model_serving.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
@@ -126,12 +123,11 @@ resources:
               warehouse_id: "${var.warehouse_id}"
               pg_database: "${var.pg_database}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
-          environment_key: ml_env
 
         # Task 6 — App setup: UC grants + model serving endpoint grants
         # Runs after all app infrastructure exists so that CAN_QUERY can be granted.
         - task_key: setup_app_dependencies
-          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on both serving endpoints"
+          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on all serving endpoints"
           depends_on:
             - task_key: prepare_app_infrastructure
           notebook_task:
@@ -142,6 +138,26 @@ resources:
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
               endpoint_name: "${var.endpoint_name}"
               mc_endpoint_name: "${var.mc_endpoint_name}"
+              genie_space_id: "${var.genie_space_id}"
+          environment_key: default_env
+
+        # Task 7 — Register chatbot as Databricks Agent
+        # Creates an MLflow ChatModel agent visible in the AI Gateway agents tab.
+        # Depends on prepare_app_infrastructure (endpoints must exist).
+        - task_key: register_chatbot_agent
+          description: "Register actuarial chatbot as Databricks Agent (AI Gateway visibility)"
+          depends_on:
+            - task_key: setup_app_dependencies
+          notebook_task:
+            notebook_path: ../src/ops/register_agent.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+              endpoint_name: "${var.endpoint_name}"
+              mc_endpoint_name: "${var.mc_endpoint_name}"
+              warehouse_id: "${var.warehouse_id}"
+              llm_endpoint_name: "${var.llm_endpoint_name}"
+              genie_space_id: "${var.genie_space_id}"
           environment_key: default_env
 
       environments:
@@ -150,23 +166,13 @@ resources:
             environment_version: "4"
             dependencies:
               - databricks-feature-engineering
-        - environment_key: ml_env
-          spec:
-            environment_version: "4"
-            dependencies:
-              # statsmodels and arch are available via %pip install in the notebook
-              # (for driver-side job_mode fitting) and listed here for the interactive
-              # applyInPandas demo path where UDFs run on the remote compute.
-              - statsmodels>=0.14
-              - arch>=7.0
-              - mlflow>=2.14
-              - psycopg2-binary
+
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
-    # Scheduled job: refreshes data via DLT then re-fits the SARIMA models.
+    # Scheduled job: refreshes data via the declarative pipeline then re-fits the SARIMA models.
     actuarial_workshop_refresh:
       name: "Actuarial Workshop — Monthly Model Refresh"
       description: >-
-        Monthly scheduled job: refreshes Bronze→Silver→Gold via DLT,
+        Monthly scheduled job: refreshes Bronze→Silver→Gold via the declarative pipeline,
         then re-fits SARIMA/GARCH models and logs to MLflow.
 
       schedule:
@@ -174,10 +180,20 @@ resources:
         timezone_id: "America/Toronto"
         pause_status: PAUSED
 
+      job_clusters:
+        - job_cluster_key: ray_ml_cluster
+          new_cluster:
+            spark_version: "16.4.x-cpu-ml-scala2.12"
+            node_type_id: "m5d.xlarge"
+            num_workers: 4
+            aws_attributes:
+              first_on_demand: 1
+              availability: SPOT_WITH_FALLBACK
+
       tasks:
 
         - task_key: fetch_macro_data
-          description: "Fetch latest StatCan macro indicators → macro_indicators_raw"
+          description: "Fetch latest StatCan macro indicators → raw_macro_indicators"
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
@@ -185,7 +201,7 @@ resources:
               schema: "${var.schema}"
 
         - task_key: refresh_dlt_pipeline
-          description: "Refresh Bronze→Silver→Gold via DLT Apply Changes (incl. macro SCD2)"
+          description: "Refresh Bronze→Silver→Gold via SDP Apply Changes (incl. macro SCD2)"
           depends_on:
             - task_key: fetch_macro_data
           pipeline_task:
@@ -196,20 +212,9 @@ resources:
           description: "Re-fit SARIMAX/GARCH models on refreshed data with updated macro signals"
           depends_on:
             - task_key: refresh_dlt_pipeline
+          job_cluster_key: ray_ml_cluster
           notebook_task:
-            notebook_path: ../src/04_classical_stats_at_scale.py
+            notebook_path: ../src/03_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
-              run_ray: "skip"
-              job_mode: "true"
-          environment_key: ml_env
-
-      environments:
-        - environment_key: ml_env
-          spec:
-            environment_version: "4"
-            dependencies:
-              - statsmodels>=0.14
-              - arch>=7.0
-              - mlflow>=2.14

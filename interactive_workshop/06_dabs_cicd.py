@@ -9,7 +9,7 @@
 # MAGIC ### What Are Databricks Asset Bundles (DABs)?
 # MAGIC
 # MAGIC DABs let you treat **Databricks resources as code**:
-# MAGIC - Jobs, DLT Pipelines, Model Serving endpoints, notebooks — all in YAML
+# MAGIC - Jobs, Declarative Pipelines, Model Serving endpoints, notebooks — all in YAML
 # MAGIC - Version-controlled, peer-reviewed, testable
 # MAGIC - Deploy to Dev / Staging / Prod with a single CLI command
 # MAGIC - The same CI/CD practices actuarial/finance teams use for application code
@@ -20,6 +20,8 @@
 # MAGIC - Safety: staging environment validates before production
 # MAGIC - Consistency: eliminate "works on my laptop" problems
 
+# MAGIC
+# MAGIC > **Interactive notebook** — This module is for learning only. It explains how Databricks Asset Bundles and CI/CD work.
 # COMMAND ----------
 
 # MAGIC %md
@@ -33,10 +35,10 @@
 # MAGIC ├── resources/
 # MAGIC │   ├── jobs.yml            ← Job definitions
 # MAGIC │   ├── serving.yml         ← Model Serving endpoint definitions
-# MAGIC │   └── pipelines.yml       ← DLT pipeline definitions (Module 1)
+# MAGIC │   └── pipelines.yml       ← SDP pipeline definitions (Module 1)
 # MAGIC ├── src/
-# MAGIC │   ├── 04_classical_stats_at_scale.py
-# MAGIC │   ├── 05_model_serving.py
+# MAGIC │   ├── 03_classical_stats_at_scale.py
+# MAGIC │   ├── 04_model_serving.py
 # MAGIC │   ├── 06_dabs_cicd.py
 # MAGIC │   └── monte_carlo.py      ← Reusable Python modules
 # MAGIC ├── tests/
@@ -118,7 +120,7 @@
 # MAGIC         - task_key: generate_silver_data
 # MAGIC           description: "Load/refresh claims time series to Silver"
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/04_classical_stats_at_scale
+# MAGIC             notebook_path: ${workspace.file_path}/src/03_classical_stats_at_scale
 # MAGIC             base_parameters:
 # MAGIC               catalog:  ${var.catalog}
 # MAGIC               schema:   ${var.schema}
@@ -129,7 +131,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: generate_silver_data
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/04_classical_stats_at_scale
+# MAGIC             notebook_path: ${workspace.file_path}/src/03_classical_stats_at_scale
 # MAGIC             base_parameters:
 # MAGIC               step: fit_models
 # MAGIC           environment_key: ml_env
@@ -139,7 +141,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: fit_sarima_garch
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/05_model_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/04_model_serving
 # MAGIC             base_parameters:
 # MAGIC               step: register
 # MAGIC           environment_key: ml_env
@@ -149,7 +151,7 @@
 # MAGIC           depends_on:
 # MAGIC             - task_key: register_champion_model
 # MAGIC           notebook_task:
-# MAGIC             notebook_path: ${workspace.file_path}/src/05_model_serving
+# MAGIC             notebook_path: ${workspace.file_path}/src/04_model_serving
 # MAGIC             base_parameters:
 # MAGIC               step: deploy_endpoint
 # MAGIC           environment_key: ml_env
@@ -448,8 +450,8 @@ print(json.dumps({
 print("\nTypical `databricks bundle deploy` output:")
 print(f"""
 Uploading bundle files to {_bundle_root}/files...
-  ./src/04_classical_stats_at_scale.py (5.2 KB)
-  ./src/05_model_serving.py (4.8 KB)
+  ./src/03_classical_stats_at_scale.py (5.2 KB)
+  ./src/04_model_serving.py (4.8 KB)
   ./src/06_dabs_cicd.py (3.1 KB)
   ./src/monte_carlo.py (1.2 KB)
 
@@ -483,7 +485,7 @@ Deployment complete!
 # MAGIC You've covered the full production stack:
 # MAGIC
 # MAGIC ```
-# MAGIC Bronze/Silver/Gold (DLT)
+# MAGIC Bronze/Silver/Gold (SDP)
 # MAGIC         ↓
 # MAGIC Feature Store (UC, point-in-time)
 # MAGIC         ↓

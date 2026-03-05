@@ -1,20 +1,9 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # App Setup Notebook
-# MAGIC ## UC Permission Grants + Model Serving Endpoint Grant
+# MAGIC # App Setup — UC Grants + Endpoint Permissions
 # MAGIC
-# MAGIC **Run once as part of the `actuarial_workshop_setup` job (Task 6).**
-# MAGIC
-# MAGIC Lakebase PostgreSQL setup (DB, table, extension, SP grants) is handled by
-# MAGIC Module 5 (`prepare_app_infrastructure` task) using the Databricks SDK's
-# MAGIC `generate_database_credential()` for authentication.
-# MAGIC
-# MAGIC ### What this notebook does
-# MAGIC
-# MAGIC | Step | Action |
-# MAGIC |---|---|
-# MAGIC | 1 | Grant `USE CATALOG`, `USE SCHEMA`, and `SELECT` on all workshop tables to the app SP |
-# MAGIC | 2 | Grant `CAN_QUERY` on the model serving endpoint to the app SP |
+# MAGIC Grants `USE CATALOG`, `USE SCHEMA`, `SELECT` on all tables, and `CAN_QUERY`
+# MAGIC on serving endpoints to the app service principal. Run as job Task 6.
 
 # COMMAND ----------
 
@@ -88,8 +77,10 @@ print("\nUC grants complete.")
 # COMMAND ----------
 
 # ─── 2. Grant CAN_QUERY on serving endpoints to the app SP ────────────────────
-# Both endpoints are created by Task 5 (prepare_app_infrastructure) before this task runs.
-_endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME] if ep]
+# All endpoints are created by Task 5 (prepare_app_infrastructure) before this task runs.
+# The agent endpoint (if it exists) is created by Task 7 (register_chatbot_agent).
+AGENT_ENDPOINT_NAME = "actuarial-workshop-chatbot-agent"
+_endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME, AGENT_ENDPOINT_NAME] if ep]
 
 for ep_name in _endpoints_to_grant:
     endpoint_resp = requests.get(
@@ -112,5 +103,31 @@ for ep_name in _endpoints_to_grant:
         print(f"[OK] Granted CAN_QUERY on endpoint '{ep_name}' to SP: {APP_SP_CLIENT_ID}")
     else:
         print(f"[WARN] Failed CAN_QUERY on '{ep_name}': {perms_resp.text[:200]}")
+
+# COMMAND ----------
+
+# ─── 3. Grant CAN_RUN on Genie space to the app SP ────────────────────────────
+# The Genie space is created by Module 4 (src/04_model_serving.py, Section 5).
+# The app SP needs CAN_RUN to use the Genie space for natural-language queries.
+dbutils.widgets.text("genie_space_id", "", "Genie Space ID")
+GENIE_SPACE_ID = dbutils.widgets.get("genie_space_id")
+
+if GENIE_SPACE_ID and APP_SP_CLIENT_ID:
+    genie_perms_resp = requests.patch(
+        f"https://{WORKSPACE_URL}/api/2.0/permissions/genie/{GENIE_SPACE_ID}",
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        json={"access_control_list": [
+            {"service_principal_name": APP_SP_CLIENT_ID, "permission_level": "CAN_RUN"},
+        ]},
+    )
+    if genie_perms_resp.status_code == 200:
+        print(f"[OK] Granted CAN_RUN on Genie space '{GENIE_SPACE_ID}' to SP: {APP_SP_CLIENT_ID}")
+    else:
+        print(f"[WARN] Failed CAN_RUN on Genie space: {genie_perms_resp.text[:200]}")
+else:
+    if not GENIE_SPACE_ID:
+        print("[SKIP] No genie_space_id provided — skipping Genie space grant.")
+    if not APP_SP_CLIENT_ID:
+        print("[SKIP] No app_sp_client_id provided — skipping Genie space grant.")
 
 print("\nApp setup complete.")

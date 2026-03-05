@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from math import log, sqrt, pi
 
 from db import load_monte_carlo_summary
+from endpoints import call_monte_carlo_endpoint
 
 
 def _fit_lognormal(mean_val, var99_val):
@@ -190,3 +191,69 @@ _Technical: t-Copula (df=4) + lognormal marginals. Correlation matrix: ρ(Prop,A
         st.markdown("""
 > **Regulatory context:** The Solvency Capital Requirement (SCR) is the amount of capital a Solvency II insurer must hold to survive a 1-in-200 year loss event. The Tail Risk Estimate goes further — capturing the average severity of scenarios beyond that threshold, and is increasingly referenced in IFRS 17 risk margin calculations.
 """)
+
+        # ── Standard Formula vs Internal Model comparison ────────────────────────
+        st.divider()
+        st.markdown("### Standard Formula vs Internal Model")
+        st.caption(
+            "Compare the aggregate t-Copula approach (Standard Formula) with the "
+            "frequency-severity Collective Risk Model (Internal Model). "
+            "The internal model breaks losses into claim counts × claim sizes "
+            "for more granular risk measurement."
+        )
+
+        if st.button("Run Comparison", key="run_sf_vs_im"):
+            _cmp_base = {
+                "mean_property_M": float(summary.get("expected_loss", 26.5)) * 0.47,
+                "mean_auto_M": float(summary.get("expected_loss", 26.5)) * 0.31,
+                "mean_liability_M": float(summary.get("expected_loss", 26.5)) * 0.22,
+                "cv_property": 0.35, "cv_auto": 0.28, "cv_liability": 0.42,
+                "corr_prop_auto": 0.40, "corr_prop_liab": 0.20, "corr_auto_liab": 0.30,
+                "n_scenarios": 25_000, "copula_df": 4,
+            }
+
+            with st.spinner("Running Standard Formula (aggregate)..."):
+                _sf_params = {**_cmp_base, "model_type": "aggregate", "simulation_mode": "single_period"}
+                _sf_result = call_monte_carlo_endpoint(_sf_params)
+
+            with st.spinner("Running Internal Model (collective risk)..."):
+                _im_params = {**_cmp_base, "model_type": "collective_risk", "simulation_mode": "single_period"}
+                _im_result = call_monte_carlo_endpoint(_im_params)
+
+            if _sf_result and _im_result:
+                _cmp_metrics = ["expected_loss_M", "var_99_M", "var_995_M", "cvar_99_M"]
+                _cmp_labels = ["Expected Loss", "VaR 99%", "SCR (VaR 99.5%)", "CVaR 99%"]
+
+                _fig_cmp = go.Figure()
+                _fig_cmp.add_trace(go.Bar(
+                    name="Standard Formula",
+                    x=_cmp_labels,
+                    y=[_sf_result.get(m, 0) for m in _cmp_metrics],
+                    marker_color="rgba(31,119,180,0.7)",
+                    text=[f"${_sf_result.get(m, 0):.1f}M" for m in _cmp_metrics],
+                    textposition="outside",
+                ))
+                _fig_cmp.add_trace(go.Bar(
+                    name="Internal Model",
+                    x=_cmp_labels,
+                    y=[_im_result.get(m, 0) for m in _cmp_metrics],
+                    marker_color="rgba(44,160,44,0.7)",
+                    text=[f"${_im_result.get(m, 0):.1f}M" for m in _cmp_metrics],
+                    textposition="outside",
+                ))
+                _fig_cmp.update_layout(
+                    title="Standard Formula vs Internal Model — Capital Requirements",
+                    yaxis_title="Annual Portfolio Loss ($M)",
+                    barmode="group", height=400,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(_fig_cmp, use_container_width=True)
+
+                st.caption(
+                    "**Standard Formula**: Aggregate t-Copula + Lognormal marginals — "
+                    "treats each line as a single random variable. "
+                    "**Internal Model**: Frequency-Severity (NegBin counts × Lognormal claim sizes) — "
+                    "captures granular claim-level variability."
+                )
+            else:
+                st.warning("Monte Carlo endpoint not available for comparison.")

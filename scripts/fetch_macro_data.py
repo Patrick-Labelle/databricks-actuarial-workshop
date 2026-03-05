@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Macro Data Fetch — Statistics Canada
 # MAGIC
-# MAGIC Fetches three Statistics Canada time series and appends them to `macro_indicators_raw`:
+# MAGIC Fetches three Statistics Canada time series and appends them to `raw_macro_indicators`:
 # MAGIC - **14-10-0017-01**: Labour force characteristics by province (unemployment rate, monthly)
 # MAGIC - **18-10-0205-01**: New housing price index by province (monthly)
 # MAGIC - **34-10-0158-01**: Housing starts by province (monthly)
@@ -73,6 +73,16 @@ STATCAN_TABLES = {
         "unit_keyword":   "Units",
         "filters": [],   # no further breakdown; each province has one row per month
     },
+    # Table 18-10-0004-01: Consumer Price Index (All-items) by province, monthly.
+    # Used for inflation-adjusted severity calibration in Monte Carlo (Module 4).
+    "18100004": {
+        "source_table":   "18-10-0004-01",
+        "indicator_name": "cpi_index",
+        "unit_keyword":   "Index",
+        "filters": [
+            ("Products and product groups", "All-items"),
+        ],
+    },
 }
 
 # Map StatCan GEO province names → workshop region names (underscore-separated)
@@ -115,19 +125,17 @@ def fetch_statcan_csv(pid_nodashes: str) -> pd.DataFrame:
 def parse_statcan_table(raw_df: pd.DataFrame, table_config: dict, batch_id: str) -> pd.DataFrame:
     """
     Filter a StatCan raw DataFrame to the target provinces and indicator breakdown.
-    Returns rows in the macro_indicators_raw schema.
+    Returns rows in the raw_macro_indicators schema.
     """
-    df = raw_df.copy()
-
     # 1. Filter to the 10 provinces we care about (drop Canada total, CMAs, territories)
-    if "GEO" not in df.columns:
-        raise ValueError(f"No GEO column. Available: {df.columns.tolist()}")
-    df = df[df["GEO"].isin(PROVINCE_MAP.keys())].copy()
+    if "GEO" not in raw_df.columns:
+        raise ValueError(f"No GEO column. Available: {raw_df.columns.tolist()}")
+    df = raw_df[raw_df["GEO"].isin(PROVINCE_MAP.keys())].copy()
 
     # 2. Apply table-specific row filters (skip if column not present)
     for fc, fv in table_config.get("filters", []):
         if fc in df.columns:
-            df = df[df[fc] == fv].copy()
+            df = df[df[fc] == fv]
         else:
             print(f"    Note: filter column '{fc}' not in table — skipping")
 
@@ -185,7 +193,7 @@ for pid, config in STATCAN_TABLES.items():
 if not all_rows:
     print("\nWARNING: All StatCan fetches failed.")
     print("  This is expected on workspaces with restricted outbound internet access.")
-    print("  The DLT pipeline will process an empty macro_indicators_raw.")
+    print("  The declarative pipeline will process an empty raw_macro_indicators.")
     print("  Module 4 SARIMAX will fall back to baseline SARIMA (no macro exog).")
     print("  To populate macro data manually: run this notebook on a cluster with")
     print("  outbound HTTPS access to www150.statcan.gc.ca")
@@ -211,31 +219,31 @@ MACRO_RAW_SCHEMA = StructType([
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
 if all_rows:
-    # Append fetched rows to macro_indicators_raw
+    # Append fetched rows to raw_macro_indicators
     macro_sdf = spark.createDataFrame(combined_pdf, schema=MACRO_RAW_SCHEMA)
     (macro_sdf.write
         .format("delta")
         .mode("append")
-        .saveAsTable(f"{CATALOG}.{SCHEMA}.macro_indicators_raw"))
-    total = spark.table(f"{CATALOG}.{SCHEMA}.macro_indicators_raw").count()
-    print(f"\nAppended {len(combined_pdf):,} rows → {CATALOG}.{SCHEMA}.macro_indicators_raw")
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.raw_macro_indicators"))
+    total = spark.table(f"{CATALOG}.{SCHEMA}.raw_macro_indicators").count()
+    print(f"\nAppended {len(combined_pdf):,} rows → {CATALOG}.{SCHEMA}.raw_macro_indicators")
     print(f"Table total: {total:,} rows")
     print(f"\nIndicator breakdown:")
     display(
-        spark.table(f"{CATALOG}.{SCHEMA}.macro_indicators_raw")
+        spark.table(f"{CATALOG}.{SCHEMA}.raw_macro_indicators")
         .groupBy("indicator_name")
         .agg(F.count("*").alias("rows"), F.countDistinct("province").alias("provinces"),
              F.min("ref_date").alias("first_date"), F.max("ref_date").alias("last_date"))
         .orderBy("indicator_name")
     )
 else:
-    # Ensure the landing zone table exists so DLT streaming source doesn't fail.
-    # The DLT bronze_macro_indicators table will be empty but won't error.
-    if not spark.catalog.tableExists(f"{CATALOG}.{SCHEMA}.macro_indicators_raw"):
+    # Ensure the landing zone table exists so SDP streaming source doesn't fail.
+    # The SDP bronze_macro_indicators table will be empty but won't error.
+    if not spark.catalog.tableExists(f"{CATALOG}.{SCHEMA}.raw_macro_indicators"):
         (spark.createDataFrame([], MACRO_RAW_SCHEMA).write
              .format("delta")
-             .saveAsTable(f"{CATALOG}.{SCHEMA}.macro_indicators_raw"))
-        print(f"Created empty macro_indicators_raw → {CATALOG}.{SCHEMA}.macro_indicators_raw")
+             .saveAsTable(f"{CATALOG}.{SCHEMA}.raw_macro_indicators"))
+        print(f"Created empty raw_macro_indicators → {CATALOG}.{SCHEMA}.raw_macro_indicators")
     else:
-        print(f"macro_indicators_raw already exists — no new rows added.")
+        print(f"raw_macro_indicators already exists — no new rows added.")
     print("Macro data will be empty. SARIMAX will fall back to baseline SARIMA.")
