@@ -38,6 +38,14 @@ variables:
     description: "Email address for job failure notifications (optional)"
     default: ""
 
+  genie_space_id:
+    description: "AI/BI Genie space ID for the chatbot's natural-language data queries"
+    default: ""
+
+  llm_endpoint_name:
+    description: "Foundation Model API endpoint for the chatbot LLM (pay-per-token)"
+    default: "databricks-meta-llama-3-3-70b-instruct"
+
 include:
   - resources/*.yml
   - databricks.local*.yml   # gitignored local overrides; silently skipped if absent

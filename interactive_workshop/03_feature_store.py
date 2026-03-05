@@ -24,7 +24,7 @@
 # MAGIC ### What We'll Build
 # MAGIC
 # MAGIC ```
-# MAGIC Silver rolling features (DLT pipeline)
+# MAGIC Silver rolling features (SDP pipeline)
 # MAGIC         ↓ register
 # MAGIC UC Feature Table ({catalog}.{schema}.segment_features)
 # MAGIC         ↓ point-in-time join
@@ -33,6 +33,8 @@
 # MAGIC Online Table (low-latency lookup at inference)
 # MAGIC ```
 
+# MAGIC
+# MAGIC > **Interactive notebook** — Run this attached to a classic ML cluster (DBR 16.4+). The automated job version runs as part of the setup job.
 # COMMAND ----------
 
 # MAGIC %md
@@ -40,10 +42,7 @@
 
 # COMMAND ----------
 
-import numpy as np
-import pandas as pd
 import pyspark.sql.functions as F
-from pyspark.sql.types import *
 from pyspark.sql.window import Window
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -51,14 +50,10 @@ from pyspark.sql.window import Window
 dbutils.widgets.text("catalog",      "my_catalog",         "UC Catalog")
 dbutils.widgets.text("schema",       "actuarial_workshop", "UC Schema")
 dbutils.widgets.text("warehouse_id", "",                   "SQL Warehouse ID")
-# job_mode: "true" skips display() calls, Feature Engineering client, and training set demo.
-# Online Table creation is handled by Module 5. Set to "false" for full interactive demo.
-dbutils.widgets.dropdown("job_mode", "false", ["false", "true"], "Job (automated) mode")
 CATALOG       = dbutils.widgets.get("catalog")
 SCHEMA        = dbutils.widgets.get("schema")
 WAREHOUSE_ID  = dbutils.widgets.get("warehouse_id")
-JOB_MODE      = dbutils.widgets.get("job_mode") == "true"
-FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
+FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 # COMMAND ----------
 
@@ -77,45 +72,9 @@ FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
 
 # COMMAND ----------
 
-# Load Silver rolling features (from DLT pipeline) or regenerate
-try:
-    silver_features = spark.table(f"{CATALOG}.{SCHEMA}.silver_rolling_features")
-    print(f"Loaded from Silver: {silver_features.count()} rows")
-except Exception:
-    print("Silver features not found — regenerating (run Module 2 first for full pipeline)")
-
-    # Fallback: generate directly (matching gold_claims_monthly schema: 40 segments × 84 months)
-    from itertools import product as iterproduct
-    np.random.seed(42)
-    PRODUCT_LINES = ["Personal_Auto","Commercial_Auto","Homeowners","Commercial_Property"]
-    REGIONS       = ["Ontario","Quebec","British_Columbia","Alberta","Manitoba",
-                     "Saskatchewan","New_Brunswick","Nova_Scotia","Prince_Edward_Island","Newfoundland"]
-    MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")
-    SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
-    BASE          = {"Personal_Auto":26000,"Commercial_Auto":10500,"Homeowners":18500,"Commercial_Property":5200}
-    MULT          = {"Ontario":3.19,"Quebec":1.85,"British_Columbia":1.15,"Alberta":1.0,
-                     "Manitoba":0.30,"Saskatchewan":0.25,"New_Brunswick":0.17,
-                     "Nova_Scotia":0.22,"Prince_Edward_Island":0.04,"Newfoundland":0.11}
-
-    rows = []
-    for prod, reg in iterproduct(PRODUCT_LINES, REGIONS):
-        b = BASE[prod]*MULT[reg]
-        y = [max(0, b*(1+0.003*i)*SEASONALITY[m.month]*(1+np.random.normal(0,0.08))) for i,m in enumerate(MONTHS)]
-        y_arr = np.array(y)
-        for i, (m, v) in enumerate(zip(MONTHS, y_arr)):
-            rows.append({
-                "segment_id": f"{prod}__{reg}", "product_line": prod, "region": reg,
-                "month": m.date(), "claims_count": int(round(v)),
-                "rolling_3m_mean": float(np.mean(y_arr[max(0,i-2):i+1])),
-                "rolling_6m_mean": float(np.mean(y_arr[max(0,i-5):i+1])),
-                "rolling_12m_mean": float(np.mean(y_arr[max(0,i-11):i+1])),
-                "rolling_3m_std": float(np.std(y_arr[max(0,i-2):i+1])+1e-6),
-                "mom_change_pct": float((v/y_arr[i-1]-1)*100 if i>0 else 0.0),
-                "yoy_change_pct": float((v/y_arr[i-12]-1)*100 if i>=12 else 0.0),
-                "avg_loss_ratio": round(np.random.uniform(0.55, 0.80), 4),
-                "total_premium": round(b * np.random.uniform(3.2, 3.8), 2),
-            })
-    silver_features = spark.createDataFrame(pd.DataFrame(rows))
+# Load Silver rolling features (from declarative pipeline — Module 2 must run first)
+silver_features = spark.table(f"{CATALOG}.{SCHEMA}.silver_rolling_features")
+print(f"Loaded from Silver: {silver_features.count()} rows")
 
 # COMMAND ----------
 
@@ -126,26 +85,23 @@ except Exception:
 
 # Add any columns that may be missing when loading from the Silver table
 # (notebook 02 saves rolling means/pct_change but not std, loss ratio, or premium)
-from pyspark.sql import Window as _W
-import pyspark.sql.functions as _F
-
 if "rolling_3m_std" not in silver_features.columns:
-    w3 = _W.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
+    w3 = Window.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
     silver_features = silver_features.withColumn(
         "rolling_3m_std",
-        _F.coalesce(_F.stddev("claims_count").over(w3).cast("double"), _F.lit(0.0)) + _F.lit(1e-6)
+        F.coalesce(F.stddev("claims_count").over(w3).cast("double"), F.lit(0.0)) + F.lit(1e-6)
     )
 
 if "avg_loss_ratio" not in silver_features.columns:
     silver_features = silver_features.withColumn(
         "avg_loss_ratio",
-        _F.lit(0.65) + (_F.abs(_F.hash("segment_id")) % 1000).cast("double") / _F.lit(40000)
+        F.lit(0.65) + (F.abs(F.hash("segment_id")) % 1000).cast("double") / F.lit(40000)
     )
 
 if "total_premium" not in silver_features.columns:
     silver_features = silver_features.withColumn(
         "total_premium",
-        (_F.col("claims_count").cast("double") / _F.lit(0.65)) * _F.lit(3.5)
+        (F.col("claims_count").cast("double") / F.lit(0.65)) * F.lit(3.5)
     )
 
 feature_df = (
@@ -180,8 +136,6 @@ feature_df = (
 )
 
 print(f"Feature table shape: {feature_df.count()} rows × {len(feature_df.columns)} columns")
-if not JOB_MODE:
-    display(feature_df.limit(5))
 
 # COMMAND ----------
 
@@ -199,58 +153,30 @@ if not JOB_MODE:
 # Ensure the schema exists before writing the feature table
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
-if JOB_MODE:
-    # In job mode: save as plain Delta to avoid Feature Engineering client compatibility issues
-    # on serverless compute. Interactive demo uses the Feature Engineering client below.
-    (feature_df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(FEATURE_TABLE))
-    print(f"Feature table saved (job mode): {FEATURE_TABLE}")
-    FE_AVAILABLE = False
-    fe = None
-else:
-    try:
-        from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
-        fe = FeatureEngineeringClient()  # Validate it can connect (may fail on some serverless configs)
-        FE_AVAILABLE = True
-    except Exception as _fe_import_err:
-        print(f"FeatureEngineeringClient not available ({type(_fe_import_err).__name__}: {_fe_import_err}) "
-              "— saving as plain Delta table instead.")
-        FE_AVAILABLE = False
-        fe = None
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+fe = FeatureEngineeringClient()
 
-    if FE_AVAILABLE:
-        # Write the feature table (create if not exists, overwrite if exists)
-        try:
-            fe.create_table(
-                name             = FEATURE_TABLE,
-                primary_keys     = ["segment_id", "month"],
-                timestamp_keys   = ["month_ts"],           # Enables point-in-time joins
-                df               = feature_df,
-                description      = (
-                    "Monthly actuarial risk features per segment (product × region). "
-                    "Rolling means, volatility measures, seasonality indicators. "
-                    "Registered for point-in-time correct training set assembly."
-                ),
-            )
-            print(f"Feature table created: {FEATURE_TABLE}")
-        except Exception as e:
-            if "already exists" in str(e).lower() or "table already exists" in str(e).lower():
-                print(f"Feature table already exists — overwriting data: {FEATURE_TABLE}")
-                fe.write_table(name=FEATURE_TABLE, df=feature_df, mode="overwrite")
-            else:
-                raise
-        print(f"Point-in-time key: month_ts")
+# Write the feature table (create if not exists, overwrite if exists)
+try:
+    fe.create_table(
+        name             = FEATURE_TABLE,
+        primary_keys     = ["segment_id", "month"],
+        timestamp_keys   = ["month_ts"],           # Enables point-in-time joins
+        df               = feature_df,
+        description      = (
+            "Monthly actuarial risk features per segment (product × region). "
+            "Rolling means, volatility measures, seasonality indicators. "
+            "Registered for point-in-time correct training set assembly."
+        ),
+    )
+    print(f"Feature table created: {FEATURE_TABLE}")
+except Exception as e:
+    if "already exists" in str(e).lower() or "table already exists" in str(e).lower():
+        print(f"Feature table already exists — overwriting data: {FEATURE_TABLE}")
+        fe.write_table(name=FEATURE_TABLE, df=feature_df, mode="overwrite")
     else:
-        # Fallback: save as plain Delta table
-        (feature_df.write
-            .format("delta")
-            .mode("overwrite")
-            .option("overwriteSchema", "true")
-            .saveAsTable(FEATURE_TABLE))
-        print(f"Feature table saved as Delta (no Feature Store registration): {FEATURE_TABLE}")
+        raise
+print(f"Point-in-time key: month_ts")
 
 # COMMAND ----------
 
@@ -276,21 +202,17 @@ else:
 
 # COMMAND ----------
 
-# Training set assembly is an interactive demo — skip in automated job runs
-if not JOB_MODE:
- observations_pdf = (
+observations_pdf = (
     feature_df
     .select("segment_id", "month_ts", "avg_loss_ratio")
     .filter(F.col("month_ts") >= "2020-01-01")  # Train on 2020+ data
     .withColumnRenamed("avg_loss_ratio", "target_loss_ratio")
     .withColumn("observation_id", F.monotonically_increasing_id())
     .toPandas()
- )
-
-if not JOB_MODE:
-    observations_spark = spark.createDataFrame(observations_pdf)
-    print(f"Observation table: {len(observations_pdf)} rows")
-    display(observations_spark.limit(10))
+)
+observations_spark = spark.createDataFrame(observations_pdf)
+print(f"Observation table: {len(observations_pdf)} rows")
+display(observations_spark.limit(10))
 
 # COMMAND ----------
 
@@ -304,39 +226,29 @@ if not JOB_MODE:
 # it retrieves features from FEATURE_TABLE where month_ts <= observation timestamp.
 # This ensures we only use information available at prediction time.
 
-if not JOB_MODE and FE_AVAILABLE:
-    training_set = fe.create_training_set(
-        df                = observations_spark,
-        feature_lookups   = [
-            FeatureLookup(
-                table_name       = FEATURE_TABLE,
-                feature_names    = [
-                    "rolling_3m_mean", "rolling_6m_mean", "rolling_12m_mean",
-                    "rolling_3m_std", "coeff_variation_3m",
-                    "mom_change_pct", "yoy_change_pct",
-                    "month_of_year", "quarter", "is_q1", "is_winter",
-                    "loss_ratio_trend_3m", "normalized_premium",
-                ],
-                lookup_key       = ["segment_id"],
-                timestamp_lookup_key = "month_ts",  # Point-in-time key
-            ),
-        ],
-        label             = "target_loss_ratio",
-        exclude_columns   = ["observation_id"],
-    )
-    training_df = training_set.load_df()
-    print(f"Training set (point-in-time join): {training_df.count()} rows × {len(training_df.columns)} columns")
-    print("Columns:", training_df.columns)
-    display(training_df.limit(10))
-elif not JOB_MODE:
-    # Fallback: simple join without point-in-time guarantees
-    print("Feature Store not available — using plain join for training set assembly")
-    training_df = (
-        observations_spark
-        .join(feature_df.drop("avg_loss_ratio"), on=["segment_id", "month_ts"], how="left")
-    )
-    print(f"Training set (plain join): {training_df.count()} rows × {len(training_df.columns)} columns")
-    display(training_df.limit(10))
+training_set = fe.create_training_set(
+    df                = observations_spark,
+    feature_lookups   = [
+        FeatureLookup(
+            table_name       = FEATURE_TABLE,
+            feature_names    = [
+                "rolling_3m_mean", "rolling_6m_mean", "rolling_12m_mean",
+                "rolling_3m_std", "coeff_variation_3m",
+                "mom_change_pct", "yoy_change_pct",
+                "month_of_year", "quarter", "is_q1", "is_winter",
+                "loss_ratio_trend_3m", "normalized_premium",
+            ],
+            lookup_key       = ["segment_id"],
+            timestamp_lookup_key = "month_ts",  # Point-in-time key
+        ),
+    ],
+    label             = "target_loss_ratio",
+    exclude_columns   = ["observation_id"],
+)
+training_df = training_set.load_df()
+print(f"Training set (point-in-time join): {training_df.count()} rows × {len(training_df.columns)} columns")
+print("Columns:", training_df.columns)
+display(training_df.limit(10))
 
 # COMMAND ----------
 
@@ -349,14 +261,13 @@ elif not JOB_MODE:
 
 # Sanity check: for the earliest observation dates (Jan 2020),
 # rolling_12m_mean should reflect data from 2019 only (12 months prior)
-if not JOB_MODE and 'training_df' in dir():
-    leakage_check = (
-        training_df
-        .filter((F.col("segment_id") == "Personal_Auto__Ontario") & (F.col("month_ts") < "2020-04-01"))
-        .select("segment_id", "month_ts", "rolling_12m_mean", "rolling_3m_mean", "target_loss_ratio")
-        .orderBy("month_ts")
-    )
-    display(leakage_check)
+leakage_check = (
+    training_df
+    .filter((F.col("segment_id") == "Personal_Auto__Ontario") & (F.col("month_ts") < "2020-04-01"))
+    .select("segment_id", "month_ts", "rolling_12m_mean", "rolling_3m_mean", "target_loss_ratio")
+    .orderBy("month_ts")
+)
+display(leakage_check)
 
 # COMMAND ----------
 
@@ -400,4 +311,4 @@ spark.sql(f"""
 # MAGIC
 # MAGIC **Next:** Module 4 — with reliable data and leakage-free features, we're ready to fit
 # MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 40 segments. Module 4 reads
-# MAGIC `segment_monthly_features` to provide exogenous variables for SARIMAX forecasting.
+# MAGIC `features_segment_monthly` to provide exogenous variables for SARIMAX forecasting.

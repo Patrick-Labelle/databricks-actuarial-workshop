@@ -2,10 +2,10 @@ import numpy as np
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 
-from db import load_monte_carlo_summary, load_stress_scenarios, load_var_timeline, load_regional_forecast, load_reserve_triangle
-from endpoints import call_monte_carlo_endpoint, email_from_token
+from db import load_monte_carlo_summary, load_stress_scenarios, load_var_timeline, load_reserve_triangle, load_surplus_evolution
+from endpoints import call_monte_carlo_endpoint
+from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
 from constants import CAT_PRESETS, RETURN_PERIOD_MULT, CANADIAN_PROVINCES
 
@@ -79,7 +79,7 @@ def render(tab):
             )
             st.plotly_chart(_fig_stress, use_container_width=True)
         else:
-            st.info("Stress scenario data not yet available — run the setup job (e2-demo-ray target).")
+            st.info("Stress scenario data not yet available — run the setup job.")
 
         # ── Section 2: VaR evolution timeline ─────────────────────────────────────
         st.markdown("### Capital Requirement Outlook — Next 12 Months")
@@ -252,7 +252,7 @@ def render(tab):
             else:
                 st.warning(
                     "Monte Carlo endpoint not available. "
-                    "Start it from Module 6 or wait for the setup job to complete."
+                    "Start it from Module 4 or wait for the setup job to complete."
                 )
 
         # Recent CAT scenarios
@@ -264,31 +264,70 @@ def render(tab):
         else:
             st.info("No catastrophe scenarios submitted yet. Use the form above to run one.")
 
-        # ── Section 4: Regional Forecast Context ─────────────────────────────────
+        # ── Section 4: Surplus Evolution ───────────────────────────────────────────
         st.divider()
-        st.markdown("### Regional Claims Forecast")
+        st.markdown("### Surplus Evolution — 12-Month Outlook")
         st.caption(
-            "Geographic breakdown of projected claims over the next 12 months — shows where "
-            "exposure is concentrated and helps contextualize catastrophe stress scenarios."
+            "Multi-period portfolio simulation with 2-state regime-switching (Normal/Crisis). "
+            "Shows how surplus evolves under stochastic losses with monthly premium inflow and investment returns."
         )
-        _reg_forecast = load_regional_forecast()
-        if not _reg_forecast.empty:
-            # Pivot to get regions as rows, months as value
-            _reg_total = _reg_forecast.groupby("region")["total_forecast_claims"].sum().reset_index()
-            _reg_total = _reg_total.sort_values("total_forecast_claims", ascending=True)
-            _fig_reg = px.bar(
-                _reg_total, x="total_forecast_claims", y="region",
-                orientation="h",
-                title="12-Month Cumulative Projected Claims by Region",
-                labels={"total_forecast_claims": "Total Projected Claims", "region": "Region"},
-            )
-            _fig_reg.update_layout(height=400)
-            st.plotly_chart(_fig_reg, use_container_width=True)
+        _surplus_df = load_surplus_evolution()
+        if not _surplus_df.empty:
+            _fig_surplus = go.Figure()
 
-            with st.expander("📋 Regional forecast detail"):
-                st.dataframe(_reg_forecast, use_container_width=True, hide_index=True)
+            # 5th-95th percentile band
+            _fig_surplus.add_trace(go.Scatter(
+                x=_surplus_df["month"], y=_surplus_df["surplus_p95"],
+                mode="lines", line=dict(width=0), showlegend=False,
+                hovertemplate="Month %{x}<br>95th pctl: $%{y:.1f}M<extra></extra>",
+            ))
+            _fig_surplus.add_trace(go.Scatter(
+                x=_surplus_df["month"], y=_surplus_df["surplus_p05"],
+                mode="lines", line=dict(width=0), fill="tonexty",
+                fillcolor="rgba(31,119,180,0.15)", name="5th–95th percentile",
+                hovertemplate="Month %{x}<br>5th pctl: $%{y:.1f}M<extra></extra>",
+            ))
+
+            # 25th-75th percentile band
+            _fig_surplus.add_trace(go.Scatter(
+                x=_surplus_df["month"], y=_surplus_df["surplus_p75"],
+                mode="lines", line=dict(width=0), showlegend=False,
+            ))
+            _fig_surplus.add_trace(go.Scatter(
+                x=_surplus_df["month"], y=_surplus_df["surplus_p25"],
+                mode="lines", line=dict(width=0), fill="tonexty",
+                fillcolor="rgba(31,119,180,0.30)", name="25th–75th percentile",
+            ))
+
+            # Median
+            _fig_surplus.add_trace(go.Scatter(
+                x=_surplus_df["month"], y=_surplus_df["surplus_p50"],
+                mode="lines+markers", name="Median surplus",
+                line=dict(color="#1f77b4", width=2),
+                hovertemplate="Month %{x}<br>Median: $%{y:.1f}M<extra></extra>",
+            ))
+
+            # Zero line (ruin threshold)
+            _fig_surplus.add_hline(y=0, line_dash="dot", line_color="red",
+                                   annotation_text="Ruin threshold",
+                                   annotation_position="bottom right")
+
+            _fig_surplus.update_layout(
+                title="Surplus Trajectory with Regime-Switching (50,000 scenarios)",
+                xaxis_title="Month", yaxis_title="Surplus ($M)", height=420,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(_fig_surplus, use_container_width=True)
+
+            # Ruin probability
+            _ruin_final = _surplus_df["ruin_probability"].iloc[-1]
+            if _ruin_final > 0:
+                st.metric("12-Month Ruin Probability", f"{_ruin_final:.4%}",
+                          help="Probability that surplus drops below zero within 12 months under the regime-switching model.")
+            else:
+                st.info("No ruin events observed in 50,000 scenarios — surplus remains healthy over the 12-month horizon.")
         else:
-            st.info("Regional forecast data not yet available. Run Module 4 (Ray target) to generate.")
+            st.info("Surplus evolution data not yet available. Run Module 3 (Ray target) to generate.")
 
         # ── Section 5: Reserve Development Triangle ──────────────────────────────
         st.divider()
@@ -348,4 +387,4 @@ def render(tab):
                             use_container_width=True,
                         )
         else:
-            st.info("Reserve triangle data not yet available. Run the DLT pipeline to generate.")
+            st.info("Reserve triangle data not yet available. Run the declarative pipeline to generate.")

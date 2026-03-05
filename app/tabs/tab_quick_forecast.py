@@ -42,7 +42,7 @@ _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion 
                     st.session_state["ondemand_result"] = _fetched
                     st.session_state["ondemand_horizon"] = horizon
                 else:
-                    st.warning("Endpoint not available — start the Model Serving endpoint from Module 5")
+                    st.warning("Endpoint not available — start the Model Serving endpoint from Module 4")
 
         result_df = st.session_state.get("ondemand_result", pd.DataFrame())
         _display_horizon = st.session_state.get("ondemand_horizon", horizon)

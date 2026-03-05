@@ -1,33 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Workshop Cleanup Notebook
-# MAGIC ## Remove All Assets Created by the Actuarial Workshop Demo
+# MAGIC # Workshop Cleanup — Remove All Workshop Assets
 # MAGIC
-# MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
-# MAGIC
-# MAGIC ---
-# MAGIC > **⚠️ WARNING**: This notebook permanently deletes workshop assets.
-# MAGIC > Review each section carefully before running. Run cells individually, not all at once.
-# MAGIC >
-# MAGIC > **Do NOT run this notebook during the workshop.**
-# MAGIC > It is intended for post-workshop cleanup only.
-# MAGIC
-# MAGIC ### Assets This Notebook Will Remove
-# MAGIC
-# MAGIC | Asset | Type | Created By |
-# MAGIC |---|---|---|
-# MAGIC | `{catalog}.{schema}` | UC Schema + all tables (incl. legacy `garch_volatility`) | Modules 1–5 |
-# MAGIC | `segment_features_online` | Online Table | Module 3 |
-# MAGIC | `actuarial-workshop-sarima-forecaster` | Model Serving endpoint | Module 5 |
-# MAGIC | `actuarial_workshop_sarima_claims_forecaster` | MLflow experiment | Module 5 |
-# MAGIC | `{catalog}.{schema}.sarima_claims_forecaster` | UC Model | Module 5 |
-# MAGIC | `Actuarial Workshop — DLT Pipeline` | DLT Pipeline | Module 1 |
-# MAGIC | `Actuarial Workshop — Orchestration Demo` | Databricks Job | Module 1 |
-# MAGIC | `actuarial_workshop_db` | Lakebase PostgreSQL database | Bonus (App setup) |
-# MAGIC
-# MAGIC > **Note:** The Databricks App, Lakebase instance, bundle jobs, and DLT pipeline managed
-# MAGIC > by the Asset Bundle are removed by `databricks bundle destroy --target <target>`.
-# MAGIC > This notebook removes assets created *inside* the workspace by the workshop notebooks.
+# MAGIC Drops the UC schema (CASCADE), Online Table, serving endpoints, registered models,
+# MAGIC MLflow experiments, SDP pipeline, jobs, and Lakebase database.
+# MAGIC Bundle-managed resources are removed separately via `databricks bundle destroy`.
 
 # COMMAND ----------
 
@@ -51,7 +28,7 @@ PG_DATABASE       = dbutils.widgets.get("pg_database")
 LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance")
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
-import requests, json, mlflow, time, os
+import requests, mlflow, time, os
 
 # Serverless-compatible token acquisition.
 # Method 1: notebook context (works on classic clusters and scheduled job runs).
@@ -78,9 +55,6 @@ print(f"Token acquired: {'yes' if TOKEN else 'no'}")
 
 # MAGIC %md
 # MAGIC ## 1. Drop Unity Catalog Schema and All Tables
-# MAGIC
-# MAGIC This drops **all** tables, views, functions, and volumes in `{catalog}.{schema}`,
-# MAGIC then drops the schema itself.
 
 # COMMAND ----------
 
@@ -100,9 +74,6 @@ print(f"Schema {CATALOG}.{SCHEMA} dropped (CASCADE — all tables, views, functi
 
 # MAGIC %md
 # MAGIC ## 2. Remove the Online Table
-# MAGIC
-# MAGIC The Online Table (`segment_features_online`) was created in Module 3 via the REST API.
-# MAGIC It must also be removed via REST API.
 
 # COMMAND ----------
 
@@ -124,8 +95,6 @@ else:
 
 # MAGIC %md
 # MAGIC ## 3. Delete Model Serving Endpoint
-# MAGIC
-# MAGIC The endpoint `actuarial-workshop-sarima-forecaster` was created in Module 5.
 
 # COMMAND ----------
 
@@ -145,9 +114,6 @@ else:
 
 # MAGIC %md
 # MAGIC ## 4. Delete Registered Model from UC Registry
-# MAGIC
-# MAGIC Removes the model `{catalog}.{schema}.sarima_claims_forecaster`
-# MAGIC and all its versions from Unity Catalog.
 
 # COMMAND ----------
 
@@ -166,8 +132,6 @@ except Exception as e:
 
 # MAGIC %md
 # MAGIC ## 5. Delete MLflow Experiment
-# MAGIC
-# MAGIC Removes the MLflow experiment and all its run data.
 
 # COMMAND ----------
 
@@ -189,9 +153,7 @@ for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_4]:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Delete DLT Pipeline
-# MAGIC
-# MAGIC Find and delete the DLT pipeline named `Actuarial Workshop — DLT Pipeline`.
+# MAGIC ## 6. Delete SDP Pipeline
 
 # COMMAND ----------
 
@@ -226,8 +188,6 @@ for p in workshop_pipelines:
 
 # MAGIC %md
 # MAGIC ## 7. Delete Databricks Job
-# MAGIC
-# MAGIC Find and delete jobs named `Actuarial Workshop — Orchestration Demo`.
 
 # COMMAND ----------
 
@@ -263,11 +223,8 @@ for j in jobs:
 # MAGIC %md
 # MAGIC ## 8. Drop Lakebase PostgreSQL Database
 # MAGIC
-# MAGIC Drops the `actuarial_workshop_db` database (and all tables in it) from the
-# MAGIC Lakebase instance. This removes `public.scenario_annotations` and all analyst annotations.
-# MAGIC
-# MAGIC > The Lakebase **instance** itself is removed by `databricks bundle destroy`.
-# MAGIC > This step only drops the database inside the instance.
+# MAGIC Drops the database inside the Lakebase instance. The instance itself is
+# MAGIC removed by `databricks bundle destroy`.
 
 # COMMAND ----------
 
@@ -333,10 +290,7 @@ if LB_HOST:
 # MAGIC %md
 # MAGIC ## 9. Cleanup Verification
 # MAGIC
-# MAGIC Verify all assets have been removed.
-# MAGIC
-# MAGIC > After running this notebook, run `databricks bundle destroy --target <target>` to
-# MAGIC > remove the Databricks App, Lakebase instance, jobs, and DLT pipeline managed by the bundle.
+# MAGIC Verify all assets removed. Run `databricks bundle destroy` afterward for bundle resources.
 
 # COMMAND ----------
 
@@ -375,14 +329,5 @@ print("\nCleanup complete.")
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC | Asset | Action |
-# MAGIC |---|---|
-# MAGIC | `{catalog}.{schema}` schema | Dropped (CASCADE) |
-# MAGIC | Online Table `segment_features_online` | Deleted via REST API |
-# MAGIC | Model Serving endpoint | Deleted via REST API |
-# MAGIC | UC registered model | Deleted via MLflow client |
-# MAGIC | MLflow experiments | Deleted |
-# MAGIC | DLT pipeline | Deleted via REST API |
-# MAGIC | Databricks Job | Deleted via REST API |
-# MAGIC | Lakebase database `actuarial_workshop_db` | Dropped (PostgreSQL DROP DATABASE) |
-# MAGIC | Databricks App + Lakebase instance + bundle jobs | Run `databricks bundle destroy` |
+# MAGIC All workshop assets removed. Run `databricks bundle destroy --target <target>`
+# MAGIC to clean up bundle-managed resources (App, Lakebase instance, jobs, pipeline).

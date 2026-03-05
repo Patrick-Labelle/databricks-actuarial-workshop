@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Module 1: Foundations
-# MAGIC ## Delta Live Tables Pipeline + Databricks Workflows
+# MAGIC ## Spark Declarative Pipelines (SDP) + Databricks Workflows
 # MAGIC
 # MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
 # MAGIC *Audience: Actuaries, Data Scientists, Financial Analysts*
@@ -13,13 +13,13 @@
 # MAGIC we need **reliable, versioned, auditable data** flowing through a pipeline. The classic actuarial
 # MAGIC challenges:
 # MAGIC
-# MAGIC | Challenge | Without Databricks | With DLT + Medallion |
+# MAGIC | Challenge | Without Databricks | With SDP + Medallion |
 # MAGIC |---|---|---|
 # MAGIC | CDC / policy updates | Hand-rolled MERGE SQL | Declarative Apply Changes |
 # MAGIC | Data quality enforcement | Ad-hoc checks, late discovery | Expectations: fail/warn/quarantine |
 # MAGIC | Reprocessing history | Manual, error-prone | Re-run from Bronze, full lineage |
 # MAGIC | Pipeline orchestration | Cron + shell scripts | Databricks Jobs DAG |
-# MAGIC | Streaming + batch unification | Two separate codebases | One DLT pipeline |
+# MAGIC | Streaming + batch unification | Two separate codebases | One declarative pipeline |
 # MAGIC
 # MAGIC ---
 # MAGIC ### Architecture for Today
@@ -29,48 +29,50 @@
 # MAGIC        ↓
 # MAGIC   BRONZE  — append-only raw records (full history preserved)
 # MAGIC        ↓  Apply Changes (SCD Type 2)
-# MAGIC   SILVER  — current + history of each reserve estimate, DLT expectations enforced
+# MAGIC   SILVER  — current + history of each reserve estimate, SDP expectations enforced
 # MAGIC        ↓  Aggregation
 # MAGIC   GOLD    — loss development triangle (accident month × development lag)
 # MAGIC ```
 
+# MAGIC
+# MAGIC > **Interactive notebook** — Run this notebook attached to a cluster (not a job). To create the SDP pipeline tables, attach this notebook to a declarative pipeline.
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part A: DLT Pipeline Definition
+# MAGIC ## Part A: SDP Pipeline Definition
 # MAGIC
-# MAGIC **This notebook is the DLT pipeline source.** When attached to a Delta Live Tables pipeline,
+# MAGIC **This notebook is the declarative pipeline source.** When attached to a Spark Declarative Pipelines (SDP) pipeline,
 # MAGIC Databricks automatically:
 # MAGIC - Determines execution order from `@dlt.table` dependencies
 # MAGIC - Manages incremental processing (only new/changed data)
 # MAGIC - Tracks data quality metrics (expectations)
 # MAGIC - Handles SCD logic via `dlt.apply_changes()`
 # MAGIC
-# MAGIC > **How to run**: Create a DLT pipeline in the Workflows UI, point it at this notebook,
+# MAGIC > **How to run**: Create a declarative pipeline in the Workflows UI, point it at this notebook,
 # MAGIC > and click Start. The pipeline handles the rest.
 
 # COMMAND ----------
 
 try:
     import dlt
-    IN_DLT = True
+    IN_PIPELINE = True
 except Exception:
-    # Running as a regular notebook (not inside a DLT pipeline context)
+    # Running as a regular notebook (not inside a declarative pipeline context)
     # Data generation and Job creation sections still work normally
     # Catching Exception (not just ImportError) because on some runtimes
-    # importing dlt outside a DLT pipeline raises a Py4J/Java error
+    # importing dlt outside a declarative pipeline raises a Py4J/Java error
     dlt = None
-    IN_DLT = False
+    IN_PIPELINE = False
 
 import pyspark.sql.functions as F
-from pyspark.sql.types import *
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-# When running as a DLT pipeline, values come from the pipeline's configuration
+# When running as a declarative pipeline, values come from the pipeline's configuration
 # block (set in databricks.yml → resources/pipeline.yml).
 # When running as a job task or interactively, values come from widgets
 # (base_parameters in resources/jobs.yml, or the defaults below).
-if IN_DLT:
+if IN_PIPELINE:
     CATALOG            = spark.conf.get("catalog",             "my_catalog")
     SCHEMA             = spark.conf.get("schema",              "actuarial_workshop")
     NOTIFICATION_EMAIL = spark.conf.get("notification_email", "")
@@ -96,12 +98,12 @@ else:
 # COMMAND ----------
 
 # ── Helper: generate synthetic reserve development CDC data ───────────────────
-# Run this cell OUTSIDE the DLT pipeline to seed the landing zone with data
+# Run this cell OUTSIDE the declarative pipeline to seed the landing zone with data
 
 def generate_reserve_development_data(spark, catalog: str, schema: str):
     """
     Generate synthetic claims reserve development CDC records and write to a Delta
-    table that acts as the Bronze source for the DLT pipeline.
+    table that acts as the Bronze source for the declarative pipeline.
 
     Reserve development is core actuarial data: case reserves are set when a claim
     is first reported, then revised as the claim develops (additional information,
@@ -174,7 +176,6 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
             if max_lag < 1:
                 continue
 
-            prev_paid = 0.0
             for lag in range(1, max_lag + 1):
                 cum_paid_pct = dev_pct[lag - 1] * np.random.uniform(0.92, 1.08)
                 cum_paid = ultimate * min(cum_paid_pct, 1.0)
@@ -201,7 +202,6 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
                     "ingested_at":        pd.Timestamp.now().isoformat(),
                 })
                 event_seq += 1
-                prev_paid = cum_paid
 
     pdf = pd.DataFrame(rows)
 
@@ -227,10 +227,10 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .saveAsTable(f"{catalog}.{schema}.reserve_development_raw"))
+        .saveAsTable(f"{catalog}.{schema}.raw_reserve_development"))
 
     count = sdf.count()
-    print(f"Generated {count:,} reserve development CDC events → {catalog}.{schema}.reserve_development_raw")
+    print(f"Generated {count:,} reserve development CDC events → {catalog}.{schema}.raw_reserve_development")
     return sdf
 
 # ── Helper: generate synthetic claim incident data ────────────────────────────
@@ -240,8 +240,8 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
 
     Volume calibrated to Alberta Open Data 2013 loss ratios with population-weighted
     provincial multipliers (~500K claims/month, ~42M total). Each row is one claim
-    event. Writes to claims_events_raw per-segment batch to manage memory,
-    which feeds the DLT bronze_claims → gold_claims_monthly pipeline.
+    event. Writes to raw_claims_events per-segment batch to manage memory,
+    which feeds the SDP bronze_claims → gold_claims_monthly pipeline.
 
     Returns the Spark DataFrame.
     """
@@ -359,24 +359,24 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
             .format("delta")
             .mode(mode)
             .option("overwriteSchema", "true" if first else "false")
-            .saveAsTable(f"{catalog}.{schema}.claims_events_raw"))
+            .saveAsTable(f"{catalog}.{schema}.raw_claims_events"))
         first = False
 
-    print(f"Generated {total_count:,} claim events → {catalog}.{schema}.claims_events_raw")
-    return spark.table(f"{catalog}.{schema}.claims_events_raw")
+    print(f"Generated {total_count:,} claim events → {catalog}.{schema}.raw_claims_events")
+    return spark.table(f"{catalog}.{schema}.raw_claims_events")
 
 
-# Run OUTSIDE the DLT context to seed data
-if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessible DLT spark conf)
+# Run OUTSIDE the pipeline context to seed data
+if not IN_PIPELINE:  # Use the IN_PIPELINE flag set at top of notebook (avoids inaccessible pipeline spark conf)
     raw_df = generate_reserve_development_data(spark, CATALOG, SCHEMA)
     display(raw_df.limit(20))
-    # Generate claims events data (feeds bronze_claims → gold_claims_monthly DLT tables)
+    # Generate claims events data (feeds bronze_claims → gold_claims_monthly SDP tables)
     generate_claims_events_data(spark, CATALOG, SCHEMA)
-    # Create empty macro_indicators_raw landing zone if not yet present.
-    # fetch_macro_data.py populates it before the DLT pipeline runs (see jobs.yml).
-    # Creating the schema here ensures DLT streaming sources don't fail on first run
+    # Create empty raw_macro_indicators landing zone if not yet present.
+    # fetch_macro_data.py populates it before the declarative pipeline runs (see jobs.yml).
+    # Creating the schema here ensures SDP streaming sources don't fail on first run
     # when this notebook is executed interactively without running fetch_macro_data first.
-    _macro_table = f"{CATALOG}.{SCHEMA}.macro_indicators_raw"
+    _macro_table = f"{CATALOG}.{SCHEMA}.raw_macro_indicators"
     if not spark.catalog.tableExists(_macro_table):
         _empty_macro_schema = StructType([
             StructField("source_table",   StringType(), False),
@@ -391,7 +391,7 @@ if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessibl
         (spark.createDataFrame([], _empty_macro_schema).write
              .format("delta")
              .saveAsTable(_macro_table))
-        print(f"Created empty macro_indicators_raw → {_macro_table}")
+        print(f"Created empty raw_macro_indicators → {_macro_table}")
 
 # COMMAND ----------
 
@@ -408,7 +408,7 @@ if not IN_DLT:  # Use the IN_DLT flag set at top of notebook (avoids inaccessibl
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     @dlt.table(
         name="bronze_reserve_cdc",
         comment="Raw reserve development CDC events. Append-only — tracks how case reserves evolve over time.",
@@ -430,11 +430,11 @@ if IN_DLT:
         return (
             spark.readStream
                  .format("delta")
-                 .table(f"{CATALOG}.{SCHEMA}.reserve_development_raw")
+                 .table(f"{CATALOG}.{SCHEMA}.raw_reserve_development")
         )
 else:
-    print("ℹ️  DLT not active — Bronze/Silver/Gold tables are created by the DLT pipeline.")
-    print("   Create a DLT pipeline pointing at this notebook to materialize these tables.")
+    print("ℹ️  SDP not active — Bronze/Silver/Gold tables are created by the declarative pipeline.")
+    print("   Create a declarative pipeline pointing at this notebook to materialize these tables.")
 
 # COMMAND ----------
 
@@ -454,14 +454,14 @@ else:
 
 # ── Silver target table + Apply Changes ───────────────────────────────────────
 # Use create_streaming_table() to declare the SCD2 target, then populate it
-# with apply_changes(). This is the correct pattern for DLT runtimes ≥ 2024-Q3:
+# with apply_changes(). This is the correct pattern for SDP runtimes ≥ 2024-Q3:
 # the old @dlt.table + apply_changes() on the same name produces a duplicate-
 # query error in newer runtimes.
 #
 # Data quality expectations are enforced at the Bronze layer (above), which is
 # architecturally correct: Bronze should capture every record; Silver applies
 # CDC merge logic on top of validated Bronze records.
-if IN_DLT:
+if IN_PIPELINE:
     dlt.create_streaming_table(
         name="silver_reserves",
         comment="Reserve development history with SCD Type 2 tracking. Each (segment, accident_month, dev_lag) tracks how estimates evolve.",
@@ -489,8 +489,8 @@ if IN_DLT:
 # MAGIC We aggregate reserve development data into a **loss development triangle** — the standard
 # MAGIC actuarial exhibit for tracking how claims settle over time.
 # MAGIC
-# MAGIC DLT **materialized views** keep this table incrementally up-to-date as Silver changes.
-# MAGIC No scheduled jobs needed — DLT handles the refresh automatically.
+# MAGIC SDP **materialized views** keep this table incrementally up-to-date as Silver changes.
+# MAGIC No scheduled jobs needed — the declarative pipeline handles the refresh automatically.
 # MAGIC
 # MAGIC | Axis | Description |
 # MAGIC |---|---|
@@ -500,7 +500,7 @@ if IN_DLT:
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     @dlt.table(
         name="gold_reserve_triangle",
         comment="Loss development triangle by segment × accident month × development lag. Core actuarial exhibit for reserve adequacy analysis.",
@@ -545,7 +545,7 @@ if IN_DLT:
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     @dlt.table(
         name="bronze_claims",
         comment="Raw claim incidents stream. Append-only — one row per claim event.",
@@ -560,12 +560,12 @@ if IN_DLT:
         return (
             spark.readStream
                  .format("delta")
-                 .table(f"{CATALOG}.{SCHEMA}.claims_events_raw")
+                 .table(f"{CATALOG}.{SCHEMA}.raw_claims_events")
         )
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     @dlt.table(
         name="gold_claims_monthly",
         comment="Monthly claims aggregate by product line × province. Primary input for SARIMAX/GARCH in Module 4.",
@@ -597,7 +597,7 @@ if IN_DLT:
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     from pyspark.sql import Window as _RollingWindow
 
     @dlt.table(
@@ -638,20 +638,20 @@ if IN_DLT:
 # MAGIC Real macroeconomic data from Statistics Canada flows through the same medallion pattern,
 # MAGIC demonstrating that the architecture applies equally to external reference data:
 # MAGIC
-# MAGIC - **`bronze_macro_indicators`** — append-only raw ingestion from `macro_indicators_raw`
+# MAGIC - **`bronze_macro_indicators`** — append-only raw ingestion from `raw_macro_indicators`
 # MAGIC - **`silver_macro_indicators`** — SCD Type 2 via `apply_changes` (captures StatCan revisions)
 # MAGIC - **`gold_macro_features`** — pivoted wide table, current versions only, adds `hpi_growth`
 # MAGIC
 # MAGIC `gold_macro_features` is joined to claims data in Module 4 to provide exogenous variables
 # MAGIC for SARIMAX: **unemployment_rate** and **hpi_growth** (month-over-month HPI change).
 # MAGIC
-# MAGIC **Demo narrative:** *"The DLT pipeline processes your incoming claims stream. The gold layer
+# MAGIC **Demo narrative:** *"The declarative pipeline processes your incoming claims stream. The gold layer
 # MAGIC feeds directly into our SARIMAX models, which improve their forecasts using real macro
 # MAGIC signals from Statistics Canada — watch the MAPE drop when we add provincial unemployment rates."*
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     @dlt.table(
         name="bronze_macro_indicators",
         comment="Raw StatCan macro indicator ingestion (append-only). One row per province × ref_date × indicator × batch.",
@@ -666,12 +666,12 @@ if IN_DLT:
         return (
             spark.readStream
                  .format("delta")
-                 .table(f"{CATALOG}.{SCHEMA}.macro_indicators_raw")
+                 .table(f"{CATALOG}.{SCHEMA}.raw_macro_indicators")
         )
 
 # COMMAND ----------
 
-if IN_DLT:
+if IN_PIPELINE:
     # SCD Type 2 target table: tracks every StatCan revision over time.
     # A StatCan release that revises a prior month's unemployment figure creates a new version.
     dlt.create_streaming_table(
@@ -704,9 +704,7 @@ _PROVINCE_MAP = {
     "Newfoundland and Labrador": "Newfoundland",
 }
 
-if IN_DLT:
-    from pyspark.sql import Window as _Window
-
+if IN_PIPELINE:
     @dlt.table(
         name="gold_macro_features",
         comment="Pivoted macro features for SARIMAX — current SCD2 versions only. Columns: region, month, unemployment_rate, hpi_index, hpi_growth, housing_starts.",
@@ -768,7 +766,7 @@ if IN_DLT:
 # MAGIC ## Part B: Orchestrate with Databricks Workflows
 # MAGIC
 # MAGIC Now that our pipeline is defined, we wire it into a **multi-task Job** that:
-# MAGIC 1. Runs the DLT pipeline (Bronze → Silver → Gold)
+# MAGIC 1. Runs the declarative pipeline (Bronze → Silver → Gold)
 # MAGIC 2. Runs Module 4's SARIMA modeling notebook downstream (depends on Gold being ready)
 # MAGIC 3. Sends an email on failure
 # MAGIC
@@ -777,7 +775,7 @@ if IN_DLT:
 
 # COMMAND ----------
 
-import requests, json
+import requests
 
 # ── Get workspace URL and token ───────────────────────────────────────────────
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
@@ -787,7 +785,7 @@ TOKEN = (
 )
 
 def get_pipeline_id(pipeline_name: str) -> str | None:
-    """Find an existing DLT pipeline by name."""
+    """Find an existing declarative pipeline by name."""
     resp = requests.get(
         f"https://{WORKSPACE_URL}/api/2.0/pipelines",
         headers={"Authorization": f"Bearer {TOKEN}"},
@@ -814,8 +812,8 @@ def get_job_id(job_name: str) -> int | None:
 # MAGIC ### Create the Multi-Task Job
 # MAGIC
 # MAGIC This code creates a Job with two tasks:
-# MAGIC 1. `refresh_medallion_pipeline` — triggers the DLT pipeline
-# MAGIC 2. `fit_sarima_models` — runs Module 4 notebook, depends on DLT completing successfully
+# MAGIC 1. `refresh_medallion_pipeline` — triggers the declarative pipeline
+# MAGIC 2. `fit_sarima_models` — runs Module 4 notebook, depends on the pipeline completing successfully
 
 # COMMAND ----------
 
@@ -846,7 +844,7 @@ if pipeline_id:
             "tasks": [
                 {
                     "task_key":    "refresh_medallion_pipeline",
-                    "description": "Refresh Bronze→Silver→Gold via DLT Apply Changes",
+                    "description": "Refresh Bronze→Silver→Gold via SDP Apply Changes",
                     "pipeline_task": {
                         "pipeline_id": pipeline_id,
                         "full_refresh": False,
@@ -883,11 +881,11 @@ if pipeline_id:
             print(f"https://{WORKSPACE_URL}/jobs/{job_id}")
         else:
             print(f"Could not create job: {resp.text}")
-            print("Tip: Create the DLT pipeline first via Workflows UI, then re-run this cell.")
+            print("Tip: Create the declarative pipeline first via Workflows UI, then re-run this cell.")
 else:
     print(f"Pipeline '{PIPELINE_NAME}' not found — create it via Workflows UI first.")
     print("Steps:")
-    print("  1. Go to Workflows → Delta Live Tables → Create Pipeline")
+    print("  1. Go to Workflows → Declarative Pipelines → Create Pipeline")
     print(f"  2. Name: {PIPELINE_NAME}")
     print("  3. Source: this notebook")
     print(f"  4. Catalog: {CATALOG} | Schema: {SCHEMA}")
@@ -903,7 +901,7 @@ else:
 # MAGIC **Task-level status**: Each task shows its own run duration, logs, and exit status.
 # MAGIC
 # MAGIC **Repair & rerun**: If `fit_sarima_models` fails (e.g., due to a library conflict),
-# MAGIC you can repair just that task without re-running the DLT pipeline:
+# MAGIC you can repair just that task without re-running the declarative pipeline:
 # MAGIC ```python
 # MAGIC # Repair a specific failed task in a run
 # MAGIC requests.post(f"https://{WORKSPACE_URL}/api/2.1/jobs/runs/repair", json={
@@ -923,14 +921,14 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Review: DLT Pipeline Event Log
+# MAGIC ### Review: SDP Pipeline Event Log
 # MAGIC
 # MAGIC After the pipeline runs, the event log is queryable as a Delta table.
 # MAGIC This is your audit trail for data quality and pipeline health.
 
 # COMMAND ----------
 
-# Query the DLT pipeline event log (available after first pipeline run)
+# Query the SDP pipeline event log (available after first pipeline run)
 try:
     event_log = spark.sql(f"""
         SELECT
@@ -946,16 +944,16 @@ try:
         LIMIT 30
     """)
     display(event_log)
-except Exception:
-    print("Event log available after the DLT pipeline runs.")
-    print("Run the pipeline via Workflows UI first.")
+except Exception as _evt_err:
+    print(f"Event log not available ({_evt_err})")
+    print("Run the declarative pipeline via Workflows UI first.")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Review: Data Quality Metrics
 # MAGIC
-# MAGIC DLT tracks expectation pass/fail counts — queryable as metrics, viewable in the Pipeline UI.
+# MAGIC SDP tracks expectation pass/fail counts — queryable as metrics, viewable in the Pipeline UI.
 
 # COMMAND ----------
 
@@ -973,15 +971,15 @@ try:
         LIMIT 10
     """)
     display(quality_metrics)
-except Exception:
-    print("Quality metrics available after pipeline run.")
+except Exception as _qm_err:
+    print(f"Quality metrics not available ({_qm_err})")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC Three medallion pipelines run in a single DLT notebook:
+# MAGIC Three medallion pipelines run in a single SDP notebook:
 # MAGIC
 # MAGIC | Layer | Table | Pattern | Consumer |
 # MAGIC |---|---|---|---|

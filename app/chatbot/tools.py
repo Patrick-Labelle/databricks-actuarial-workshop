@@ -9,8 +9,6 @@ Adding a new tool:
   That's it — the agent auto-discovers tools from that list.
 """
 
-import json
-import time
 import pandas as pd
 
 from auth import get_workspace_client
@@ -24,35 +22,36 @@ from config import (
 # ── Data query tool (SQL via warehouse) ──────────────────────────────────────
 
 AVAILABLE_TABLES = {
-    "sarima_forecasts": "Monthly SARIMA+GARCH forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
+    "predictions_sarima": "Monthly SARIMA+GARCH forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
+    "predictions_monte_carlo": "Portfolio-level Monte Carlo simulation results. Columns: mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M.",
+    "predictions_stress_scenarios": "Pre-computed stress test comparisons. Columns: scenario_label, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
+    "predictions_risk_timeline": "12-month SARIMA-driven VaR evolution. Columns: forecast_month, month_idx, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
+    "predictions_surplus_evolution": "Multi-period surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
+    "predictions_reserve_validation": "Reserve adequacy validation. Columns: segment_id, accident_month, reserve_adequacy_ratio.",
     "gold_claims_monthly": "Historical monthly claims aggregated by segment. Columns: segment_id, product_line, region, month, claims_count, total_incurred, avg_severity.",
-    "monte_carlo_results": "Portfolio-level Monte Carlo simulation results. Columns: mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M.",
-    "stress_test_scenarios": "Pre-computed stress test comparisons. Columns: scenario_label, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
-    "portfolio_risk_timeline": "12-month SARIMA-driven VaR evolution. Columns: forecast_month, month_idx, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
-    "regional_claims_forecast": "Regional claims forecast from Module 4. Columns: region, forecast_month, total_forecast_claims.",
     "gold_reserve_triangle": "Loss development triangle. Columns: segment_id, product_line, region, accident_month, dev_lag, cumulative_paid, cumulative_incurred, case_reserve.",
     "silver_reserves": "SCD Type 2 reserve development. Columns: reserve_id, segment_id, accident_month, dev_lag, paid_cumulative, incurred_cumulative, case_reserve, effective_date, end_date, is_current.",
     "silver_rolling_features": "Rolling statistical features per segment. Columns: segment_id, month, claims_count, rolling_mean_3m, rolling_std_3m, rolling_mean_6m, rolling_std_6m, yoy_change.",
-    "segment_monthly_features": "Feature Store table with macro features. Columns: segment_id, month, claims_count, plus rolling and macro-economic features.",
+    "features_segment_monthly": "Feature Store table with macro features. Columns: segment_id, month, claims_count, plus rolling and macro-economic features.",
 }
 
 
 def query_data(sql_query: str) -> str:
-    """Execute a read-only SQL query against the actuarial workshop tables.
+    """FALLBACK ONLY: Execute a read-only SQL query. Use ask_genie first for any data question — only call this if ask_genie fails or returns no results.
 
     Args:
         sql_query: A SELECT query against the actuarial workshop tables.
             Available tables (all in {catalog}.{schema}):
-            - sarima_forecasts: Monthly SARIMA+GARCH forecasts per segment
+            - predictions_sarima: Monthly SARIMA+GARCH forecasts per segment
+            - predictions_monte_carlo: Portfolio Monte Carlo simulation results
+            - predictions_stress_scenarios: Pre-computed stress tests
+            - predictions_risk_timeline: 12-month VaR evolution
+            - predictions_surplus_evolution: Multi-period surplus trajectory
             - gold_claims_monthly: Historical monthly claims by segment
-            - monte_carlo_results: Portfolio Monte Carlo simulation results
-            - stress_test_scenarios: Pre-computed stress tests
-            - portfolio_risk_timeline: 12-month VaR evolution
-            - regional_claims_forecast: Regional forecast data
             - gold_reserve_triangle: Loss development triangle
             - silver_reserves: SCD2 reserve development
             - silver_rolling_features: Rolling stats per segment
-            - segment_monthly_features: Feature Store with macro features
+            - features_segment_monthly: Feature Store with macro features
 
     Returns:
         Query results as a formatted string table, or an error message.
@@ -142,11 +141,21 @@ def run_monte_carlo(
     corr_auto_liab: float = 0.30,
     n_scenarios: int = 10_000,
     copula_df: int = 4,
+    model_type: str = "aggregate",
+    simulation_mode: str = "single_period",
 ) -> str:
     """Run a Monte Carlo portfolio loss simulation with custom parameters.
 
     Use this to answer "what if" questions about capital requirements under
     different assumptions. Default values represent the baseline scenario.
+
+    Supports two model types:
+    - "aggregate" (default): t-Copula + Lognormal Marginals (standard formula)
+    - "collective_risk": Frequency-Severity bottom-up (internal model)
+
+    And two simulation modes:
+    - "single_period" (default): Single annual loss distribution
+    - "multi_period": 12-month surplus evolution with regime-switching
 
     Args:
         mean_property_M: Expected annual property loss in $M (default: 12.5).
@@ -160,6 +169,8 @@ def run_monte_carlo(
         corr_auto_liab: Correlation between auto and liability (default: 0.30).
         n_scenarios: Number of simulation paths (default: 10000).
         copula_df: Degrees of freedom for t-copula (default: 4).
+        model_type: "aggregate" for t-Copula or "collective_risk" for frequency-severity (default: aggregate).
+        simulation_mode: "single_period" for annual loss or "multi_period" for surplus evolution (default: single_period).
 
     Returns:
         Risk metrics including Expected Loss, VaR 99%, SCR (VaR 99.5%),
@@ -181,6 +192,8 @@ def run_monte_carlo(
         "corr_auto_liab": corr_auto_liab,
         "n_scenarios": n_scenarios,
         "copula_df": copula_df,
+        "model_type": model_type,
+        "simulation_mode": simulation_mode,
     }
 
     try:
@@ -193,7 +206,7 @@ def run_monte_carlo(
             lines = ["Monte Carlo Simulation Results:", ""]
             for k, v in p.items():
                 if isinstance(v, (int, float)):
-                    lines.append(f"- **{k}**: ${v:.2f}M")
+                    lines.append(f"- **{k}**: {v:.2f}M")
                 else:
                     lines.append(f"- **{k}**: {v}")
             return "\n".join(lines)
@@ -250,14 +263,11 @@ def query_annotations(segment_id: str = "") -> str:
 # ── Genie space tool (natural language → SQL) ────────────────────────────────
 
 def ask_genie(question: str) -> str:
-    """Ask a natural-language question about the insurance portfolio data.
+    """Ask a natural-language question about the insurance portfolio data using the AI/BI Genie space.
 
     This queries the AI/BI Genie space which understands all workshop tables
-    and can generate SQL automatically. Use this for data exploration questions
-    where you don't want to write SQL manually — for example, trend analysis,
-    comparisons, aggregations, or "show me" questions.
-
-    For precise queries where you already know the SQL, prefer query_data instead.
+    and can generate SQL automatically. Use this for data exploration questions —
+    trend analysis, comparisons, aggregations, or "show me" questions.
 
     Args:
         question: A natural-language question about the data, e.g.
@@ -267,6 +277,9 @@ def ask_genie(question: str) -> str:
     Returns:
         The Genie response including any generated SQL and query results.
     """
+    if not GENIE_SPACE_ID:
+        return "Error: GENIE_SPACE_ID is not configured. The Genie space has not been created yet."
+
     w = get_workspace_client()
     if w is None:
         return "Error: Databricks SDK not available."
@@ -295,7 +308,7 @@ def ask_genie(question: str) -> str:
             if query_obj:
                 sql_text = getattr(query_obj, "query", None) or getattr(query_obj, "sql", None)
                 if sql_text:
-                    parts.append(f"\n**Generated SQL:**\n```sql\n{sql_text}\n```")
+                    parts.append(f"\nGenerated SQL:\n```sql\n{sql_text}\n```")
 
             # Get the query result data
             if att_id:
@@ -320,29 +333,18 @@ def ask_genie(question: str) -> str:
                                     parts.append(f"\nShowing first 30 of {len(df)} rows:\n\n{df.head(30).to_markdown(index=False)}")
                                 else:
                                     parts.append(f"\n{df.to_markdown(index=False)}")
-                except Exception:
-                    pass  # Query result fetch is best-effort
+                except Exception as e:
+                    parts.append(f"\n(Could not fetch query results: {e})")
 
         if not parts:
-            return "Genie processed the question but returned no content."
+            return "Genie processed the question but returned no content. Try rephrasing or use query_data as a fallback."
         return "\n".join(parts)
     except Exception as e:
-        return f"Genie query error: {e}"
+        return f"Genie query error: {e}. You can try query_data as a fallback."
 
 
 # ── Tool registry ────────────────────────────────────────────────────────────
 
 TOOLS = [ask_genie, query_data, run_sarima_forecast, run_monte_carlo, query_annotations]
-
-# OpenAI-compatible tool definitions for the LLM
-TOOL_DEFINITIONS = []
-for fn in TOOLS:
-    TOOL_DEFINITIONS.append({
-        "type": "function",
-        "function": {
-            "name": fn.__name__,
-            "description": fn.__doc__,
-        },
-    })
 
 TOOL_MAP = {fn.__name__: fn for fn in TOOLS}

@@ -1,3 +1,6 @@
+import base64
+import json
+
 import streamlit as st
 
 # ─── Lazy import for psycopg2 (may not be available in all environments) ─────
@@ -68,3 +71,14 @@ def get_token():
         except Exception:
             pass
     return None
+
+
+def email_from_token(token: str) -> str:
+    """Decode the JWT payload (without verification) to extract the user identity."""
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("sub", payload.get("email", ""))
+    except Exception:
+        return ""

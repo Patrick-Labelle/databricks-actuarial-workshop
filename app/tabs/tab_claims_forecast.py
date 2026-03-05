@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from db import load_segments, load_forecasts, load_segment_stats, load_garch_volatility
-from endpoints import email_from_token
+from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
 from constants import SCENARIO_TYPES, APPROVAL_STATUSES
 
@@ -194,7 +194,7 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                                     "α+β close to 1.0 indicates highly persistent volatility."
                                 )
                         else:
-                            st.info("No significant ARCH effects detected for this segment, or Module 4 has not been run yet.")
+                            st.info("No significant ARCH effects detected for this segment, or Module 3 has not been run yet.")
 
                     with st.expander("📋 Raw forecast data"):
                         st.markdown("""

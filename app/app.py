@@ -48,7 +48,7 @@ Insurance claims across **40 segments** (product line × Canadian province):
     st.markdown("""
 ```
 Raw CDC events
-  → Bronze (Delta Live Tables)
+  → Bronze (Spark Declarative Pipelines)
   → Silver (SCD Type 2 policies)
   → Gold (monthly segment stats)
   → Feature Store (point-in-time joins)

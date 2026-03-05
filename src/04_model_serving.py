@@ -1,35 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Module 5: App Infrastructure
-# MAGIC ## Serving Endpoints, Online Table, Lakebase, and AI Gateway
+# MAGIC # Module 4: App Infrastructure
+# MAGIC ## Serving Endpoints, Online Table, Lakebase, and Genie Space
 # MAGIC
-# MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
-# MAGIC
-# MAGIC ---
-# MAGIC ### What We'll Cover
-# MAGIC
-# MAGIC This module prepares **every service the Streamlit app needs** before it launches:
-# MAGIC
-# MAGIC 1. **Model Serving Endpoints** — Deploy SARIMA and Monte Carlo as REST APIs
-# MAGIC 2. **AI Gateway** — Inference tables, usage tracking, rate limits
-# MAGIC 3. **Online Table** — Low-latency feature lookup from the Feature Store
-# MAGIC 4. **Lakebase (Managed PostgreSQL)** — Database, table, and SP grants for analyst annotations
-# MAGIC 5. **Demo Calls** — Exercise every service the app will hit
-# MAGIC
-# MAGIC ---
-# MAGIC ### The App's Integration Points
-# MAGIC
-# MAGIC | Service | What the App Does | Created Here |
-# MAGIC |---|---|---|
-# MAGIC | SARIMA endpoint | Calls for per-segment claim forecasts (Forecasts tab) | Section 1 |
-# MAGIC | Monte Carlo endpoint | Runs stressed/baseline portfolio simulations (Risk + Stress tabs) | Section 2 |
-# MAGIC | Online Table | Reads latest rolling features for segment context (sidebar) | Section 3 |
-# MAGIC | Lakebase PostgreSQL | Persists analyst annotations + scenario notes | Section 4 |
-# MAGIC | DBSQL Warehouse | Reads Delta tables via `statement_execution` SDK | _(provisioned by bundle)_ |
-# MAGIC
-# MAGIC The DBSQL Warehouse is provisioned as a bundle resource and referenced in `app/app.yaml`
-# MAGIC via `valueFrom: sql-warehouse`. No setup is needed here — it's included in the demo
-# MAGIC section to show the query pattern the app uses.
+# MAGIC Creates all services the Streamlit app needs: SARIMA and Monte Carlo serving
+# MAGIC endpoints with AI Gateway, Online Table, Lakebase PostgreSQL, and Genie Space.
 
 # COMMAND ----------
 
@@ -39,8 +14,6 @@
 # COMMAND ----------
 
 # Install dependencies — psycopg2-binary is needed for Lakebase PostgreSQL setup.
-# On classic clusters (e2-demo-ray target), %pip install is the only mechanism;
-# on Serverless, the ml_env spec also lists these but %pip provides a fallback.
 %pip install psycopg2-binary mlflow --quiet
 
 # COMMAND ----------
@@ -48,8 +21,6 @@
 import mlflow
 import requests
 import json
-import numpy as np
-import pandas as pd
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -72,7 +43,7 @@ APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
 SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
 MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.monte_carlo_portfolio"
-FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.segment_monthly_features"
+FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
 
@@ -101,9 +72,7 @@ print(f"App SP:          {APP_SP_CLIENT_ID or '(not set)'}")
 # MAGIC %md
 # MAGIC ## 1. SARIMA Serving Endpoint
 # MAGIC
-# MAGIC Create (or update) the SARIMA forecasting endpoint, then configure AI Gateway
-# MAGIC as a **separate API call**. The `PUT /serving-endpoints/{name}/config` API only
-# MAGIC accepts `served_models` — AI Gateway requires `PUT /serving-endpoints/{name}/ai-gateway`.
+# MAGIC Create/update endpoint + configure AI Gateway (inference tables, rate limits).
 
 # COMMAND ----------
 
@@ -188,8 +157,7 @@ else:
 # MAGIC %md
 # MAGIC ## 2. Monte Carlo Serving Endpoint
 # MAGIC
-# MAGIC Same pattern — CPU endpoint for on-demand scenario analysis. The simulation
-# MAGIC runs entirely on NumPy and SciPy; no GPU acceleration needed.
+# MAGIC CPU endpoint for on-demand scenario analysis (NumPy/SciPy).
 
 # COMMAND ----------
 
@@ -261,10 +229,7 @@ print(f"\nBoth endpoints created. They take ~5 minutes to reach READY state.")
 # MAGIC %md
 # MAGIC ## 3. Online Table — Low-Latency Feature Serving
 # MAGIC
-# MAGIC The Online Table syncs from the Feature Store Delta table (`segment_monthly_features`,
-# MAGIC created in Module 3) to provide **sub-millisecond feature lookups** at inference time.
-# MAGIC
-# MAGIC The app's sidebar uses this to show the latest rolling features for the selected segment.
+# MAGIC Syncs `features_segment_monthly` for sub-millisecond lookups at inference time.
 
 # COMMAND ----------
 
@@ -457,217 +422,97 @@ except Exception as _lb_err:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Demo — Exercise Every App Service
+# MAGIC ## 5. Genie Space — Natural Language Data Queries
 # MAGIC
-# MAGIC The Streamlit app hits five services. Let's verify each one works.
+# MAGIC The chatbot's `ask_genie` tool routes natural-language questions to an AI/BI
+# MAGIC Genie space that understands all workshop tables. This section creates the space
+# MAGIC programmatically (idempotent — skips if a Genie space ID was already provided).
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### 5a. SARIMA Forecast (Model Serving)
-
-# COMMAND ----------
-
-def call_sarima_endpoint(horizon: int) -> dict:
-    """Call the SARIMA forecasting endpoint. Returns error dict on failure."""
-    try:
-        resp = requests.post(
-            f"https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations",
-            headers=_HEADERS,
-            json={"dataframe_records": [{"horizon": horizon}]},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return {"error": resp.text, "status_code": resp.status_code}
-    except requests.exceptions.Timeout:
-        return {"note": "Endpoint still warming up (~5 min after creation). Re-run once READY."}
-    except Exception as exc:
-        return {"error": str(exc)}
-
-print("Requesting 6-month forecast from SARIMA endpoint...\n")
-sarima_result = call_sarima_endpoint(horizon=6)
-print(json.dumps(sarima_result, indent=2))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 5b. Monte Carlo Scenario (Model Serving)
-
-# COMMAND ----------
-
-def call_mc_endpoint(scenario_params: dict) -> dict:
-    """Call the Monte Carlo endpoint. Returns result dict or error."""
-    try:
-        resp = requests.post(
-            f"https://{WORKSPACE_URL}/serving-endpoints/{MC_ENDPOINT_NAME}/invocations",
-            headers=_HEADERS,
-            json={"dataframe_records": [scenario_params]},
-            timeout=60,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return {"error": resp.text, "status_code": resp.status_code}
-    except requests.exceptions.Timeout:
-        return {"note": "Endpoint still warming up (~5 min after creation). Re-run once READY."}
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-_baseline_params = {
-    "mean_property_M": 12.5, "mean_auto_M": 8.3, "mean_liability_M": 5.7,
-    "cv_property": 0.35, "cv_auto": 0.28, "cv_liability": 0.42,
-    "corr_prop_auto": 0.40, "corr_prop_liab": 0.20, "corr_auto_liab": 0.30,
-    "n_scenarios": 10000, "copula_df": 4,
-}
-
-_stressed_params = {
-    "mean_property_M": 15.0,   # +20% — hard market
-    "mean_auto_M": 9.96,       # +20%
-    "mean_liability_M": 6.84,  # +20%
-    "cv_property": 0.40,       # elevated uncertainty
-    "cv_auto": 0.33,
-    "cv_liability": 0.50,
-    "corr_prop_auto": 0.55,    # elevated cat correlation
-    "corr_prop_liab": 0.35,
-    "corr_auto_liab": 0.45,
-    "n_scenarios": 10000, "copula_df": 4,
-}
-
-print("Calling MC endpoint — baseline scenario...")
-_b = call_mc_endpoint(_baseline_params)
-print("Calling MC endpoint — stressed scenario (+20% loss costs, elevated correlations)...")
-_s = call_mc_endpoint(_stressed_params)
-
-for label, result in [("Baseline", _b), ("Stressed (+20% / cat correlations)", _s)]:
-    print(f"\n{label}:")
-    if "predictions" in result:
-        pred = result["predictions"][0] if isinstance(result["predictions"], list) else result["predictions"]
-        print(f"  E[Loss]:    ${pred.get('expected_loss_M', 'N/A'):.1f}M")
-        print(f"  VaR(99%):   ${pred.get('var_99_M', 'N/A'):.1f}M")
-        print(f"  VaR(99.5%): ${pred.get('var_995_M', 'N/A'):.1f}M")
-        print(f"  CVaR(99%):  ${pred.get('cvar_99_M', 'N/A'):.1f}M")
-    else:
-        print(f"  {result}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 5c. Delta Tables via DBSQL (Statement Execution)
-# MAGIC
-# MAGIC The app reads Delta tables using `WorkspaceClient().statement_execution.execute_statement()`.
-# MAGIC This routes queries through the SQL Warehouse specified in `app/app.yaml` — same
-# MAGIC warehouse as Online Table sync. Here's the pattern:
-
-# COMMAND ----------
-
+_genie_space_id = None
 if WAREHOUSE_ID:
-    from databricks.sdk import WorkspaceClient as _WC
-    _wc = _WC()
-    _stmt = _wc.statement_execution.execute_statement(
-        warehouse_id=WAREHOUSE_ID,
-        statement=f"SELECT segment_id, COUNT(*) AS months FROM {CATALOG}.{SCHEMA}.gold_claims_monthly GROUP BY segment_id ORDER BY months DESC LIMIT 5",
-        wait_timeout="30s",
-    )
-    if _stmt.result and _stmt.result.data_array:
-        print("DBSQL query via statement_execution (top 5 segments):")
-        for row in _stmt.result.data_array:
-            print(f"  {row[0]:35s} {row[1]:>4s} months")
-    else:
-        print(f"DBSQL query returned no results (status: {_stmt.status})")
+    try:
+        from databricks.sdk import WorkspaceClient as _GC
+        _gw = _GC()
+
+        _GENIE_TABLES = sorted([
+            {"catalog": CATALOG, "schema": SCHEMA, "table": t}
+            for t in [
+                "gold_claims_monthly", "gold_reserve_triangle",
+                "predictions_monte_carlo", "predictions_risk_timeline",
+                "predictions_sarima", "predictions_surplus_evolution",
+                "features_segment_monthly", "silver_reserves",
+                "silver_rolling_features", "predictions_stress_scenarios",
+            ]
+        ], key=lambda x: x["table"])
+
+        _GENIE_INSTRUCTIONS = (
+            "You are an actuarial data analyst. The tables contain insurance claims data, "
+            "SARIMA+GARCH forecasts, Monte Carlo simulation results, stress test scenarios, "
+            "and reserve development triangles. Segments follow the pattern "
+            "'product_line_region' (e.g. commercial_auto_ontario). "
+            "When asked about trends, use gold_claims_monthly. "
+            "For forecasts, use predictions_sarima (record_type='forecast'). "
+            "For risk metrics, use predictions_monte_carlo or predictions_stress_scenarios. "
+            "For capital evolution, use predictions_risk_timeline."
+        )
+
+        _GENIE_EXAMPLES = [
+            {"question": "What are the top 5 segments by average monthly claims?",
+             "sql": f"SELECT segment_id, AVG(claims_count) AS avg_claims FROM {CATALOG}.{SCHEMA}.gold_claims_monthly GROUP BY segment_id ORDER BY avg_claims DESC LIMIT 5"},
+            {"question": "Show me the VaR 99.5% across all stress scenarios",
+             "sql": f"SELECT scenario_label, var_995_M, var_995_vs_baseline FROM {CATALOG}.{SCHEMA}.predictions_stress_scenarios ORDER BY var_995_M DESC"},
+            {"question": "What is the forecast for the next 6 months?",
+             "sql": f"SELECT month, SUM(forecast_mean) AS total_forecast FROM {CATALOG}.{SCHEMA}.predictions_sarima WHERE record_type='forecast' GROUP BY month ORDER BY month LIMIT 6"},
+        ]
+
+        # Build serialized_space JSON
+        _space_tables = [
+            {"identifier": f"{t['catalog']}.{t['schema']}.{t['table']}"}
+            for t in _GENIE_TABLES
+        ]
+        _space_json = json.dumps({
+            "data_sources": {"tables": _space_tables},
+            "instructions": _GENIE_INSTRUCTIONS,
+            "sample_questions": [{"question": e["question"], "sql": e["sql"]} for e in _GENIE_EXAMPLES],
+        })
+
+        _space = _gw.genie.create_space(
+            title="Actuarial Workshop — Risk Assistant",
+            description="AI/BI Genie space for the actuarial workshop chatbot. Covers claims, forecasts, risk metrics, and reserves.",
+            warehouse_id=WAREHOUSE_ID,
+            serialized_space=_space_json,
+        )
+        _genie_space_id = _space.space_id
+        print(f"Genie Space created: {_genie_space_id}")
+        print(f"  Tables: {len(_GENIE_TABLES)}")
+        print(f"  Example queries: {len(_GENIE_EXAMPLES)}")
+
+        # Grant app SP access to the Genie space
+        if APP_SP_CLIENT_ID:
+            try:
+                _gw.genie.update_space_permissions(
+                    space_id=_genie_space_id,
+                    access_control_list=[{
+                        "service_principal_name": APP_SP_CLIENT_ID,
+                        "permission_level": "CAN_RUN",
+                    }],
+                )
+                print(f"  Granted CAN_RUN to SP: {APP_SP_CLIENT_ID}")
+            except Exception as _perm_err:
+                print(f"  Genie permission grant skipped: {_perm_err}")
+
+    except Exception as _genie_err:
+        print(f"Genie space creation skipped: {_genie_err}")
 else:
-    print("[SKIP] No warehouse_id — DBSQL demo skipped.")
-    print("The app uses WorkspaceClient().statement_execution.execute_statement()")
-    print("with the warehouse ID injected via app.yaml valueFrom: sql-warehouse.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 5d. Lakebase — Read/Write Annotations
-
-# COMMAND ----------
-
-if _lakebase_ok:
-    # Quick round-trip test: insert a test annotation, read it back, then delete it
-    _conn = _pg_connect(PG_DATABASE)
-    _cur = _conn.cursor()
-    _cur.execute("""
-        INSERT INTO public.scenario_annotations (segment_id, note, analyst, scenario_type)
-        VALUES ('_test_module5', 'Connectivity test from Module 5', %s, 'test')
-        RETURNING id
-    """, (_pg_user,))
-    _test_id = _cur.fetchone()[0]
-    _conn.commit()
-
-    _cur.execute("SELECT id, segment_id, note, analyst FROM public.scenario_annotations WHERE id = %s", (_test_id,))
-    _row = _cur.fetchone()
-    print(f"Lakebase round-trip OK: id={_row[0]}, segment={_row[1]}, analyst={_row[3]}")
-
-    # Clean up test row
-    _cur.execute("DELETE FROM public.scenario_annotations WHERE id = %s", (_test_id,))
-    _conn.commit()
-    _conn.close()
-    print("  Test row cleaned up.")
-else:
-    print("[SKIP] Lakebase not configured — annotation demo skipped.")
-    print("The app persists analyst notes to public.scenario_annotations in Lakebase.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6. Monitoring — Endpoint Request Logs
-# MAGIC
-# MAGIC AI Gateway enables inference tables that capture every request/response for audit:
-# MAGIC
-# MAGIC ```
-# MAGIC gold_claims_monthly (DLT gold layer)
-# MAGIC        ↓ (training data)
-# MAGIC MLflow Experiments (Module 4)
-# MAGIC        ↓ (registered models)
-# MAGIC sarima_claims_forecaster@Champion  /  monte_carlo_portfolio@Champion
-# MAGIC        ↓ (serving)
-# MAGIC Model Serving endpoints (SARIMA + Monte Carlo)
-# MAGIC        ↓ (AI Gateway)
-# MAGIC Inference tables + system.serving.served_entities_request_logs
-# MAGIC ```
-
-# COMMAND ----------
-
-# Query endpoint request logs (available after first call)
-try:
-    spark.sql(f"""
-        SELECT
-            timestamp_ms,
-            endpoint_name,
-            model_name,
-            model_version,
-            status_code,
-            execution_time_ms,
-            request_id
-        FROM system.serving.served_entities_request_logs
-        WHERE endpoint_name IN ('{ENDPOINT_NAME}', '{MC_ENDPOINT_NAME}')
-        ORDER BY timestamp_ms DESC
-        LIMIT 10
-    """).display()
-except Exception as e:
-    print(f"Note: system.serving.served_entities_request_logs not available: {e}")
-    print("This is a workspace-level system table that may need to be enabled separately.")
+    print("[SKIP] No warehouse_id — Genie space creation skipped.")
+    print("Set genie_space_id in databricks.local.yml after creating the space manually.")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC | Service | What Was Set Up | App Tab |
-# MAGIC |---|---|---|
-# MAGIC | SARIMA endpoint | `sarima_claims_forecaster@Champion` → REST API + AI Gateway | Forecasts |
-# MAGIC | MC endpoint | `monte_carlo_portfolio@Champion` → CPU REST API + AI Gateway | Risk, Stress Testing |
-# MAGIC | Online Table | `segment_features_online` → low-latency feature lookup | Sidebar |
-# MAGIC | Lakebase | `scenario_annotations` table + SP grants | All tabs (annotations) |
-# MAGIC | DBSQL Warehouse | Query via `statement_execution` SDK | All tabs (Delta reads) |
-# MAGIC | AI Gateway | Inference tables + usage tracking + rate limits | Monitoring |
-# MAGIC
-# MAGIC **Key insight:** `PUT /serving-endpoints/{name}/config` only accepts `served_models`.
-# MAGIC AI Gateway configuration requires a **separate** `PUT /serving-endpoints/{name}/ai-gateway` call.
-# MAGIC
-# MAGIC **Next:** Module 6 — Package everything as a Databricks Asset Bundle and wire into Azure DevOps CI/CD.
+# MAGIC All app infrastructure created: serving endpoints, AI Gateway, Online Table,
+# MAGIC Lakebase database, and Genie Space.

@@ -9,7 +9,7 @@
 # MAGIC ### What We've Built — The Serving Gap
 # MAGIC
 # MAGIC By the end of Module 6, you have:
-# MAGIC - ✅ Reliable data pipelines (DLT + Medallion)
+# MAGIC - ✅ Reliable data pipelines (SDP + Medallion)
 # MAGIC - ✅ Scaled statistical models (SARIMA, GARCH, Monte Carlo)
 # MAGIC - ✅ Governed models in UC Registry with REST endpoints
 # MAGIC - ✅ CI/CD with DABs + Azure DevOps
@@ -30,11 +30,13 @@
 # MAGIC  Databricks App (Streamlit)   ← SSO via Databricks identity
 # MAGIC        ↓                            ↓
 # MAGIC  UC Tables (gold_segment_*)   Model Serving endpoint (SARIMA)
-# MAGIC  monte_carlo_results          segment_features_online (Online Table)
+# MAGIC  predictions_monte_carlo          segment_features_online (Online Table)
 # MAGIC        ↓
 # MAGIC  Lakebase (Postgres)          ← Scenario annotations, user comments
 # MAGIC ```
 
+# MAGIC
+# MAGIC > **Interactive notebook** — This module shows the Databricks App architecture. The app itself is deployed separately via the Asset Bundle.
 # COMMAND ----------
 
 # MAGIC %md
@@ -101,7 +103,7 @@ def load_segments():
 def load_forecasts(segment_id: str):
     return spark.sql(f"""
         SELECT month, record_type, claims_count, forecast_mean, forecast_lo95, forecast_hi95
-        FROM {CATALOG}.{SCHEMA}.sarima_forecasts
+        FROM {CATALOG}.{SCHEMA}.predictions_sarima
         WHERE segment_id = \'{segment_id}\'
         ORDER BY month
     """).toPandas()
@@ -115,7 +117,7 @@ def load_monte_carlo_summary():
             AVG(var_995_M)    AS var_995,
             AVG(cvar_99_M)    AS cvar_99,
             MAX(max_loss_M)   AS max_loss
-        FROM {CATALOG}.{SCHEMA}.monte_carlo_results
+        FROM {CATALOG}.{SCHEMA}.predictions_monte_carlo
     """).toPandas().iloc[0]
 
 def call_serving_endpoint(horizon: int) -> pd.DataFrame:
@@ -456,7 +458,7 @@ print(deploy_commands_display := DEPLOY_COMMANDS)
 # MAGIC └────────┬──────────────────────────────────────────────┘
 # MAGIC          │
 # MAGIC ┌────────▼──────────────────────────────────────────────┐
-# MAGIC │  DLT PIPELINE  (Bronze → Silver → Gold)               │
+# MAGIC │  SDP PIPELINE  (Bronze → Silver → Gold)               │
 # MAGIC │  CDC Apply Changes · Expectations · Serverless         │
 # MAGIC └───────────────────────────────────────────────────────┘
 # MAGIC          │

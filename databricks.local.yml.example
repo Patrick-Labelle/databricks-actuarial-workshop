@@ -9,6 +9,9 @@
 #
 # This file is auto-merged by the bundle (via the include glob in databricks.yml)
 # and is gitignored to keep sensitive IDs/URLs out of version control.
+#
+# Requires a workspace with classic compute (not serverless-only) for the
+# Ray-on-Spark ML cluster used by Modules 3-5.
 
 targets:
   my-workspace:                                                   # ← rename this
@@ -22,52 +25,27 @@ targets:
       warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
       pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional
-
-  # ── Optional: Ray-enabled variant (classic ML cluster for Modules 4+5) ──────
-  # Identical to my-workspace above, except Task 5 (fit_statistical_models) and
-  # Task 6 (prepare_app_infrastructure) run on a classic DBR 16.4 ML job cluster.
-  # Task 5 needs Ray-on-Spark for distributed Monte Carlo; Task 6 needs
-  # psycopg2-binary for Lakebase setup (unreliable on Serverless ml_env).
-  # All other tasks remain on serverless.  Use ./deploy-ray.sh to deploy.
-  #
-  # Note: classic cluster spin-up adds ~5-10 min to the setup job.
-  # Only supported on non-serverless workspaces (classic clusters not available
-  # on serverless-only workspaces such as FEVM).
-  my-workspace-ray:                                               # ← rename this (convention: add -ray suffix)
-    workspace:
-      host: https://your-workspace.cloud.databricks.com          # ← same as above
-      profile: your-profile                                       # ← same as above
-    variables:
-      catalog: your_catalog                                       # ← same as above
-      schema: actuarial_workshop
-      endpoint_name: actuarial-workshop-sarima-forecaster
-      warehouse_id: "your_warehouse_id"                           # ← same as above
-      pg_database: actuarial_workshop_db
-      notification_email: your.email@example.com
+      genie_space_id: ""                                         # ← set after first deploy creates the space
+      llm_endpoint_name: databricks-meta-llama-3-3-70b-instruct  # ← Foundation Model API endpoint
     resources:
       jobs:
         actuarial_workshop_setup:
-          # Add a classic ML cluster used only by the fit_statistical_models task.
           job_clusters:
             - job_cluster_key: ray_ml_cluster
               new_cluster:
                 spark_version: "16.4.x-cpu-ml-scala2.12"
                 node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
-                num_workers: 2
+                num_workers: 4
                 aws_attributes:
                   first_on_demand: 1
                   availability: SPOT_WITH_FALLBACK
-          tasks:
-            # Override task 5 to use the classic ML cluster instead of serverless,
-            # and enable Ray (run_ray: "auto") and applyInPandas (job_mode: "false").
-            - task_key: fit_statistical_models
-              job_cluster_key: ray_ml_cluster
-              notebook_task:
-                base_parameters:
-                  run_ray: "auto"    # Ray-on-Spark works on classic ML clusters
-                  job_mode: "false"  # use applyInPandas (works on classic cluster)
-            # Reuse the ML cluster for Module 5 — psycopg2-binary installs
-            # reliably via %pip on classic clusters; Serverless ml_env is flaky.
-            - task_key: prepare_app_infrastructure
-              job_cluster_key: ray_ml_cluster
-              environment_key: ""
+        actuarial_workshop_refresh:
+          job_clusters:
+            - job_cluster_key: ray_ml_cluster
+              new_cluster:
+                spark_version: "16.4.x-cpu-ml-scala2.12"
+                node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
+                num_workers: 4
+                aws_attributes:
+                  first_on_demand: 1
+                  availability: SPOT_WITH_FALLBACK

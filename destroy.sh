@@ -15,7 +15,7 @@
 #      Each step prints a clear success/skip/error message. Failures are logged
 #      but do not abort the script so the remaining assets are still cleaned up.
 #   3. `databricks bundle destroy` — removes bundle-managed resources:
-#        App, Lakebase instance, jobs, DLT pipeline.
+#        App, Lakebase instance, jobs, declarative pipeline.
 #   4. Remove the workspace bundle folder left behind by bundle destroy.
 #
 # Note: The Lakebase PostgreSQL database is dropped implicitly when the Lakebase
@@ -320,7 +320,7 @@ databricks bundle destroy --auto-approve "${BUNDLE_ARGS[@]}" || _BUNDLE_EXIT=$?
 if [ "$_BUNDLE_EXIT" -ne 0 ] && [ "$_LAKEBASE_DELETED" -ne 0 ]; then
     # bundle destroy failed AND Lakebase was not pre-deleted (protected branch).
     # The failure is expected for the Lakebase endpoint. All other resources
-    # (jobs, DLT pipeline, app) were still deleted. Warn and continue.
+    # (jobs, declarative pipeline, app) were still deleted. Warn and continue.
     echo ""
     echo "    [WARN] bundle destroy reported errors (likely the Lakebase read-write endpoint)."
     echo "    [WARN] To complete Lakebase cleanup, delete the project manually:"
