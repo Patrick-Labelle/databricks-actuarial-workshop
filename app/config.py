@@ -35,3 +35,6 @@ PG_DATABASE_DEFAULT    = _BC_PG
 ENDPOINT_NAME          = os.environ.get("ENDPOINT_NAME") or _BC_ENDPOINT
 MC_ENDPOINT_NAME       = os.environ.get("MC_ENDPOINT_NAME") or _BC_MC_ENDPOINT
 LAKEBASE_ENDPOINT_PATH = os.environ.get("LAKEBASE_ENDPOINT_PATH") or _BC_LAKEBASE_PATH
+
+# Chatbot LLM endpoint (Foundation Model API via AI Gateway)
+LLM_ENDPOINT_NAME      = os.environ.get("LLM_ENDPOINT_NAME", "databricks-meta-llama-3-3-70b-instruct")

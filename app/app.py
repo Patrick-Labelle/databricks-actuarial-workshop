@@ -71,7 +71,8 @@ the Unity Catalog Model Registry.
 st.title("📊 Insurance Portfolio Risk Intelligence")
 st.caption("Powered by Databricks | Claims Forecasting · Capital Planning · Catastrophe Analysis")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "💬 Risk Assistant",
     "📈 Claims Forecast",
     "💰 Capital Requirements",
     "⚡ Quick Forecast",
@@ -79,8 +80,9 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🌪️ Catastrophe & Reserves",
 ])
 
-from tabs import tab_claims_forecast, tab_capital, tab_quick_forecast, tab_stress_testing, tab_catastrophe
+from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_quick_forecast, tab_stress_testing, tab_catastrophe
 
+tab_chatbot.render(tab0)
 tab_claims_forecast.render(tab1)
 tab_capital.render(tab2)
 tab_quick_forecast.render(tab3)
