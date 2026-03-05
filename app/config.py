@@ -38,3 +38,6 @@ LAKEBASE_ENDPOINT_PATH = os.environ.get("LAKEBASE_ENDPOINT_PATH") or _BC_LAKEBAS
 
 # Chatbot LLM endpoint (Foundation Model API via AI Gateway)
 LLM_ENDPOINT_NAME      = os.environ.get("LLM_ENDPOINT_NAME", "databricks-meta-llama-3-3-70b-instruct")
+
+# Genie space for natural-language data queries
+GENIE_SPACE_ID          = os.environ.get("GENIE_SPACE_ID", "01f118c087b717e0b37c2f19f2de04de")

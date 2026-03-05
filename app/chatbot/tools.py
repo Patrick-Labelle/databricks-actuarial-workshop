@@ -2,15 +2,22 @@
 
 Each tool is a plain function with type hints and a docstring.
 The agent calls these via OpenAI-style tool calling.
+
+Adding a new tool:
+  1. Define a function with type hints and a Google-style docstring.
+  2. Append it to the TOOLS list at the bottom of this file.
+  That's it — the agent auto-discovers tools from that list.
 """
 
 import json
+import time
 import pandas as pd
 
 from auth import get_workspace_client
 from config import (
     CATALOG, SCHEMA, WAREHOUSE_ID,
     ENDPOINT_NAME, MC_ENDPOINT_NAME,
+    GENIE_SPACE_ID,
 )
 
 
@@ -240,9 +247,92 @@ def query_annotations(segment_id: str = "") -> str:
         return f"Lakebase query error: {e}"
 
 
+# ── Genie space tool (natural language → SQL) ────────────────────────────────
+
+def ask_genie(question: str) -> str:
+    """Ask a natural-language question about the insurance portfolio data.
+
+    This queries the AI/BI Genie space which understands all workshop tables
+    and can generate SQL automatically. Use this for data exploration questions
+    where you don't want to write SQL manually — for example, trend analysis,
+    comparisons, aggregations, or "show me" questions.
+
+    For precise queries where you already know the SQL, prefer query_data instead.
+
+    Args:
+        question: A natural-language question about the data, e.g.
+            "What are the top 5 segments by average claims?" or
+            "Show claims trend by product line over the last year".
+
+    Returns:
+        The Genie response including any generated SQL and query results.
+    """
+    w = get_workspace_client()
+    if w is None:
+        return "Error: Databricks SDK not available."
+
+    try:
+        msg = w.genie.start_conversation_and_wait(
+            space_id=GENIE_SPACE_ID,
+            content=question,
+        )
+
+        parts = []
+
+        # Extract text reply
+        reply = getattr(msg, "reply", None)
+        if reply:
+            text = getattr(reply, "text", None)
+            if text:
+                parts.append(text)
+
+        # Extract query results from attachments
+        attachments = getattr(msg, "attachments", None) or []
+        for att in attachments:
+            att_id = getattr(att, "attachment_id", None) or getattr(att, "id", None)
+            # Get the generated SQL if available
+            query_obj = getattr(att, "query", None)
+            if query_obj:
+                sql_text = getattr(query_obj, "query", None) or getattr(query_obj, "sql", None)
+                if sql_text:
+                    parts.append(f"\n**Generated SQL:**\n```sql\n{sql_text}\n```")
+
+            # Get the query result data
+            if att_id:
+                try:
+                    qr = w.genie.get_message_query_result(
+                        space_id=GENIE_SPACE_ID,
+                        conversation_id=msg.conversation_id,
+                        message_id=msg.id,
+                    )
+                    stmt = getattr(qr, "statement_response", None)
+                    if stmt:
+                        manifest = getattr(stmt, "manifest", None)
+                        result = getattr(stmt, "result", None)
+                        if manifest and result:
+                            schema = getattr(manifest, "schema", None)
+                            cols_obj = getattr(schema, "columns", None) if schema else None
+                            columns = [c.name for c in cols_obj] if cols_obj else []
+                            data = getattr(result, "data_array", None) or []
+                            if columns and data:
+                                df = pd.DataFrame(data, columns=columns)
+                                if len(df) > 30:
+                                    parts.append(f"\nShowing first 30 of {len(df)} rows:\n\n{df.head(30).to_markdown(index=False)}")
+                                else:
+                                    parts.append(f"\n{df.to_markdown(index=False)}")
+                except Exception:
+                    pass  # Query result fetch is best-effort
+
+        if not parts:
+            return "Genie processed the question but returned no content."
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Genie query error: {e}"
+
+
 # ── Tool registry ────────────────────────────────────────────────────────────
 
-TOOLS = [query_data, run_sarima_forecast, run_monte_carlo, query_annotations]
+TOOLS = [ask_genie, query_data, run_sarima_forecast, run_monte_carlo, query_annotations]
 
 # OpenAI-compatible tool definitions for the LLM
 TOOL_DEFINITIONS = []

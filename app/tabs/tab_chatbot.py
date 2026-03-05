@@ -9,9 +9,9 @@ EXAMPLE_QUESTIONS = [
     "Generate a 12-month claims forecast",
     "What would happen to capital requirements if property losses doubled?",
     "Explain how the GARCH model captures volatility clustering",
-    "What stress scenarios have been tested and how do they compare?",
-    "Show recent analyst annotations for commercial_auto_ontario",
-    "What is the VaR trend over the next 12 months?",
+    "Compare the stress test scenarios — which one has the highest SCR?",
+    "Which provinces have the highest projected claims for the next year?",
+    "Show the claims trend for Commercial Property over time",
 ]
 
 
