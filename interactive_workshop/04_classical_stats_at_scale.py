@@ -441,23 +441,36 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
     )
 
-    # Trigger execution and compute MAPE metrics
-    total_rows = sarima_results_df.count()
+    # Write to Delta — single trigger for applyInPandas execution
+    (sarima_results_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
 
-    mape_row = (
+    # Re-read from Delta for metrics (cheap read, no recomputation)
+    sarima_results_df = spark.table(f"{CATALOG}.{SCHEMA}.predictions_sarima")
+
+    # Compute all metrics in a single query
+    _metrics = (
         sarima_results_df
         .filter(F.col("record_type") == "forecast")
         .agg(
+            F.count("*").alias("total_forecasts"),
             F.mean("mape").alias("avg_mape"),
             F.mean("mape_baseline").alias("avg_mape_baseline"),
             F.mean("mape_sarimax").alias("avg_mape_sarimax"),
+            F.countDistinct(
+                F.when(F.col("garch_alpha").isNotNull(), F.col("segment_id"))
+            ).alias("garch_seg_count"),
         )
         .collect()[0]
     )
-    avg_mape          = mape_row["avg_mape"]          or 0.0
-    avg_mape_baseline = mape_row["avg_mape_baseline"] or avg_mape
-    avg_mape_sarimax  = mape_row["avg_mape_sarimax"]  or avg_mape
+    avg_mape          = _metrics["avg_mape"]          or 0.0
+    avg_mape_baseline = _metrics["avg_mape_baseline"] or avg_mape
+    avg_mape_sarimax  = _metrics["avg_mape_sarimax"]  or avg_mape
     avg_mape_improve  = avg_mape_baseline - avg_mape_sarimax
+    total_rows = sarima_results_df.count()
 
     mlflow.log_metrics({
         "avg_mape_pct":             round(avg_mape, 2),
@@ -468,37 +481,15 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         "segments_fitted":          40,
     })
 
-    # Count segments with GARCH fitted
-    _garch_seg_count = (
-        sarima_results_df
-        .filter(F.col("record_type") == "forecast")
-        .filter(F.col("garch_alpha").isNotNull())
-        .select("segment_id").distinct().count()
-    )
-
     print(f"SARIMAX+GARCH complete | Total rows: {total_rows}")
     print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
     print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
     print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
-    print(f"  GARCH(1,1) fitted:     {_garch_seg_count}/40 segments (ARCH-LM p < 0.10)")
+    print(f"  GARCH(1,1) fitted:     {_metrics['garch_seg_count']}/40 segments (ARCH-LM p < 0.10)")
+    print(f"Saved to {CATALOG}.{SCHEMA}.predictions_sarima")
     print(f"MLflow run: {run.info.run_id}")
 
 display(sarima_results_df.filter(F.col("record_type") == "forecast").orderBy("segment_id", "month").limit(30))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Save SARIMA Results
-
-# COMMAND ----------
-
-(sarima_results_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
-
-print(f"Saved to {CATALOG}.{SCHEMA}.predictions_sarima")
 
 # COMMAND ----------
 
@@ -896,8 +887,7 @@ for _seg in ["Property", "Auto", "Liability"]:
 # The GARCH(1,1) fitted on SARIMA residuals (inside fit_sarimax_per_segment)
 # produces conditional volatility in claims_count units.  The textbook CV is
 # simply σ/μ — no ad-hoc scaling needed because the units are already correct.
-_sarima_cv_pd = sarima_results_df.toPandas()
-_sarima_cv_pd["product_line"] = _sarima_cv_pd["segment_id"].str.split("__").str[0]
+_sarima_cv_pd = _sarima_pd  # reuse from calibration bridge (already has product_line)
 
 # Filter to actuals with GARCH conditional volatility
 _actual_garch = _sarima_cv_pd[
@@ -1414,8 +1404,10 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
                    'Crisis': {'Normal': 0.15, 'Crisis': 0.85}}
 
     # Monthly premium = annualized earned premium / 12 (from gold_claims_monthly)
-    _prem_pdf = spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly").select("earned_premium").toPandas()
-    _monthly_premium = float(_prem_pdf["earned_premium"].mean()) / 1_000_000  # monthly avg in $M
+    _monthly_premium = float(
+        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+        .agg(F.mean("earned_premium")).collect()[0][0]
+    ) / 1_000_000  # monthly avg in $M
 
     _investment_rate_monthly = 0.04 / 12  # 4% annual risk-free rate
 

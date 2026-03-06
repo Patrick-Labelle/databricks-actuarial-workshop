@@ -75,10 +75,7 @@ claims_df = (
 )
 claims_df.createOrReplaceTempView("claims_ts")
 
-n_segments = claims_df.select("segment_id").distinct().count()
-n_rows     = claims_df.count()
-print(f"Segments: {n_segments} (expected 40 = 4 product lines × 10 provinces)")
-print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
+print(f"Loaded gold_claims_monthly (expected 40 segments × 84 months = 3,360 rows)")
 
 # COMMAND ----------
 
@@ -92,8 +89,7 @@ print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
 
 # Load gold_macro_features from the declarative pipeline and join to claims data
 macro_df = spark.table(f"{CATALOG}.{SCHEMA}.gold_macro_features")
-macro_count = macro_df.count()
-print(f"gold_macro_features: {macro_count:,} rows (expected ~840 = 10 provinces × 84 months)")
+print("Loaded gold_macro_features")
 
 claims_with_macro = (
     claims_df
@@ -105,7 +101,6 @@ claims_with_macro = (
     )
 )
 claims_with_macro.createOrReplaceTempView("claims_with_macro")
-print(f"Macro data joined ({macro_count:,} rows)")
 
 # COMMAND ----------
 
@@ -120,8 +115,7 @@ print(f"Macro data joined ({macro_count:,} rows)")
 # Load Feature Store features and join to claims data
 _fs_table = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 fs_features = spark.table(_fs_table)
-_fs_count = fs_features.count()
-print(f"features_segment_monthly: {_fs_count:,} rows")
+print("Loaded features_segment_monthly")
 
 # Select key features for SARIMAX exogenous variables
 _fs_cols = ["segment_id", "month", "rolling_3m_mean", "rolling_6m_mean",
@@ -382,22 +376,33 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
     )
 
-    # Trigger execution and compute MAPE metrics
-    total_rows = sarima_results_df.count()
+    # Write to Delta — single trigger for applyInPandas execution
+    (sarima_results_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
 
-    mape_row = (
+    # Re-read from Delta for metrics (cheap read, no recomputation)
+    sarima_results_df = spark.table(f"{CATALOG}.{SCHEMA}.predictions_sarima")
+
+    # Compute all metrics in a single query
+    _metrics = (
         sarima_results_df
         .filter(F.col("record_type") == "forecast")
         .agg(
             F.mean("mape").alias("avg_mape"),
             F.mean("mape_baseline").alias("avg_mape_baseline"),
             F.mean("mape_sarimax").alias("avg_mape_sarimax"),
+            F.countDistinct(
+                F.when(F.col("garch_alpha").isNotNull(), F.col("segment_id"))
+            ).alias("garch_seg_count"),
         )
         .collect()[0]
     )
-    avg_mape          = mape_row["avg_mape"]          or 0.0
-    avg_mape_baseline = mape_row["avg_mape_baseline"] or avg_mape
-    avg_mape_sarimax  = mape_row["avg_mape_sarimax"]  or avg_mape
+    avg_mape          = _metrics["avg_mape"]          or 0.0
+    avg_mape_baseline = _metrics["avg_mape_baseline"] or avg_mape
+    avg_mape_sarimax  = _metrics["avg_mape_sarimax"]  or avg_mape
     avg_mape_improve  = avg_mape_baseline - avg_mape_sarimax
 
     mlflow.log_metrics({
@@ -405,63 +410,19 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         "avg_mape_baseline_pct":    round(avg_mape_baseline, 2),
         "avg_mape_sarimax_pct":     round(avg_mape_sarimax, 2),
         "avg_mape_improvement_pct": round(avg_mape_improve, 2),
-        "total_output_rows":        total_rows,
         "segments_fitted":          40,
     })
 
-    # Count segments with GARCH fitted
-    _garch_seg_count = (
-        sarima_results_df
-        .filter(F.col("record_type") == "forecast")
-        .filter(F.col("garch_alpha").isNotNull())
-        .select("segment_id").distinct().count()
-    )
-
-    print(f"SARIMAX+GARCH complete | Total rows: {total_rows}")
-    print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
-    print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
-    print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
-    print(f"  GARCH(1,1) fitted:     {_garch_seg_count}/40 segments (ARCH-LM p < 0.10)")
+    print(f"SARIMAX+GARCH complete → {CATALOG}.{SCHEMA}.predictions_sarima")
+    print(f"  MAPE: baseline={avg_mape_baseline:.1f}%, SARIMAX={avg_mape_sarimax:.1f}%, improvement={avg_mape_improve:+.1f}%")
+    print(f"  GARCH(1,1) fitted: {_metrics['garch_seg_count']}/40 segments")
     print(f"MLflow run: {run.info.run_id}")
 
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Save SARIMA Results
-
-# COMMAND ----------
-
-(sarima_results_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
-
-print(f"Saved to {CATALOG}.{SCHEMA}.predictions_sarima")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. ARCH-LM Diagnostic — GARCH(1,1) on SARIMA Residuals
-# MAGIC
-# MAGIC Engle's ARCH-LM test on SARIMAX residuals. Segments with p < 0.10 get GARCH(1,1)
-# MAGIC for time-varying prediction intervals and Monte Carlo CVs.
-
-# COMMAND ----------
-
-# Summarize ARCH-LM results across all 40 segments
-_arch_summary = (
-    sarima_results_df
-    .filter(F.col("record_type") == "forecast")
-    .select("segment_id", "arch_lm_pvalue", "garch_alpha", "garch_beta")
-    .distinct()
-    .orderBy("arch_lm_pvalue")
-)
-_arch_count = _arch_summary.filter(F.col("arch_lm_pvalue") < 0.10).count()
-_arch_total = _arch_summary.filter(F.col("arch_lm_pvalue").isNotNull()).count()
-print(f"ARCH-LM summary: {_arch_count}/{_arch_total} segments show significant ARCH effects (p < 0.10)")
-print("Segments with GARCH(1,1) fitted have time-varying CIs in predictions_sarima.")
+# MAGIC ## 4. Monte Carlo Portfolio Calibration
 
 
 # COMMAND ----------
@@ -761,8 +722,7 @@ for _seg in ["Property", "Auto", "Liability"]:
 # The GARCH(1,1) fitted on SARIMA residuals (inside fit_sarimax_per_segment)
 # produces conditional volatility in claims_count units.  The textbook CV is
 # simply σ/μ — no ad-hoc scaling needed because the units are already correct.
-_sarima_cv_pd = sarima_results_df.toPandas()
-_sarima_cv_pd["product_line"] = _sarima_cv_pd["segment_id"].str.split("__").str[0]
+_sarima_cv_pd = _sarima_pd  # reuse from calibration bridge (already has product_line)
 
 # Filter to actuals with GARCH conditional volatility
 _actual_garch = _sarima_cv_pd[
@@ -1265,8 +1225,10 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
                    'Crisis': {'Normal': 0.15, 'Crisis': 0.85}}
 
     # Monthly premium = annualized earned premium / 12 (from gold_claims_monthly)
-    _prem_pdf = spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly").select("earned_premium").toPandas()
-    _monthly_premium = float(_prem_pdf["earned_premium"].mean()) / 1_000_000
+    _monthly_premium = float(
+        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+        .agg(F.mean("earned_premium")).collect()[0][0]
+    ) / 1_000_000
 
     _investment_rate_monthly = 0.04 / 12  # 4% annual risk-free rate
 
@@ -1379,8 +1341,7 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
 
 _triangle_table = f"{CATALOG}.{SCHEMA}.gold_reserve_triangle"
 triangle_df = spark.table(_triangle_table)
-_tri_count = triangle_df.count()
-print(f"gold_reserve_triangle: {_tri_count:,} rows")
+print("Loaded gold_reserve_triangle")
 
 # Aggregate triangle to get latest cumulative incurred per segment × accident month
 # (use the maximum dev_lag available for each accident month as the most mature estimate)
@@ -1418,10 +1379,7 @@ predictions_reserve_validation = (
     .option("overwriteSchema", "true")
     .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_reserve_validation"))
 
-_avg_adequacy = predictions_reserve_validation.agg(F.mean("reserve_adequacy_ratio")).collect()[0][0]
 print(f"Reserve validation saved → {CATALOG}.{SCHEMA}.predictions_reserve_validation")
-print(f"  Average reserve adequacy ratio: {_avg_adequacy:.2f}")
-print(f"  (>1.0 = over-reserved, <1.0 = under-reserved, ~1.0 = adequate)")
 
 # COMMAND ----------
 

@@ -83,56 +83,40 @@ print(f"Loaded from Silver: {silver_features.count()} rows")
 
 # COMMAND ----------
 
-# Add any columns that may be missing when loading from the Silver table
-# (notebook 02 saves rolling means/pct_change but not std, loss ratio, or premium)
-if "rolling_3m_std" not in silver_features.columns:
-    w3 = Window.partitionBy("segment_id").orderBy("month").rowsBetween(-2, 0)
-    silver_features = silver_features.withColumn(
-        "rolling_3m_std",
-        F.coalesce(F.stddev("claims_count").over(w3).cast("double"), F.lit(0.0)) + F.lit(1e-6)
-    )
-
-if "avg_loss_ratio" not in silver_features.columns:
-    silver_features = silver_features.withColumn(
-        "avg_loss_ratio",
-        F.lit(0.65) + (F.abs(F.hash("segment_id")) % 1000).cast("double") / F.lit(40000)
-    )
-
-if "total_premium" not in silver_features.columns:
-    silver_features = silver_features.withColumn(
-        "total_premium",
-        (F.col("claims_count").cast("double") / F.lit(0.65)) * F.lit(3.5)
-    )
+# Add derived columns not in silver_rolling_features (avg_loss_ratio, total_premium)
+# rolling_3m_std already exists from the DLT pipeline
+w_seg = Window.partitionBy("segment_id").orderBy("month")
+silver_features = silver_features.withColumns({
+    "avg_loss_ratio": F.lit(0.65) + (F.abs(F.hash("segment_id")) % 1000).cast("double") / F.lit(40000),
+    "total_premium": (F.col("claims_count").cast("double") / F.lit(0.65)) * F.lit(3.5),
+})
 
 feature_df = (
     silver_features
-    .withColumn("month_ts",         F.col("month").cast("timestamp"))
-    .withColumn("month_of_year",    F.month("month"))
-    .withColumn("quarter",          F.quarter("month"))
-    .withColumn("is_q1",            (F.quarter("month") == 1).cast("int"))  # High-claims quarter
-    .withColumn("is_winter",        F.month("month").isin([12, 1, 2]).cast("int"))
-    # Coefficient of variation — normalized volatility measure (used in actuarial risk scoring)
-    .withColumn("coeff_variation_3m",
-        F.when(F.col("rolling_3m_mean") > 0,
-               F.col("rolling_3m_std") / F.col("rolling_3m_mean"))
-         .otherwise(F.lit(0.0)))
-    # Loss ratio stability: lower = more predictable segment
-    .withColumn("loss_ratio_momentum",
-        F.lag("avg_loss_ratio", 3).over(
-            Window.partitionBy("segment_id").orderBy("month")
-        ))
-    .withColumn("loss_ratio_trend_3m",
-        (F.col("avg_loss_ratio") - F.col("loss_ratio_momentum")))
-    .drop("loss_ratio_momentum")
-    .fillna(0.0, subset=["loss_ratio_trend_3m"])
-    # Normalized exposure (relative to segment mean)
-    # Guard against divide-by-zero (Photon + ANSI mode raises ArithmeticException on DBX Serverless)
-    .withColumn("_avg_prem",  F.avg("total_premium").over(Window.partitionBy("segment_id")))
-    .withColumn("normalized_premium",
-        F.when(F.col("_avg_prem").isNotNull() & (F.col("_avg_prem") != 0),
-               F.col("total_premium") / F.col("_avg_prem"))
-         .otherwise(F.lit(1.0)))
-    .drop("_avg_prem")
+    .withColumns({
+        "month_ts":          F.col("month").cast("timestamp"),
+        "month_of_year":     F.month("month"),
+        "quarter":           F.quarter("month"),
+        "is_q1":             (F.quarter("month") == 1).cast("int"),  # High-claims quarter
+        "is_winter":         F.month("month").isin([12, 1, 2]).cast("int"),
+        # Coefficient of variation — normalized volatility measure (used in actuarial risk scoring)
+        "coeff_variation_3m": F.when(F.col("rolling_3m_mean") > 0,
+                                     F.col("rolling_3m_std") / F.col("rolling_3m_mean"))
+                               .otherwise(F.lit(0.0)),
+        # Loss ratio stability: lower = more predictable segment
+        "loss_ratio_momentum": F.lag("avg_loss_ratio", 3).over(w_seg),
+        # Normalized exposure (relative to segment mean)
+        "_avg_prem": F.avg("total_premium").over(Window.partitionBy("segment_id")),
+    })
+    .withColumns({
+        "loss_ratio_trend_3m": F.coalesce(
+            F.col("avg_loss_ratio") - F.col("loss_ratio_momentum"), F.lit(0.0)),
+        "normalized_premium": F.when(
+            F.col("_avg_prem").isNotNull() & (F.col("_avg_prem") != 0),
+            F.col("total_premium") / F.col("_avg_prem"))
+            .otherwise(F.lit(1.0)),
+    })
+    .drop("loss_ratio_momentum", "_avg_prem")
 )
 
 print(f"Feature table shape: {feature_df.count()} rows × {len(feature_df.columns)} columns")
