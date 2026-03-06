@@ -32,6 +32,7 @@ dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-monte-carlo",      
 dbutils.widgets.text("warehouse_id",     "",                                     "SQL Warehouse ID")
 dbutils.widgets.text("pg_database",      "actuarial_workshop_db",                "Lakebase Database")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP Client ID")
+dbutils.widgets.text("genie_space_id",  "",                                     "Genie Space ID")
 
 CATALOG          = dbutils.widgets.get("catalog")
 SCHEMA           = dbutils.widgets.get("schema")
@@ -430,8 +431,20 @@ except Exception as _lb_err:
 
 # COMMAND ----------
 
-_genie_space_id = None
-if WAREHOUSE_ID:
+_genie_space_id = dbutils.widgets.get("genie_space_id")
+
+# If a Genie space ID was provided, verify it still exists
+if _genie_space_id and WAREHOUSE_ID:
+    try:
+        from databricks.sdk import WorkspaceClient as _GC
+        _gw = _GC()
+        _gw.genie.get_space(space_id=_genie_space_id)
+        print(f"Genie Space already exists: {_genie_space_id}")
+    except Exception:
+        print(f"Genie Space {_genie_space_id} not found — will create a new one.")
+        _genie_space_id = None
+
+if WAREHOUSE_ID and not _genie_space_id:
     try:
         from databricks.sdk import WorkspaceClient as _GC
         _gw = _GC()
@@ -505,9 +518,17 @@ if WAREHOUSE_ID:
 
     except Exception as _genie_err:
         print(f"Genie space creation skipped: {_genie_err}")
-else:
+elif not WAREHOUSE_ID and not _genie_space_id:
     print("[SKIP] No warehouse_id — Genie space creation skipped.")
     print("Set genie_space_id in databricks.local.yml after creating the space manually.")
+
+# Pass Genie space ID to downstream tasks via task values
+if _genie_space_id:
+    try:
+        dbutils.jobs.taskValues.set(key="genie_space_id", value=_genie_space_id)
+        print(f"  Task value set: genie_space_id={_genie_space_id}")
+    except Exception:
+        pass  # Not running in a job context (interactive notebook)
 
 # COMMAND ----------
 
