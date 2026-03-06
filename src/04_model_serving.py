@@ -449,58 +449,45 @@ if WAREHOUSE_ID and not _genie_space_id:
         from databricks.sdk import WorkspaceClient as _GC
         _gw = _GC()
 
-        _GENIE_TABLES = sorted([
-            {"catalog": CATALOG, "schema": SCHEMA, "table": t}
-            for t in [
-                "gold_claims_monthly", "gold_reserve_triangle",
-                "predictions_monte_carlo", "predictions_risk_timeline",
-                "predictions_sarima", "predictions_surplus_evolution",
-                "features_segment_monthly", "silver_reserves",
-                "silver_rolling_features", "predictions_stress_scenarios",
-            ]
-        ], key=lambda x: x["table"])
+        _GENIE_TABLE_NAMES = sorted([
+            "gold_claims_monthly", "gold_reserve_triangle",
+            "predictions_monte_carlo", "predictions_risk_timeline",
+            "predictions_sarima", "predictions_surplus_evolution",
+            "features_segment_monthly", "silver_reserves",
+            "silver_rolling_features", "predictions_stress_scenarios",
+        ])
 
-        _GENIE_INSTRUCTIONS = (
-            "You are an actuarial data analyst. The tables contain insurance claims data, "
-            "SARIMA+GARCH forecasts, Monte Carlo simulation results, stress test scenarios, "
-            "and reserve development triangles. Segments follow the pattern "
-            "'product_line_region' (e.g. commercial_auto_ontario). "
-            "When asked about trends, use gold_claims_monthly. "
+        _GENIE_DESCRIPTION = (
+            "AI/BI Genie space for the actuarial workshop chatbot. "
+            "Tables contain insurance claims data, SARIMA+GARCH forecasts, Monte Carlo simulation results, "
+            "stress test scenarios, and reserve development triangles. "
+            "Segments follow the pattern product_line_region (e.g. commercial_auto_ontario). "
+            "For trends, use gold_claims_monthly. "
             "For forecasts, use predictions_sarima (record_type='forecast'). "
             "For risk metrics, use predictions_monte_carlo or predictions_stress_scenarios. "
             "For capital evolution, use predictions_risk_timeline."
         )
 
-        _GENIE_EXAMPLES = [
-            {"question": "What are the top 5 segments by average monthly claims?",
-             "sql": f"SELECT segment_id, AVG(claims_count) AS avg_claims FROM {CATALOG}.{SCHEMA}.gold_claims_monthly GROUP BY segment_id ORDER BY avg_claims DESC LIMIT 5"},
-            {"question": "Show me the VaR 99.5% across all stress scenarios",
-             "sql": f"SELECT scenario_label, var_995_M, var_995_vs_baseline FROM {CATALOG}.{SCHEMA}.predictions_stress_scenarios ORDER BY var_995_M DESC"},
-            {"question": "What is the forecast for the next 6 months?",
-             "sql": f"SELECT month, SUM(forecast_mean) AS total_forecast FROM {CATALOG}.{SCHEMA}.predictions_sarima WHERE record_type='forecast' GROUP BY month ORDER BY month LIMIT 6"},
-        ]
-
-        # Build serialized_space JSON
-        _space_tables = [
-            {"identifier": f"{t['catalog']}.{t['schema']}.{t['table']}"}
-            for t in _GENIE_TABLES
-        ]
+        # serialized_space uses version 2 proto format with data_sources.tables[].identifier
         _space_json = json.dumps({
-            "data_sources": {"tables": _space_tables},
-            "instructions": _GENIE_INSTRUCTIONS,
-            "sample_questions": [{"question": e["question"], "sql": e["sql"]} for e in _GENIE_EXAMPLES],
+            "version": 2,
+            "data_sources": {
+                "tables": [
+                    {"identifier": f"{CATALOG}.{SCHEMA}.{t}"}
+                    for t in _GENIE_TABLE_NAMES
+                ]
+            },
         })
 
         _space = _gw.genie.create_space(
             title="Actuarial Workshop — Risk Assistant",
-            description="AI/BI Genie space for the actuarial workshop chatbot. Covers claims, forecasts, risk metrics, and reserves.",
+            description=_GENIE_DESCRIPTION,
             warehouse_id=WAREHOUSE_ID,
             serialized_space=_space_json,
         )
         _genie_space_id = _space.space_id
         print(f"Genie Space created: {_genie_space_id}")
-        print(f"  Tables: {len(_GENIE_TABLES)}")
-        print(f"  Example queries: {len(_GENIE_EXAMPLES)}")
+        print(f"  Tables: {len(_GENIE_TABLE_NAMES)}")
 
         # Grant app SP access to the Genie space
         if APP_SP_CLIENT_ID:
@@ -517,7 +504,9 @@ if WAREHOUSE_ID and not _genie_space_id:
                 print(f"  Genie permission grant skipped: {_perm_err}")
 
     except Exception as _genie_err:
-        print(f"Genie space creation skipped: {_genie_err}")
+        import traceback
+        print(f"Genie space creation failed: {_genie_err}")
+        traceback.print_exc()
 elif not WAREHOUSE_ID and not _genie_space_id:
     print("[SKIP] No warehouse_id — Genie space creation skipped.")
     print("Set genie_space_id in databricks.local.yml after creating the space manually.")
