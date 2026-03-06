@@ -111,6 +111,14 @@ for ep_name in _endpoints_to_grant:
 # The app SP needs CAN_RUN to use the Genie space for natural-language queries.
 dbutils.widgets.text("genie_space_id", "", "Genie Space ID")
 GENIE_SPACE_ID = dbutils.widgets.get("genie_space_id")
+if not GENIE_SPACE_ID:
+    try:
+        GENIE_SPACE_ID = dbutils.jobs.taskValues.get(
+            taskKey="prepare_app_infrastructure", key="genie_space_id"
+        )
+        print(f"  Resolved genie_space_id from upstream task: {GENIE_SPACE_ID}")
+    except Exception:
+        pass
 
 if GENIE_SPACE_ID and APP_SP_CLIENT_ID:
     genie_perms_resp = requests.patch(

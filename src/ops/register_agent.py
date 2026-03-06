@@ -8,6 +8,11 @@
 
 # COMMAND ----------
 
+%pip install mlflow>=3.1.3 databricks-agents>=1.1.0 --quiet
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
 dbutils.widgets.text("catalog", "my_catalog", "UC Catalog")
 dbutils.widgets.text("schema", "actuarial_workshop", "UC Schema")
 dbutils.widgets.text("endpoint_name", "actuarial-workshop-sarima-forecaster", "SARIMA endpoint")
@@ -23,6 +28,14 @@ MC_ENDPOINT_NAME = dbutils.widgets.get("mc_endpoint_name")
 WAREHOUSE_ID = dbutils.widgets.get("warehouse_id")
 LLM_ENDPOINT_NAME = dbutils.widgets.get("llm_endpoint_name")
 GENIE_SPACE_ID = dbutils.widgets.get("genie_space_id")
+if not GENIE_SPACE_ID:
+    try:
+        GENIE_SPACE_ID = dbutils.jobs.taskValues.get(
+            taskKey="prepare_app_infrastructure", key="genie_space_id"
+        )
+        print(f"  Resolved genie_space_id from upstream task: {GENIE_SPACE_ID}")
+    except Exception:
+        pass
 
 AGENT_MODEL_NAME = f"{CATALOG}.{SCHEMA}.actuarial_chatbot_agent"
 AGENT_ENDPOINT_NAME = "actuarial-workshop-chatbot-agent"
@@ -44,19 +57,43 @@ mlflow.set_experiment(f"/Users/{CURRENT_USER}/actuarial_workshop_chatbot_agent")
 # MAGIC %md
 # MAGIC ## Log the Agent Model
 # MAGIC
-# MAGIC Uses code-based logging — the `responses_agent.py` module defines the
-# MAGIC `ActuarialChatbotAgent` ChatModel class and calls `mlflow.models.set_model()`.
+# MAGIC Defines the ChatModel inline and logs it as a pyfunc model.
+# MAGIC The agent wraps the existing tool-calling loop from `app/chatbot/agent.py`.
 
 # COMMAND ----------
 
-import os
+from mlflow.pyfunc import ChatModel
+from mlflow.types.llm import ChatCompletionResponse
 
-# The agent code lives in app/chatbot/responses_agent.py relative to the repo root.
-# For code-based logging, we point to the Python file and specify its dependencies.
-_agent_code_path = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "app", "chatbot", "responses_agent.py",
-)
+
+class ActuarialChatbotAgent(ChatModel):
+    """MLflow ChatModel wrapper for the actuarial risk assistant."""
+
+    def predict(self, context, messages, params=None):
+        # Guard import — chatbot module is only available at serving time
+        # (bundled via code_paths), not during log_model signature inference.
+        try:
+            from chatbot.agent import chat
+        except (ImportError, ModuleNotFoundError):
+            return ChatCompletionResponse.from_dict({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Agent not initialized"},
+                }]
+            })
+
+        msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+        output_parts = []
+        for chunk in chat(msg_dicts):
+            output_parts.append(chunk)
+
+        return ChatCompletionResponse.from_dict({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(output_parts)},
+            }]
+        })
+
 
 # Resources the agent needs — passed as environment variables to the serving endpoint
 _resources = [
@@ -70,6 +107,16 @@ if GENIE_SPACE_ID:
         mlflow.models.resources.DatabricksGenieSpace(genie_space_id=GENIE_SPACE_ID),
     )
 
+# Resolve the app directory from workspace paths for code_paths
+_nb_ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+_nb_path = _nb_ctx.notebookPath().get()
+# _nb_path: .../files/src/ops/register_agent → repo root: .../files
+import os
+_repo_root = "/Workspace" + os.path.dirname(os.path.dirname(os.path.dirname(_nb_path)))
+_app_dir = os.path.join(_repo_root, "app")
+print(f"Notebook path: {_nb_path}")
+print(f"App dir (code_paths): {_app_dir}")
+
 with mlflow.start_run(run_name="chatbot_agent_registration") as _run:
     mlflow.set_tags({
         "workshop_module": "ops",
@@ -79,19 +126,18 @@ with mlflow.start_run(run_name="chatbot_agent_registration") as _run:
 
     model_info = mlflow.pyfunc.log_model(
         artifact_path="actuarial_chatbot",
-        python_model=_agent_code_path,
+        python_model=ActuarialChatbotAgent(),
         registered_model_name=AGENT_MODEL_NAME,
         resources=_resources,
         pip_requirements=[
-            "mlflow>=3.0",
+            "mlflow>=3.1.3",
+            "databricks-agents>=1.1.0",
             "databricks-openai>=0.11.0",
             "databricks-sdk>=0.81",
             "pandas>=2.0",
             "psycopg2-binary>=2.9",
         ],
-        code_paths=[
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "app"),
-        ],
+        code_paths=[_app_dir],
     )
 
     print(f"Agent model logged: {model_info.model_uri}")
@@ -117,54 +163,24 @@ print(f"Set @Champion → version {_latest_ver}")
 # MAGIC %md
 # MAGIC ## Deploy Agent Endpoint
 # MAGIC
-# MAGIC Creates (or updates) a serving endpoint for the registered agent.
-# MAGIC The endpoint appears in the AI Gateway agents tab automatically.
+# MAGIC Uses `databricks.agents.deploy()` which automatically sets up:
+# MAGIC - Serving endpoint (appears in AI Gateway agents tab)
+# MAGIC - Review App for stakeholder feedback
+# MAGIC - Inference tables for request/response logging
+# MAGIC - Real-time MLflow tracing
 
 # COMMAND ----------
 
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import (
-    EndpointCoreConfigInput,
-    ServedEntityInput,
+from databricks import agents
+
+deployment = agents.deploy(
+    AGENT_MODEL_NAME,
+    _latest_ver,
+    endpoint_name=AGENT_ENDPOINT_NAME,
+    scale_to_zero=True,
 )
 
-w = WorkspaceClient()
-
-try:
-    w.serving_endpoints.create_and_wait(
-        name=AGENT_ENDPOINT_NAME,
-        config=EndpointCoreConfigInput(
-            served_entities=[
-                ServedEntityInput(
-                    entity_name=AGENT_MODEL_NAME,
-                    entity_version=str(_latest_ver),
-                    scale_to_zero_enabled=True,
-                    workload_size="Small",
-                )
-            ],
-        ),
-    )
-    print(f"Agent endpoint created: {AGENT_ENDPOINT_NAME}")
-except Exception as e:
-    if "already exists" in str(e).lower() or "RESOURCE_ALREADY_EXISTS" in str(e):
-        # Update existing endpoint
-        w.serving_endpoints.update_config_and_wait(
-            name=AGENT_ENDPOINT_NAME,
-            served_entities=[
-                ServedEntityInput(
-                    entity_name=AGENT_MODEL_NAME,
-                    entity_version=str(_latest_ver),
-                    scale_to_zero_enabled=True,
-                    workload_size="Small",
-                )
-            ],
-        )
-        print(f"Agent endpoint updated: {AGENT_ENDPOINT_NAME}")
-    else:
-        print(f"Agent endpoint creation failed: {e}")
-        raise
-
-print(f"\nAgent registration complete.")
-print(f"  Model:    {AGENT_MODEL_NAME} @Champion (v{_latest_ver})")
-print(f"  Endpoint: {AGENT_ENDPOINT_NAME}")
-print(f"  The agent is now visible in AI Gateway → Agents tab.")
+print(f"\nAgent deployment complete.")
+print(f"  Model:      {AGENT_MODEL_NAME} @Champion (v{_latest_ver})")
+print(f"  Endpoint:   {deployment.endpoint_name}")
+print(f"  Review App: {deployment.review_app_url}")

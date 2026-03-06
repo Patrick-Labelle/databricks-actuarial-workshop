@@ -1316,8 +1316,10 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
     print(f'\nStress scenarios saved → {CATALOG}.{SCHEMA}.predictions_stress_scenarios')
 
     # ── Collective Risk Model (frequency-severity bottom-up) ─────────────
-    # Single-node because it requires variable-length per-claim sampling that
-    # doesn't parallelize cleanly into fixed-size Ray tasks.
+    # Uses the CLT compound distribution approximation: with λ ≈ 200K–300K
+    # claims per scenario, the aggregate loss S = Σ X_i is approximately
+    # Normal with E[S] = N·E[X] and Var[S] = N·Var[X] + E[X]²·Var[N].
+    # This avoids allocating ~25B individual claim amounts (200GB+).
     from scipy.stats import nbinom as _nbinom_dist
     print('\n  Running Collective Risk Model (frequency-severity)...')
     _CR_N_SCENARIOS = 100_000
@@ -1339,26 +1341,15 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
 
         # NegBin inverse CDF applied to copula uniform marginals
         _p_nb = _k / (_k + _lam)
-        _n_claims = _nbinom_dist.ppf(_cr_u[:, _seg_idx], n=_k, p=_p_nb).astype(int)
+        _n_claims = _nbinom_dist.ppf(_cr_u[:, _seg_idx], n=_k, p=_p_nb).astype(float)
 
-        # Per-claim severity sampling (vectorized via repeat)
-        _total_claims = int(_n_claims.sum())
-        _claim_sevs = _cr_rng.lognormal(mean=_mu_s, sigma=_sig_s, size=_total_claims)
-
-        # Aggregate per scenario using np.add.reduceat (vectorized, no Python loop)
-        _cum_idx = np.cumsum(_n_claims)
-        _split_pts = np.concatenate([[0], _cum_idx[:-1]])
-        # reduceat sums claim severities within each scenario's slice
-        _nonzero_mask = _n_claims > 0
-        if _nonzero_mask.all():
-            _seg_losses = np.add.reduceat(_claim_sevs, _split_pts) / 1_000_000
-        else:
-            _seg_losses = np.zeros(_CR_N_SCENARIOS)
-            _nz_idx = np.where(_nonzero_mask)[0]
-            if len(_nz_idx) > 0:
-                _seg_losses[_nz_idx] = np.add.reduceat(
-                    _claim_sevs, _split_pts[_nz_idx]
-                )[:len(_nz_idx)] / 1_000_000
+        # CLT compound approximation: with λ ≈ 200K+ claims, S ≈ Normal
+        _ex = np.exp(_mu_s + _sig_s**2 / 2)
+        _varx = (np.exp(_sig_s**2) - 1) * np.exp(2*_mu_s + _sig_s**2)
+        _seg_mean = _n_claims * _ex
+        _seg_std = np.sqrt(_n_claims * _varx)
+        _seg_losses = (_seg_mean + _seg_std * _cr_rng.standard_normal(_CR_N_SCENARIOS)) / 1_000_000
+        _seg_losses = np.maximum(_seg_losses, 0.0)
         _cr_total_losses += _seg_losses
 
     _cr_mean = float(_cr_total_losses.mean())
@@ -1921,23 +1912,14 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
             total = np.zeros(n_scenarios)
             for i in range(3):
                 p_nb = freq_k[i] / (freq_k[i] + freq_lambda[i])
-                n_claims = nbinom_dist.ppf(u[:, i], n=freq_k[i], p=p_nb).astype(int)
-                total_claims = int(n_claims.sum())
-                claim_sevs = rng.lognormal(mean=sev_mu[i], sigma=sev_sigma[i],
-                                           size=max(total_claims, 1))
-                # Vectorized aggregation per scenario
-                split_pts = np.concatenate([[0], np.cumsum(n_claims)[:-1]])
-                nonzero = n_claims > 0
-                if nonzero.all():
-                    total += np.add.reduceat(claim_sevs, split_pts) / 1_000_000
-                else:
-                    nz_idx = np.where(nonzero)[0]
-                    if len(nz_idx) > 0:
-                        seg_losses = np.zeros(n_scenarios)
-                        seg_losses[nz_idx] = np.add.reduceat(
-                            claim_sevs, split_pts[nz_idx]
-                        )[:len(nz_idx)] / 1_000_000
-                        total += seg_losses
+                n_claims = nbinom_dist.ppf(u[:, i], n=freq_k[i], p=p_nb).astype(float)
+                # CLT compound approximation: with λ ≈ 200K+ claims, S ≈ Normal
+                ex = np.exp(sev_mu[i] + sev_sigma[i]**2 / 2)
+                varx = (np.exp(sev_sigma[i]**2) - 1) * np.exp(2*sev_mu[i] + sev_sigma[i]**2)
+                seg_mean = n_claims * ex
+                seg_std = np.sqrt(n_claims * varx)
+                seg_losses = (seg_mean + seg_std * rng.standard_normal(n_scenarios)) / 1_000_000
+                total += np.maximum(seg_losses, 0.0)
         else:
             # ── Aggregate Model: t-Copula + Lognormal ────────────────────
             sigma2   = np.log(1 + cv**2)

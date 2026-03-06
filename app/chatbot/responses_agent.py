@@ -1,64 +1,41 @@
-"""MLflow ResponsesAgent wrapper for the actuarial chatbot.
+"""MLflow ChatModel wrapper for the actuarial chatbot.
 
 Registers the chatbot as a Databricks Agent so it appears in the
 AI Gateway agents tab with automatic request/response logging,
 tool call tracing, and usage metrics.
-
-Usage:
-    # In a registration notebook:
-    import mlflow
-    mlflow.pyfunc.log_model(
-        artifact_path="actuarial_chatbot",
-        python_model="app/chatbot/responses_agent.py",
-        ...
-    )
 """
 
 import mlflow
 from mlflow.pyfunc import ChatModel
-from mlflow.types.llm import ChatResponse, ChatMessage, ChatChoice
+from mlflow.types.llm import ChatCompletionResponse
 
 
 class ActuarialChatbotAgent(ChatModel):
-    """MLflow ChatModel wrapper for the actuarial risk assistant.
-
-    Wraps the existing tool-calling agent loop (DatabricksOpenAI + function tools)
-    as a registered Databricks Agent for AI Gateway visibility.
-    """
+    """MLflow ChatModel wrapper for the actuarial risk assistant."""
 
     def predict(self, context, messages, params=None):
-        """Run the agent loop and return the final response.
+        """Run the agent loop and return the final response."""
+        try:
+            from chatbot.agent import chat
+        except (ImportError, ModuleNotFoundError):
+            return ChatCompletionResponse.from_dict({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Agent not initialized"},
+                }]
+            })
 
-        Args:
-            context: MLflow model context
-            messages: List of ChatMessage objects (conversation history)
-            params: Optional ChatParams
-
-        Returns:
-            ChatResponse with the agent's final answer
-        """
-        from chatbot.agent import chat
-
-        # Convert MLflow ChatMessage objects to dicts for the existing chat() API
-        msg_dicts = []
-        for m in messages:
-            msg_dicts.append({"role": m.role, "content": m.content})
-
-        # Collect all streamed output from the agent loop
+        msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
         output_parts = []
         for chunk in chat(msg_dicts):
             output_parts.append(chunk)
 
-        final_text = "".join(output_parts)
-
-        return ChatResponse(
-            choices=[
-                ChatChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=final_text),
-                )
-            ]
-        )
+        return ChatCompletionResponse.from_dict({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(output_parts)},
+            }]
+        })
 
 
 # Required for code-based logging

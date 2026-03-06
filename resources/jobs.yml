@@ -3,8 +3,9 @@
 #   1. actuarial_workshop_setup     — one-time full setup (Modules 1–5)
 #   2. actuarial_workshop_refresh   — monthly model refresh (SDP pipeline + Module 4)
 #
-# Modules 3-5 run on a classic DBR 16.4 ML job cluster (ray_ml_cluster)
-# for Ray-on-Spark distributed Monte Carlo and reliable psycopg2 installs.
+# All tasks run on the classic ML cluster (ray_ml_cluster) — single cluster spin-up,
+# no per-task cold starts. Required for Ray-on-Spark, applyInPandas, psycopg2,
+# FeatureEngineeringClient, and workspace file access for code_paths.
 
 resources:
   jobs:
@@ -32,16 +33,15 @@ resources:
       tasks:
 
         # Task 1 — Generate synthetic source data (reserve CDC + claim events)
-        # Runs notebook 01 in standalone (non-SDP) mode to write raw_reserve_development + raw_claims_events
         - task_key: generate_source_data
           description: "Generate synthetic reserve CDC + claims data → raw_reserve_development, raw_claims_events"
+          job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/01_data_pipeline.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
               notification_email: "${var.notification_email}"
-          environment_key: default_env
 
         # Task 1b — Fetch real macro data from Statistics Canada
         # Runs in parallel with generate_source_data — both handle schema creation
@@ -50,19 +50,16 @@ resources:
         # SDP bronze_macro_indicators streaming table runs.
         - task_key: fetch_macro_data
           description: "Fetch StatCan unemployment, HPI, housing starts → raw_macro_indicators"
+          job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
-          environment_key: default_env
 
         # Task 2 — Run the declarative pipeline (Bronze → Silver → Gold)
         # full_refresh: true because generate_source_data recreates source tables via
         # CREATE OR REPLACE TABLE, which invalidates any existing streaming checkpoint.
-        # A full refresh clears SDP checkpoints and re-reads the source from scratch.
-        # Depends on fetch_macro_data so raw_macro_indicators is populated before
-        # bronze_macro_indicators → silver_macro_indicators → gold_macro_features run.
         - task_key: run_dlt_pipeline
           description: "SDP: Bronze → Silver (SCD Type 2) → Gold (reserve triangle + claims + macro)"
           depends_on:
@@ -73,8 +70,6 @@ resources:
             full_refresh: true
 
         # Task 3 — Register Feature Store table (Module 3)
-        # Uses the classic ML cluster for FeatureEngineeringClient compatibility.
-        # Online Table creation is handled by Module 5 (prepare_app_infrastructure).
         - task_key: build_feature_store
           description: "UC Feature Store registration (Online Table created by Module 5)"
           depends_on:
@@ -88,9 +83,6 @@ resources:
               warehouse_id: "${var.warehouse_id}"
 
         # Task 4 — Fit SARIMAX / GARCH / Monte Carlo + register models (Module 4)
-        # Reads gold_claims_monthly (SDP) and gold_macro_features (SDP, populated by fetch_macro_data).
-        # Runs on the classic ML cluster for Ray-on-Spark distributed Monte Carlo
-        # (640M paths across 4 workers) and applyInPandas (statsmodels on workers).
         - task_key: fit_statistical_models
           description: "SARIMAX/GARCH/Monte Carlo + register both models (SARIMA + MC) to UC"
           depends_on:
@@ -103,13 +95,8 @@ resources:
               schema: "${var.schema}"
 
         # Task 5 — Prepare all app infrastructure (Module 5)
-        # Creates both serving endpoints + AI Gateway, the Online Table for
-        # low-latency feature lookup, and the Lakebase PostgreSQL database
-        # (DB, extension, table, SP role + grants). Uses the Databricks SDK's
-        # generate_database_credential() to get a valid JWT for Lakebase auth.
-        # Runs on the classic ML cluster where psycopg2-binary installs reliably.
         - task_key: prepare_app_infrastructure
-          description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup"
+          description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup, Genie Space"
           depends_on:
             - task_key: fit_statistical_models
           job_cluster_key: ray_ml_cluster
@@ -123,13 +110,14 @@ resources:
               warehouse_id: "${var.warehouse_id}"
               pg_database: "${var.pg_database}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
+              genie_space_id: "${var.genie_space_id}"
 
         # Task 6 — App setup: UC grants + model serving endpoint grants
-        # Runs after all app infrastructure exists so that CAN_QUERY can be granted.
         - task_key: setup_app_dependencies
           description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on all serving endpoints"
           depends_on:
             - task_key: prepare_app_infrastructure
+          job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/ops/app_setup.py
             base_parameters:
@@ -139,15 +127,13 @@ resources:
               endpoint_name: "${var.endpoint_name}"
               mc_endpoint_name: "${var.mc_endpoint_name}"
               genie_space_id: "${var.genie_space_id}"
-          environment_key: default_env
 
         # Task 7 — Register chatbot as Databricks Agent
-        # Creates an MLflow ChatModel agent visible in the AI Gateway agents tab.
-        # Depends on prepare_app_infrastructure (endpoints must exist).
         - task_key: register_chatbot_agent
           description: "Register actuarial chatbot as Databricks Agent (AI Gateway visibility)"
           depends_on:
             - task_key: setup_app_dependencies
+          job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/ops/register_agent.py
             base_parameters:
@@ -158,14 +144,6 @@ resources:
               warehouse_id: "${var.warehouse_id}"
               llm_endpoint_name: "${var.llm_endpoint_name}"
               genie_space_id: "${var.genie_space_id}"
-          environment_key: default_env
-
-      environments:
-        - environment_key: default_env
-          spec:
-            environment_version: "4"
-            dependencies:
-              - databricks-feature-engineering
 
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
     # Scheduled job: refreshes data via the declarative pipeline then re-fits the SARIMA models.
@@ -184,7 +162,7 @@ resources:
         - job_cluster_key: ray_ml_cluster
           new_cluster:
             spark_version: "16.4.x-cpu-ml-scala2.12"
-            node_type_id: "m5d.xlarge"
+            node_type_id: "m5d.2xlarge"
             num_workers: 4
             aws_attributes:
               first_on_demand: 1
@@ -194,6 +172,7 @@ resources:
 
         - task_key: fetch_macro_data
           description: "Fetch latest StatCan macro indicators → raw_macro_indicators"
+          job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:

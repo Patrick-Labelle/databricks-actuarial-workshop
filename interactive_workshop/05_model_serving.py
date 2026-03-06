@@ -466,7 +466,26 @@ except Exception as _lb_err:
 # COMMAND ----------
 
 _genie_space_id = None
-if WAREHOUSE_ID:
+
+# Check if a Genie space already exists (e.g. from a previous run)
+# In interactive mode, set via widget; in job mode, via task values.
+try:
+    dbutils.widgets.text("genie_space_id", "", "Genie Space ID")
+    _genie_space_id = dbutils.widgets.get("genie_space_id") or None
+except Exception:
+    pass
+
+if _genie_space_id and WAREHOUSE_ID:
+    try:
+        from databricks.sdk import WorkspaceClient
+        _gw = WorkspaceClient()
+        _gw.genie.get_space(space_id=_genie_space_id)
+        print(f"Genie Space already exists: {_genie_space_id}")
+    except Exception:
+        print(f"Genie Space {_genie_space_id} not found — will create a new one.")
+        _genie_space_id = None
+
+if WAREHOUSE_ID and not _genie_space_id:
     try:
         from databricks.sdk import WorkspaceClient
         _gw = WorkspaceClient()
@@ -540,7 +559,7 @@ if WAREHOUSE_ID:
 
     except Exception as _genie_err:
         print(f"Genie space creation skipped: {_genie_err}")
-else:
+elif not WAREHOUSE_ID and not _genie_space_id:
     print("[SKIP] No warehouse_id — Genie space creation skipped.")
     print("Set genie_space_id in databricks.local.yml after creating the space manually.")
 

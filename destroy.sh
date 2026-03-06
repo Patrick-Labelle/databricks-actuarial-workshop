@@ -7,7 +7,7 @@
 #   1. Resolve bundle variables via bundle validate
 #   2. Remove workspace assets not managed by the bundle:
 #      UC schema (CASCADE), Online Table, serving endpoints, UC models,
-#      Lakebase project, MLflow experiments
+#      Genie space, Lakebase project, MLflow experiments
 #   3. databricks bundle destroy
 #   4. Remove workspace bundle folder
 
@@ -54,6 +54,7 @@ SCHEMA=$(_var schema)
 ENDPOINT_NAME=$(_var endpoint_name)
 MC_ENDPOINT_NAME=$(_var mc_endpoint_name)
 WAREHOUSE_ID=$(_var warehouse_id)
+GENIE_SPACE_ID=$(_var genie_space_id)
 
 PROFILE_ARGS=()
 [ -n "$PROFILE" ] && PROFILE_ARGS=(--profile "$PROFILE")
@@ -117,12 +118,21 @@ api_delete "Online Table" "/api/2.0/online-tables/${CATALOG}.${SCHEMA}.segment_f
 # 2c. Serving endpoints
 api_delete "Endpoint ${ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${ENDPOINT_NAME}"
 api_delete "Endpoint ${MC_ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${MC_ENDPOINT_NAME}"
+api_delete "Endpoint actuarial-workshop-chatbot-agent" "/api/2.0/serving-endpoints/actuarial-workshop-chatbot-agent"
 
 # 2d. UC models
 api_delete "Model sarima_claims_forecaster" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.sarima_claims_forecaster"
 api_delete "Model monte_carlo_portfolio" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.monte_carlo_portfolio"
+api_delete "Model actuarial_chatbot_agent" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.actuarial_chatbot_agent"
 
-# 2e. Lakebase project
+# 2e. Genie space
+if [ -n "$GENIE_SPACE_ID" ]; then
+    api_delete "Genie space ${GENIE_SPACE_ID}" "/api/2.0/genie/spaces/${GENIE_SPACE_ID}"
+else
+    echo "    [SKIP] Genie space — no genie_space_id configured"
+fi
+
+# 2g. Lakebase project
 echo "    Deleting Lakebase project..."
 _LAKEBASE_DELETED=0
 python3 - <<PYEOF || _LAKEBASE_DELETED=$?
@@ -144,7 +154,7 @@ for attempt in range(8):
     else: print(f"    [WARN] Lakebase delete: HTTP {status}"); sys.exit(1); break
 PYEOF
 
-# 2f. MLflow experiments
+# 2h. MLflow experiments
 echo "    Deleting MLflow experiments..."
 python3 - <<PYEOF
 import json, urllib.request, urllib.error, urllib.parse
@@ -158,7 +168,8 @@ def req(method, path, body=None):
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b'{}')
 for name in [f"/Users/{user}/actuarial_workshop_sarima_claims_forecaster",
              f"/Users/{user}/actuarial_workshop_claims_sarima",
-             f"/Users/{user}/actuarial_workshop_monte_carlo_portfolio"]:
+             f"/Users/{user}/actuarial_workshop_monte_carlo_portfolio",
+             f"/Users/{user}/actuarial_workshop_chatbot_agent"]:
     status, data = req("GET", f"/api/2.0/mlflow/experiments/get-by-name?experiment_name={urllib.parse.quote(name)}")
     if status == 404 or "experiment" not in data:
         print(f"    [SKIP] {name.split('/')[-1]}"); continue

@@ -29,23 +29,16 @@ targets:
       llm_endpoint_name: databricks-meta-llama-3-3-70b-instruct  # ← Foundation Model API endpoint
     resources:
       jobs:
-        actuarial_workshop_setup:
+        actuarial_workshop_setup: &ray_cluster_override
           job_clusters:
             - job_cluster_key: ray_ml_cluster
               new_cluster:
                 spark_version: "16.4.x-cpu-ml-scala2.12"
-                node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
+                driver_node_type_id: "m5d.2xlarge"                # ← driver needs 32GB for Collective Risk Model
+                node_type_id: "m5d.2xlarge"                       # ← adjust for your cloud/region
                 num_workers: 4
                 aws_attributes:
                   first_on_demand: 1
                   availability: SPOT_WITH_FALLBACK
         actuarial_workshop_refresh:
-          job_clusters:
-            - job_cluster_key: ray_ml_cluster
-              new_cluster:
-                spark_version: "16.4.x-cpu-ml-scala2.12"
-                node_type_id: "m5d.xlarge"                        # ← adjust for your cloud/region
-                num_workers: 4
-                aws_attributes:
-                  first_on_demand: 1
-                  availability: SPOT_WITH_FALLBACK
+          <<: *ray_cluster_override
