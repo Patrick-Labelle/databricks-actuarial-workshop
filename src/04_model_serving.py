@@ -434,47 +434,92 @@ except Exception as _lb_err:
 _genie_space_id = dbutils.widgets.get("genie_space_id")
 
 _GENIE_DESCRIPTION = (
-    "Actuarial Risk Analytics — Canadian P&C Insurance Portfolio.\n\n"
-    "KEY CONCEPTS:\n"
-    "- SCR (Solvency Capital Requirement) = VaR at 99.5% confidence (NOT 99%). "
-    "Use var_995_M column for SCR values.\n"
-    "- All monetary values with _M suffix are in millions of dollars ($M).\n"
-    "- Segments follow the pattern product_line_region (e.g. commercial_auto_ontario).\n"
-    "- MC segments: Property (Homeowners+Commercial_Property), Auto (Personal_Auto+Commercial_Auto), "
-    "Liability (proxy blend).\n\n"
-    "TABLE GUIDE:\n"
-    "- gold_claims_monthly: Historical monthly claims by segment (claims_count, total_incurred, avg_severity). "
-    "Use for trends, YoY comparisons, loss ratios.\n"
-    "- predictions_sarima: SARIMA+GARCH forecasts. Filter record_type='forecast' for future periods, "
-    "'fitted' for in-sample. Has forecast_mean, ci_lower_95, ci_upper_95, garch_volatility.\n"
-    "- predictions_monte_carlo: Aggregate portfolio risk. Columns: mean_loss_M, var_99_M, var_995_M (=SCR), "
-    "cvar_99_M. Average across task_id for portfolio totals.\n"
-    "- predictions_stress_scenarios: Stress test results by scenario (baseline, recession, pandemic, "
-    "systemic_crisis, cat_event, inflation_shock). Use var_995_vs_baseline for % impact.\n"
-    "- predictions_risk_timeline: Monthly VaR evolution from SARIMA-driven Monte Carlo.\n"
-    "- predictions_surplus_evolution: Multi-period surplus trajectory with ruin probability.\n"
-    "- predictions_collective_risk: Frequency-severity bottom-up model results (NegBin counts × Lognormal severity).\n"
-    "- silver_reserves: Reserve development with SCD2 tracking.\n"
-    "- features_segment_monthly: Feature-engineered table for ML models.\n"
-    "- silver_rolling_features: Rolling statistical features (12/24-month windows)."
+    "Actuarial Risk Analytics for a Canadian P&C Insurance Portfolio.\n\n"
+    "IMPORTANT RULES:\n"
+    "- SCR (Solvency Capital Requirement) = VaR at the 99.5% confidence level (NOT 99%). "
+    "Always use the var_995_M column for SCR.\n"
+    "- All monetary columns ending in _M are in millions of dollars.\n"
+    "- When asked about portfolio totals from predictions_monte_carlo, "
+    "AVERAGE across task_id (there are 4 parallel MC tasks).\n"
+    "- Insurance segments use the pattern product_line_region (e.g. commercial_auto_ontario).\n"
+    "- Monte Carlo segments: Property = Homeowners + Commercial_Property, "
+    "Auto = Personal_Auto + Commercial_Auto, Liability = proxy blend."
 )
 
-# If a Genie space ID was provided, verify it still exists and update its description
+# Per-table descriptions (shown to Genie as context for each table)
+_GENIE_TABLES = [
+    ("features_segment_monthly",
+     ["Feature-engineered table for ML models."]),
+    ("gold_claims_monthly",
+     ["Historical monthly claims by segment. Key columns: claims_count, "
+      "total_incurred, avg_severity, earned_premium."]),
+    ("gold_reserve_triangle",
+     ["Reserve development triangle. Rows=accident periods, columns=development months."]),
+    ("predictions_monte_carlo",
+     ["Aggregate portfolio risk (640M MC paths). AVERAGE across task_id for totals. "
+      "var_995_M = SCR at 99.5%."]),
+    ("predictions_risk_timeline",
+     ["Monthly VaR evolution from SARIMA-driven Monte Carlo."]),
+    ("predictions_sarima",
+     ["SARIMA+GARCH forecasts. Filter record_type='forecast' for future. "
+      "Has forecast_mean, ci_lower_95, ci_upper_95."]),
+    ("predictions_stress_scenarios",
+     ["Stress tests: baseline, recession, pandemic, systemic_crisis, cat_event, "
+      "inflation_shock. var_995_vs_baseline = % impact."]),
+    ("predictions_surplus_evolution",
+     ["Multi-period surplus trajectory with ruin probability."]),
+    ("silver_reserves",
+     ["Reserve development with SCD2 change tracking."]),
+    ("silver_rolling_features",
+     ["Rolling statistical features (12/24-month windows)."]),
+]
+
+import uuid as _uuid
+
+_GENIE_SAMPLE_QUESTIONS = [
+    {"id": _uuid.uuid4().hex, "question": [q]}
+    for q in [
+        "What is the current SCR (Solvency Capital Requirement)?",
+        "Show monthly claims trend for the last 12 months",
+        "Which stress scenario has the highest impact on VaR 99.5%?",
+        "What is the portfolio expected annual loss?",
+        "Compare Property vs Auto segment loss trends",
+    ]
+]
+
+def _build_serialized_space():
+    return json.dumps({
+        "version": 2,
+        "data_sources": {
+            "tables": [
+                {"identifier": f"{CATALOG}.{SCHEMA}.{name}", "description": desc}
+                for name, desc in _GENIE_TABLES
+            ]
+        },
+        "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
+    })
+
+# If a Genie space ID was provided, verify it still exists and update config
 if _genie_space_id and WAREHOUSE_ID:
     try:
         from databricks.sdk import WorkspaceClient as _GC
         _gw = _GC()
         _gw.genie.get_space(space_id=_genie_space_id)
         print(f"Genie Space already exists: {_genie_space_id}")
-        # Update description to keep instructions current
+        # Update description + serialized_space via raw API (SDK update_space
+        # doesn't reliably persist description changes)
         try:
-            _gw.genie.update_space(
-                space_id=_genie_space_id,
-                description=_GENIE_DESCRIPTION,
+            _gw.api_client.do(
+                "PATCH",
+                f"/api/2.0/genie/spaces/{_genie_space_id}",
+                body={
+                    "description": _GENIE_DESCRIPTION,
+                    "serialized_space": _build_serialized_space(),
+                },
             )
-            print("  Description updated.")
+            print("  Description + table descriptions + sample questions updated.")
         except Exception as _e:
-            print(f"  Could not update description: {_e}")
+            print(f"  Could not update Genie space config: {_e}")
     except Exception:
         print(f"Genie Space {_genie_space_id} not found — will create a new one.")
         _genie_space_id = None
@@ -484,34 +529,15 @@ if WAREHOUSE_ID and not _genie_space_id:
         from databricks.sdk import WorkspaceClient as _GC
         _gw = _GC()
 
-        _GENIE_TABLE_NAMES = sorted([
-            "gold_claims_monthly", "gold_reserve_triangle",
-            "predictions_monte_carlo", "predictions_risk_timeline",
-            "predictions_sarima", "predictions_surplus_evolution",
-            "features_segment_monthly", "silver_reserves",
-            "silver_rolling_features", "predictions_stress_scenarios",
-        ])
-
-        # serialized_space uses version 2 proto format with data_sources.tables[].identifier
-        _space_json = json.dumps({
-            "version": 2,
-            "data_sources": {
-                "tables": [
-                    {"identifier": f"{CATALOG}.{SCHEMA}.{t}"}
-                    for t in _GENIE_TABLE_NAMES
-                ]
-            },
-        })
-
         _space = _gw.genie.create_space(
             title="Actuarial Workshop — Risk Assistant",
             description=_GENIE_DESCRIPTION,
             warehouse_id=WAREHOUSE_ID,
-            serialized_space=_space_json,
+            serialized_space=_build_serialized_space(),
         )
         _genie_space_id = _space.space_id
         print(f"Genie Space created: {_genie_space_id}")
-        print(f"  Tables: {len(_GENIE_TABLE_NAMES)}")
+        print(f"  Tables: {len(_GENIE_TABLES)}")
 
         # Grant app SP access to the Genie space
         if APP_SP_CLIENT_ID:
