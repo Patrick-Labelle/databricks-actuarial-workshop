@@ -3,147 +3,84 @@
 #
 # Usage:  ./deploy.sh [--target <target>] [other bundle flags]
 #
-# Sequence
-# --------
-#   1. Resolve bundle variables via `bundle validate`; generate app/_bundle_config.py
-#      (app/app.yaml is uploaded as source and does not receive DAB variable
-#      substitution, so catalog/schema/pg_database are injected via this file).
-#   2. `databricks bundle deploy` — provisions all bundle-managed resources
-#      (Lakebase instance, jobs, declarative pipeline, app resource).
-#   3. If a fresh app was created with compute STOPPED, call `apps start` to
-#      start the compute and clear the bundle's initial-deployment lock.
-#   4. `databricks bundle run actuarial_workshop_setup` — runs the setup job,
-#      which seeds the data, trains and registers the SARIMA model, and (crucially)
-#      grants the app's service principal permissions on all UC catalog/schema/table
-#      assets, the Lakebase PostgreSQL database, and the model-serving endpoint.
-#   5. `databricks apps deploy` — performs the final app deployment only after
-#      all permissions are in place, so the app starts cleanly without
-#      catalog-permission errors.
-#
-# app/_bundle_config.py is gitignored and re-generated on every deploy.
+# Sequence:
+#   1. Resolve bundle variables, generate app/_bundle_config.py
+#   2. databricks bundle deploy
+#   3. Resolve Lakebase hostname, sync _bundle_config.py to workspace
+#   4. Start app compute if STOPPED (clears bundle's initial deployment lock)
+#   5. Run setup job, deploy app once infrastructure task completes
+#   6. Final app deploy if not already done during job
 
 set -euo pipefail
 
-# ── Minimum CLI version check ─────────────────────────────────────────────────
-# postgres_projects/branches/endpoints resources require Databricks CLI >= 0.287.0.
+# ── CLI version check ───────────────────────────────────────────────────────
 _CLI_VER=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
-_CLI_MAJOR=$(echo "$_CLI_VER" | cut -d. -f1)
-_CLI_MINOR=$(echo "$_CLI_VER" | cut -d. -f2)
-if [ "$_CLI_MAJOR" -lt 1 ] && [ "$_CLI_MINOR" -lt 287 ]; then
+if [ "$(echo "$_CLI_VER" | cut -d. -f2)" -lt 287 ] && [ "$(echo "$_CLI_VER" | cut -d. -f1)" -lt 1 ]; then
     echo "ERROR: Databricks CLI >= 0.287.0 required (found ${_CLI_VER})." >&2
-    echo "       Install: https://docs.databricks.com/aws/en/dev-tools/cli/install" >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_ARGS=("$@")
 
-# ── Step 1: resolve variables and generate app/_bundle_config.py ─────────────
+# ── Step 1: resolve variables and generate _bundle_config.py ────────────────
 echo "==> Resolving bundle variables..."
 VALIDATE_JSON=$(databricks bundle validate --output json "${BUNDLE_ARGS[@]}" 2>/dev/null)
 
-CATALOG=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('catalog',{}).get('value','my_catalog'))")
-SCHEMA=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('schema',{}).get('value','actuarial_workshop'))")
-PG_DATABASE=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('pg_database',{}).get('value','actuarial_workshop_db'))")
-ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('endpoint_name',{}).get('value','actuarial-workshop-sarima-forecaster'))")
-MC_ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('mc_endpoint_name',{}).get('value','actuarial-workshop-monte-carlo'))")
-GENIE_SPACE_ID=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('genie_space_id',{}).get('value',''))")
-LLM_ENDPOINT_NAME=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('variables',{}).get('llm_endpoint_name',{}).get('value','databricks-meta-llama-3-3-70b-instruct'))")
+_var() { echo "$VALIDATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('variables',{}).get('$1',{}).get('value','$2'))"; }
+_ws()  { echo "$VALIDATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',{}).get('$1',''))"; }
 
-echo "==> Generating app/_bundle_config.py (initial — LAKEBASE_HOST added after lakebase setup)"
-echo "    CATALOG=${CATALOG}, SCHEMA=${SCHEMA}, PG_DATABASE=${PG_DATABASE}, ENDPOINT_NAME=${ENDPOINT_NAME}, MC_ENDPOINT_NAME=${MC_ENDPOINT_NAME}"
-echo "    GENIE_SPACE_ID=${GENIE_SPACE_ID:-<empty>}, LLM_ENDPOINT_NAME=${LLM_ENDPOINT_NAME}"
-# LAKEBASE_ENDPOINT_PATH is the resource path used by the SDK's
-# w.postgres.generate_database_credential(endpoint=...) call.
-# Format: projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}
-# These IDs match the resource definitions in resources/lakebase.yml.
-LAKEBASE_ENDPOINT_PATH="projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
-# LAKEBASE_HOST is written below (after lakebase_setup.py resolves it) — placeholder for now.
-cat > "${SCRIPT_DIR}/app/_bundle_config.py" << EOF
-# Auto-generated by deploy.sh — do not edit or commit
-CATALOG = '${CATALOG}'
-SCHEMA = '${SCHEMA}'
-PG_DATABASE = '${PG_DATABASE}'
-ENDPOINT_NAME = '${ENDPOINT_NAME}'
-MC_ENDPOINT_NAME = '${MC_ENDPOINT_NAME}'
-LAKEBASE_ENDPOINT_PATH = '${LAKEBASE_ENDPOINT_PATH}'
-LAKEBASE_HOST = ''
-GENIE_SPACE_ID = '${GENIE_SPACE_ID}'
-LLM_ENDPOINT_NAME = '${LLM_ENDPOINT_NAME}'
-EOF
+CATALOG=$(_var catalog my_catalog)
+SCHEMA=$(_var schema actuarial_workshop)
+PG_DATABASE=$(_var pg_database actuarial_workshop_db)
+ENDPOINT_NAME=$(_var endpoint_name actuarial-workshop-sarima-forecaster)
+MC_ENDPOINT_NAME=$(_var mc_endpoint_name actuarial-workshop-monte-carlo)
+GENIE_SPACE_ID=$(_var genie_space_id "")
+LLM_ENDPOINT_NAME=$(_var llm_endpoint_name databricks-meta-llama-3-3-70b-instruct)
 
-# Extract app name, workspace source path, and CLI profile from validate output.
-APP_NAME=$(echo "$VALIDATE_JSON" \
-    | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-apps = d.get('resources', {}).get('apps', {})
-print(list(apps.values())[0].get('name', '')) if apps else print('')
-")
-APP_SOURCE_PATH=$(echo "$VALIDATE_JSON" \
-    | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-apps = d.get('resources', {}).get('apps', {})
-print(list(apps.values())[0].get('source_code_path', '')) if apps else print('')
-")
-PROFILE=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('profile',''))")
-
+PROFILE=$(_ws profile)
+WORKSPACE_HOST=$(_ws host)
 PROFILE_ARGS=()
-if [ -n "$PROFILE" ]; then
-    PROFILE_ARGS=(--profile "$PROFILE")
-fi
+[ -n "$PROFILE" ] && PROFILE_ARGS=(--profile "$PROFILE")
 
-WORKSPACE_HOST=$(echo "$VALIDATE_JSON" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('workspace',{}).get('host',''))")
+APP_NAME=$(echo "$VALIDATE_JSON" | python3 -c "
+import sys, json
+apps = json.load(sys.stdin).get('resources',{}).get('apps',{})
+print(list(apps.values())[0].get('name','') if apps else '')
+")
+APP_SOURCE_PATH=$(echo "$VALIDATE_JSON" | python3 -c "
+import sys, json
+apps = json.load(sys.stdin).get('resources',{}).get('apps',{})
+print(list(apps.values())[0].get('source_code_path','') if apps else '')
+")
 
-# ── Step 2: bundle deploy ─────────────────────────────────────────────────────
+LAKEBASE_ENDPOINT_PATH="projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
+
+echo "    CATALOG=${CATALOG}, SCHEMA=${SCHEMA}, ENDPOINT=${ENDPOINT_NAME}"
+
+# ── Step 2: bundle deploy ───────────────────────────────────────────────────
 echo "==> Running databricks bundle deploy ${BUNDLE_ARGS[*]}"
 databricks bundle deploy "${PROFILE_ARGS[@]}" "${BUNDLE_ARGS[@]}"
 
-# ── Step 2.5: Resolve Lakebase endpoint hostname ─────────────────────────────
-# Lakebase database setup (create DB, table, grants) runs inside the setup job
-# (Module 5 / prepare_app_infrastructure task) using the Databricks SDK's
-# generate_database_credential(). We only need to resolve the hostname here
-# so _bundle_config.py has it before the app deploys.
+# ── Step 3: resolve Lakebase hostname and write _bundle_config.py ───────────
 echo "==> Resolving Lakebase endpoint hostname..."
 LAKEBASE_HOST=""
 for _i in $(seq 1 30); do
-    _EP_DATA=$(databricks api get "/api/2.0/postgres/${LAKEBASE_ENDPOINT_PATH}" \
-        "${PROFILE_ARGS[@]}" 2>/dev/null || echo "{}")
-    LAKEBASE_HOST=$(echo "$_EP_DATA" | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    print(json.loads('\n'.join(lines[j:])).get('status', {}).get('hosts', {}).get('host', ''))
-" 2>/dev/null || echo "")
-    _LB_STATE=$(echo "$_EP_DATA" | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    print(json.loads('\n'.join(lines[j:])).get('status', {}).get('current_state', 'UNKNOWN'))
-" 2>/dev/null || echo "UNKNOWN")
+    _EP_JSON=$(databricks api get "/api/2.0/postgres/${LAKEBASE_ENDPOINT_PATH}" \
+        "${PROFILE_ARGS[@]}" --output json 2>/dev/null || echo "{}")
+    LAKEBASE_HOST=$(echo "$_EP_JSON" | python3 -c "
+import sys,json; print(json.load(sys.stdin).get('status',{}).get('hosts',{}).get('host',''))" 2>/dev/null || echo "")
     if [ -n "$LAKEBASE_HOST" ]; then
-        echo "    Lakebase host: ${LAKEBASE_HOST} (state: ${_LB_STATE})"
+        echo "    Lakebase host: ${LAKEBASE_HOST}"
         break
     fi
-    echo "    Waiting for Lakebase endpoint... (state: ${_LB_STATE}, attempt ${_i}/30)"
+    [ "$_i" -eq 1 ] && echo "    Waiting for Lakebase endpoint..."
     sleep 20
 done
 
-if [ -n "$LAKEBASE_HOST" ]; then
-    # Regenerate _bundle_config.py with the resolved Lakebase hostname
-    cat > "${SCRIPT_DIR}/app/_bundle_config.py" << EOF
+[ -z "$LAKEBASE_HOST" ] && echo "WARNING: Lakebase endpoint not ready — LAKEBASE_HOST will be empty"
+
+cat > "${SCRIPT_DIR}/app/_bundle_config.py" << EOF
 # Auto-generated by deploy.sh — do not edit or commit
 CATALOG = '${CATALOG}'
 SCHEMA = '${SCHEMA}'
@@ -156,221 +93,108 @@ GENIE_SPACE_ID = '${GENIE_SPACE_ID}'
 LLM_ENDPOINT_NAME = '${LLM_ENDPOINT_NAME}'
 EOF
 
-    # Push the updated _bundle_config.py to the workspace bundle path
-    if [ -n "$APP_SOURCE_PATH" ] && [ -n "$WORKSPACE_HOST" ]; then
-        _UPLOAD_TOKEN=$(databricks auth token --host "$WORKSPACE_HOST" "${PROFILE_ARGS[@]}" 2>/dev/null \
-            | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
-        _UPL_HOST="$WORKSPACE_HOST" \
-        _UPL_TOKEN="$_UPLOAD_TOKEN" \
-        _UPL_SRC="${SCRIPT_DIR}/app/_bundle_config.py" \
-        _UPL_DST="${APP_SOURCE_PATH}/_bundle_config.py" \
-        python3 -c "
-import base64, json, os, urllib.request, urllib.error
-req = urllib.request.Request(
-    os.environ['_UPL_HOST'] + '/api/2.0/workspace/import',
-    data=json.dumps({'path': os.environ['_UPL_DST'],
-                     'content': base64.b64encode(open(os.environ['_UPL_SRC'],'rb').read()).decode(),
-                     'format': 'AUTO', 'overwrite': True}).encode(),
-    headers={'Authorization': 'Bearer ' + os.environ['_UPL_TOKEN'],
-             'Content-Type': 'application/json'},
-    method='POST',
-)
-try:
-    urllib.request.urlopen(req)
-    print('    _bundle_config.py synced to workspace (LAKEBASE_HOST set)')
-except urllib.error.HTTPError as e:
-    print('WARNING: Could not sync _bundle_config.py (' + str(e.code) + ') — LAKEBASE_HOST may be empty at runtime')
-"
-    fi
-else
-    echo "WARNING: Lakebase endpoint not ready — LAKEBASE_HOST will be empty in _bundle_config.py"
+# Sync _bundle_config.py to workspace
+if [ -n "$APP_SOURCE_PATH" ]; then
+    databricks workspace import "${APP_SOURCE_PATH}/_bundle_config.py" \
+        --file "${SCRIPT_DIR}/app/_bundle_config.py" \
+        --format AUTO --overwrite \
+        "${PROFILE_ARGS[@]}" 2>/dev/null \
+        && echo "    _bundle_config.py synced to workspace" \
+        || echo "WARNING: Could not sync _bundle_config.py"
 fi
 
-# ── Step 3: start app compute if needed ──────────────────────────────────────
-# When bundle creates a fresh app it leaves compute STOPPED and queues an
-# initial deployment internally. That deployment holds the deployment lock,
-# permanently blocking our later `apps deploy` call. Starting the compute
-# clears the lock without deploying anything, so step 5 can proceed cleanly.
+# ── Step 4: start app compute if needed ─────────────────────────────────────
 if [ -n "$APP_NAME" ]; then
     COMPUTE_STATE=$(databricks api get "/api/2.0/apps/${APP_NAME}" \
-        "${PROFILE_ARGS[@]}" 2>/dev/null \
-        | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    print(json.loads('\n'.join(lines[j:])).get('compute_status', {}).get('state', ''))
-" 2>/dev/null || echo "")
+        "${PROFILE_ARGS[@]}" --output json 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('compute_status',{}).get('state',''))" 2>/dev/null || echo "")
     if [ "$COMPUTE_STATE" = "STOPPED" ]; then
-        echo "==> App compute is STOPPED — starting it to clear bundle's initial deployment lock..."
+        echo "==> Starting app compute (clearing initial deployment lock)..."
         databricks apps start "${APP_NAME}" "${PROFILE_ARGS[@]}" > /dev/null 2>&1 || true
-        echo "    App compute started."
     fi
 fi
 
-# ── Step 4: run setup job ─────────────────────────────────────────────────────
-# This provisions all data assets and — critically — grants the app's service
-# principal permissions on UC catalog/schema/tables, the Lakebase PostgreSQL
-# database, and the model-serving endpoints.
-#
-# Deploy strategy: the app source code is deployed as soon as the app
-# infrastructure is ready (task prepare_app_infrastructure succeeds), rather than
-# waiting for the full job to finish.  The final task (setup_app_dependencies,
-# ~21s) grants UC and CAN_QUERY permissions; by the time the app compute starts,
-# those grants are in place.
-echo "==> Running setup job (this takes ~15 min)..."
-
-# Resolve the setup job ID (needed for async polling and fallback).
-SETUP_JOB_ID=$(databricks jobs list \
-    --name "Actuarial Workshop — Full Setup" \
-    --output json \
-    "${PROFILE_ARGS[@]}" 2>/dev/null \
+# ── Step 5: run setup job ───────────────────────────────────────────────────
+echo "==> Running setup job..."
+SETUP_JOB_ID=$(databricks jobs list --name "Actuarial Workshop — Full Setup" \
+    --output json "${PROFILE_ARGS[@]}" 2>/dev/null \
     | python3 -c "
-import sys, json
+import sys,json
 data = json.load(sys.stdin)
 jobs = data if isinstance(data, list) else data.get('jobs', [])
-if jobs:
-    print(jobs[0].get('job_id', ''))
+print(jobs[0]['job_id'] if jobs else '')
 " 2>/dev/null || echo "")
 
-# ── 4a: Launch the job and capture the run ID ─────────────────────────────────
-_BUNDLE_RUN_OK=true
 databricks bundle run actuarial_workshop_setup "${PROFILE_ARGS[@]}" "${BUNDLE_ARGS[@]}" &
 _BUNDLE_RUN_PID=$!
 
-# Resolve the latest run ID shortly after launch (give it a few seconds to register).
+# Resolve run ID
 sleep 10
-SETUP_RUN_ID=""
-if [ -n "$SETUP_JOB_ID" ]; then
-    SETUP_RUN_ID=$(databricks api get \
-        "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
-        "${PROFILE_ARGS[@]}" 2>/dev/null \
-        | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    runs = json.loads('\n'.join(lines[j:])).get('runs', [])
-    if runs:
-        print(runs[0].get('run_id', ''))
+SETUP_RUN_ID=$(databricks api get "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
+    "${PROFILE_ARGS[@]}" --output json 2>/dev/null \
+    | python3 -c "
+import sys,json
+runs = json.load(sys.stdin).get('runs', [])
+print(runs[0]['run_id'] if runs else '')
 " 2>/dev/null || echo "")
-fi
-echo "    Run ID: ${SETUP_RUN_ID:-unknown}"
 
-# ── 4b: Poll task states; deploy app once endpoints are ready ─────────────────
+echo "    Run URL: ${WORKSPACE_HOST}/?o=$(echo "$WORKSPACE_HOST" | grep -oE '[0-9]+$' || echo '')#job/${SETUP_JOB_ID}/run/${SETUP_RUN_ID}"
+
+# Poll until terminal state; deploy app once infrastructure is ready
 _APP_DEPLOYED=false
-_POLL_MAX=180   # max 180 × 20s = 1 hour
-_POLL_COUNT=0
-_FINAL_RESULT=""
-
-while [ $_POLL_COUNT -lt $_POLL_MAX ]; do
+for _poll in $(seq 0 179); do
     sleep 20
 
-    # Fetch the current task states for this run
-    if [ -z "$SETUP_RUN_ID" ]; then
-        # Fall back to checking the most recent run
-        _RUN_DATA=$(databricks api get \
-            "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
-            "${PROFILE_ARGS[@]}" 2>/dev/null)
-        SETUP_RUN_ID=$(echo "$_RUN_DATA" | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    runs = json.loads('\n'.join(lines[j:])).get('runs', [])
-    if runs: print(runs[0].get('run_id', ''))
-" 2>/dev/null || echo "")
-    fi
-
-    _TASK_STATES=$(databricks api get \
-        "/api/2.1/jobs/runs/get?run_id=${SETUP_RUN_ID}" \
-        "${PROFILE_ARGS[@]}" 2>/dev/null \
+    _TASK_STATES=$(databricks api get "/api/2.1/jobs/runs/get?run_id=${SETUP_RUN_ID}" \
+        "${PROFILE_ARGS[@]}" --output json 2>/dev/null \
         | python3 -c "
 import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is None: sys.exit()
-data = json.loads('\n'.join(lines[j:]))
-run_state = data.get('state', {})
-lc = run_state.get('life_cycle_state','')
-rs = run_state.get('result_state','')
+data = json.load(sys.stdin)
+lc = data.get('state',{}).get('life_cycle_state','')
+rs = data.get('state',{}).get('result_state','')
 print(f'RUN {lc} {rs}')
 for t in data.get('tasks', []):
     s = t.get('state', {})
     print(t['task_key'], s.get('life_cycle_state','PENDING'), s.get('result_state',''))
 " 2>/dev/null || echo "RUN UNKNOWN ")
 
-    # Parse overall run state
     _RUN_LC=$(echo "$_TASK_STATES" | awk 'NR==1{print $2}')
     _RUN_RS=$(echo "$_TASK_STATES" | awk 'NR==1{print $3}')
 
-    # Check if the run reached a terminal state
+    # Terminal state?
     if [ "$_RUN_LC" = "TERMINATED" ] || [ "$_RUN_LC" = "INTERNAL_ERROR" ]; then
         _FINAL_RESULT="$_RUN_RS"
         break
     fi
 
-    # Check infra task: deploy app once all app infrastructure is ready
+    # Deploy app once infrastructure task completes
     if [ "$_APP_DEPLOYED" = "false" ] && [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
-        _INFRA_DONE=$(echo "$_TASK_STATES" | awk '$1=="prepare_app_infrastructure"{print $2, $3}')
-        _INFRA_READY=$(echo "$_INFRA_DONE" | grep -c "TERMINATED SUCCESS" || true)
-
-        if [ "$_INFRA_READY" -ge 1 ]; then
-            echo ""
-            echo "==> App infrastructure ready — deploying app source code..."
-            echo "    (setup_app_dependencies will finish granting permissions in ~21s)"
+        if echo "$_TASK_STATES" | grep -q "prepare_app_infrastructure TERMINATED SUCCESS"; then
+            echo "==> App infrastructure ready — deploying app..."
             databricks apps deploy "${APP_NAME}" \
                 --source-code-path "${APP_SOURCE_PATH}" \
                 "${PROFILE_ARGS[@]}" && _APP_DEPLOYED=true || true
-            echo "==> App source deployed — waiting for permission grants to complete..."
         fi
     fi
 
-    # Progress indicator
-    _RUNNING=$(echo "$_TASK_STATES" | awk '$2=="RUNNING"{print $1}' | tr '\n' ' ')
     _DONE=$(echo "$_TASK_STATES" | grep -c "TERMINATED SUCCESS" || true)
-    echo "    [${_DONE}/7 tasks done] running: ${_RUNNING:-none} (poll ${_POLL_COUNT}/${_POLL_MAX})"
-    _POLL_COUNT=$((_POLL_COUNT + 1))
+    _RUNNING=$(echo "$_TASK_STATES" | awk '$2=="RUNNING"{printf "%s ", $1}')
+    echo "    [${_DONE}/7 tasks] ${_RUNNING:-waiting...}"
 done
 
-# Wait for the background bundle run process to exit cleanly
-wait $_BUNDLE_RUN_PID 2>/dev/null || _BUNDLE_RUN_OK=false
+wait $_BUNDLE_RUN_PID 2>/dev/null || true
 
-if [ -z "$_FINAL_RESULT" ]; then
-    # Polling loop hit max without a terminal state
-    echo "WARNING: Polling timed out — checking final job state..."
-    _FINAL_RESULT=$(databricks api get \
-        "/api/2.1/jobs/runs/list?job_id=${SETUP_JOB_ID}&limit=1" \
-        "${PROFILE_ARGS[@]}" 2>/dev/null \
-        | python3 -c "
-import sys, json
-lines = sys.stdin.read().split('\n')
-j = next((i for i,l in enumerate(lines) if l.strip().startswith('{')), None)
-if j is not None:
-    runs = json.loads('\n'.join(lines[j:])).get('runs', [])
-    if runs:
-        s = runs[0].get('state', {})
-        print(s.get('result_state',''))
-" 2>/dev/null || echo "")
-fi
-
-if [ "$_FINAL_RESULT" != "SUCCESS" ]; then
+if [ "${_FINAL_RESULT:-}" != "SUCCESS" ]; then
     echo "ERROR: Setup job did not complete successfully (result=${_FINAL_RESULT:-UNKNOWN})." >&2
     exit 1
 fi
 echo "==> Setup job complete!"
 
-# ── Step 5: deploy app (if not already deployed during step 4) ────────────────
+# ── Step 6: deploy app if not already deployed ──────────────────────────────
 if [ "$_APP_DEPLOYED" = "false" ] && [ -n "$APP_NAME" ] && [ -n "$APP_SOURCE_PATH" ]; then
-    echo "==> Deploying app source code (post-job — all permissions in place)..."
-    echo "    App:    ${APP_NAME}"
-    echo "    Source: ${APP_SOURCE_PATH}"
+    echo "==> Deploying app..."
     databricks apps deploy "${APP_NAME}" \
         --source-code-path "${APP_SOURCE_PATH}" \
         "${PROFILE_ARGS[@]}"
-    echo "==> App deployment complete!"
-elif [ "$_APP_DEPLOYED" = "true" ]; then
-    echo "==> App was deployed during job run (endpoints were ready). All permissions now in place."
-else
-    echo "==> No app found in bundle, skipping app deployment."
 fi
+echo "==> Deploy complete!"

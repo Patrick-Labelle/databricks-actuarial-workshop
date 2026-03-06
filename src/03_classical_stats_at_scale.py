@@ -38,7 +38,7 @@
 import numpy as np
 import pandas as pd
 import pyspark.sql.functions as F
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, DateType
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 # Passed as base_parameters by the bundle job; defaults used when interactive.
@@ -75,10 +75,7 @@ claims_df = (
 )
 claims_df.createOrReplaceTempView("claims_ts")
 
-n_segments = claims_df.select("segment_id").distinct().count()
-n_rows     = claims_df.count()
-print(f"Segments: {n_segments} (expected 40 = 4 product lines × 10 provinces)")
-print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
+print(f"Loaded gold_claims_monthly (expected 40 segments × 84 months = 3,360 rows)")
 
 # COMMAND ----------
 
@@ -92,8 +89,7 @@ print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
 
 # Load gold_macro_features from the declarative pipeline and join to claims data
 macro_df = spark.table(f"{CATALOG}.{SCHEMA}.gold_macro_features")
-macro_count = macro_df.count()
-print(f"gold_macro_features: {macro_count:,} rows (expected ~840 = 10 provinces × 84 months)")
+print("Loaded gold_macro_features")
 
 claims_with_macro = (
     claims_df
@@ -105,30 +101,6 @@ claims_with_macro = (
     )
 )
 claims_with_macro.createOrReplaceTempView("claims_with_macro")
-HAS_MACRO = macro_count > 0
-
-if HAS_MACRO:
-    # Correlation: claims_count vs macro indicators
-    corr_pdf = (
-        claims_with_macro
-        .select("claims_count", "unemployment_rate", "hpi_growth", "housing_starts")
-        .toPandas()
-        .corr()
-        .round(3)
-    )
-    print("\nCorrelation with claims_count:")
-    print(corr_pdf[["claims_count"]].sort_values("claims_count", ascending=False).to_string())
-
-    # Time-series preview: Ontario Personal_Auto vs unemployment
-    _preview = (
-        claims_with_macro
-        .filter(F.col("segment_id") == "Personal_Auto__Ontario")
-        .orderBy("month")
-        .select("month", "claims_count", "unemployment_rate")
-        .toPandas()
-    )
-    print(f"\nOntario Personal_Auto — first 6 rows with macro:")
-    print(_preview.head(6).to_string(index=False))
 
 # COMMAND ----------
 
@@ -143,23 +115,19 @@ if HAS_MACRO:
 # Load Feature Store features and join to claims data
 _fs_table = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 fs_features = spark.table(_fs_table)
-_fs_count = fs_features.count()
-print(f"features_segment_monthly: {_fs_count:,} rows")
+print("Loaded features_segment_monthly")
 
 # Select key features for SARIMAX exogenous variables
 _fs_cols = ["segment_id", "month", "rolling_3m_mean", "rolling_6m_mean",
             "coeff_variation_3m", "mom_change_pct", "normalized_premium"]
-# Only select columns that exist in the feature table
-_available_fs_cols = [c for c in _fs_cols if c in fs_features.columns]
-fs_subset = fs_features.select(*_available_fs_cols)
+fs_subset = fs_features.select(*_fs_cols)
 
 claims_with_macro = (
     claims_with_macro
     .join(fs_subset, on=["segment_id", "month"], how="left")
 )
 claims_with_macro.createOrReplaceTempView("claims_with_macro")
-HAS_FS_FEATURES = _fs_count > 0
-print(f"Feature Store features joined: {', '.join(_available_fs_cols[2:])}")
+print(f"Feature Store features joined: {', '.join(_fs_cols[2:])}")
 
 # COMMAND ----------
 
@@ -219,20 +187,14 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     y      = pdf["claims_count"].astype(float).values
     months = pd.to_datetime(pdf["month"])
 
-    # Exog columns: macro variables + Feature Store features (if available)
-    exog_cols = ["unemployment_rate", "hpi_growth"]
-    _fs_exog = ["rolling_3m_mean", "coeff_variation_3m", "mom_change_pct"]
-    for _fc in _fs_exog:
-        if _fc in pdf.columns and not pdf[_fc].isna().all():
-            exog_cols.append(_fc)
+    # Exog columns: macro variables + Feature Store features
+    exog_cols = ["unemployment_rate", "hpi_growth",
+                 "rolling_3m_mean", "coeff_variation_3m", "mom_change_pct"]
 
     # Fill NaN exog values (hpi_growth is NaN for the first month due to lag;
     # forward-fill then back-fill covers edge cases at either end of the series)
-    exog_data = pdf[exog_cols].copy() if all(c in pdf.columns for c in exog_cols) \
-                else pd.DataFrame(np.nan, index=pdf.index, columns=exog_cols)
-    exog_data = exog_data.ffill().bfill()
-    has_exog  = not exog_data.isna().all().any()
-    exog_arr  = exog_data.values.astype(float) if has_exog else None
+    exog_data = pdf[exog_cols].copy().ffill().bfill()
+    exog_arr  = exog_data.values.astype(float)
 
     # Train/validation split (72 train, 12 validation)
     n_train, n_val = 72, 12
@@ -242,10 +204,13 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     aic = mape_baseline = mape_sarimax = np.nan
     fcast_mean = np.full(12, np.nan)
     fcast_ci   = pd.DataFrame({"lower": np.full(12, np.nan), "upper": np.full(12, np.nan)})
-    exog_vars_str = ",".join(exog_cols) if has_exog else ""
+    exog_vars_str = ",".join(exog_cols)
+
+    exog_train = exog_arr[:n_train]
+    exog_val   = exog_arr[n_train:]
 
     try:
-        # ── Model 1: Baseline SARIMA (no exog) ───────────────────────────────
+        # ── Baseline SARIMA (no exog) — for MAPE comparison ──────────────────
         m_base   = SARIMAX(y_train, order=(1,0,1), seasonal_order=(1,1,0,12),
                            enforce_stationarity=False, enforce_invertibility=False)
         fit_base = m_base.fit(disp=False, maxiter=100)
@@ -255,45 +220,30 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
             np.mean(np.abs((y_val - fc_base) / np.clip(y_val, 1, None))) * 100
         )
 
-        # ── Model 2: SARIMAX with macro exog (if data is available) ──────────
-        if has_exog:
-            exog_train = exog_arr[:n_train]
-            exog_val   = exog_arr[n_train:]
-            try:
-                m_sx   = SARIMAX(y_train, exog=exog_train, order=(1,0,1),
-                                 seasonal_order=(1,1,0,12),
-                                 enforce_stationarity=False, enforce_invertibility=False)
-                fit_sx = m_sx.fit(disp=False, maxiter=100)
-                fc_sx  = fit_sx.forecast(steps=n_val, exog=exog_val)
-                mape_sarimax = float(
-                    np.mean(np.abs((y_val - fc_sx) / np.clip(y_val, 1, None))) * 100
-                )
-            except Exception:
-                mape_sarimax = mape_baseline   # fall back gracefully
+        # ── SARIMAX with macro + FS exog ─────────────────────────────────────
+        m_sx   = SARIMAX(y_train, exog=exog_train, order=(1,0,1),
+                         seasonal_order=(1,1,0,12),
+                         enforce_stationarity=False, enforce_invertibility=False)
+        fit_sx = m_sx.fit(disp=False, maxiter=100)
+        fc_sx  = fit_sx.forecast(steps=n_val, exog=exog_val)
+        mape_sarimax = float(
+            np.mean(np.abs((y_val - fc_sx) / np.clip(y_val, 1, None))) * 100
+        )
 
         # ── Final model: refit on full 84 months for forecasting ─────────────
-        if has_exog:
-            m_final = SARIMAX(y, exog=exog_arr, order=(1,0,1), seasonal_order=(1,1,0,12),
-                              enforce_stationarity=False, enforce_invertibility=False)
-        else:
-            m_final = SARIMAX(y, order=(1,0,1), seasonal_order=(1,1,0,12),
-                              enforce_stationarity=False, enforce_invertibility=False)
+        m_final = SARIMAX(y, exog=exog_arr, order=(1,0,1), seasonal_order=(1,1,0,12),
+                          enforce_stationarity=False, enforce_invertibility=False)
         fit_final = m_final.fit(disp=False, maxiter=100)
 
         # 12-month forecast; extrapolate exog as last 3-month average held flat
-        if has_exog:
-            exog_fcast = np.tile(exog_arr[-3:].mean(axis=0), (12, 1))
-            forecast   = fit_final.get_forecast(steps=12, exog=exog_fcast)
-        else:
-            forecast   = fit_final.get_forecast(steps=12)
+        exog_fcast = np.tile(exog_arr[-3:].mean(axis=0), (12, 1))
+        forecast   = fit_final.get_forecast(steps=12, exog=exog_fcast)
 
-        fcast_mean   = forecast.predicted_mean
-        fcast_ci_raw = forecast.conf_int(alpha=0.05)
-        fcast_ci     = fcast_ci_raw if hasattr(fcast_ci_raw, 'iloc') \
-                       else pd.DataFrame(fcast_ci_raw, columns=["lower", "upper"])
+        fcast_mean = forecast.predicted_mean
+        fcast_ci   = pd.DataFrame(forecast.conf_int(alpha=0.05))
+        fcast_ci.columns = ["lower", "upper"]
 
     except Exception:
-        # Return NaN forecasts — allows the pipeline to continue for all segments
         fit_final = None
 
     # ── GARCH(1,1) on SARIMA residuals ────────────────────────────────────────
@@ -345,8 +295,7 @@ def fit_sarimax_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
     forecast_months = pd.date_range(
         last_month + pd.offsets.MonthBegin(1), periods=12, freq="MS"
     )
-    # Primary MAPE = SARIMAX when available, else baseline
-    _primary_mape = mape_sarimax if has_exog and not np.isnan(mape_sarimax) else mape_baseline
+    _primary_mape = mape_sarimax if not np.isnan(mape_sarimax) else mape_baseline
 
     actuals_rows = pd.DataFrame({
         "segment_id":      segment_id,
@@ -415,7 +364,7 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         "model_type":      "SARIMAX(1,0,1)(1,1,0,12)+GARCH(1,1)",
         "segments":        "40",
         "horizon_months":  "12",
-        "exog_vars":       "unemployment_rate,hpi_growth" if HAS_MACRO else "none",
+        "exog_vars":       "unemployment_rate,hpi_growth,rolling_3m_mean,coeff_variation_3m,mom_change_pct",
         "audience":        "actuarial-workshop",
     })
 
@@ -427,22 +376,33 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
     )
 
-    # Trigger execution and compute MAPE metrics
-    total_rows = sarima_results_df.count()
+    # Write to Delta — single trigger for applyInPandas execution
+    (sarima_results_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
 
-    mape_row = (
+    # Re-read from Delta for metrics (cheap read, no recomputation)
+    sarima_results_df = spark.table(f"{CATALOG}.{SCHEMA}.predictions_sarima")
+
+    # Compute all metrics in a single query
+    _metrics = (
         sarima_results_df
         .filter(F.col("record_type") == "forecast")
         .agg(
             F.mean("mape").alias("avg_mape"),
             F.mean("mape_baseline").alias("avg_mape_baseline"),
             F.mean("mape_sarimax").alias("avg_mape_sarimax"),
+            F.countDistinct(
+                F.when(F.col("garch_alpha").isNotNull(), F.col("segment_id"))
+            ).alias("garch_seg_count"),
         )
         .collect()[0]
     )
-    avg_mape          = mape_row["avg_mape"]          or 0.0
-    avg_mape_baseline = mape_row["avg_mape_baseline"] or avg_mape
-    avg_mape_sarimax  = mape_row["avg_mape_sarimax"]  or avg_mape
+    avg_mape          = _metrics["avg_mape"]          or 0.0
+    avg_mape_baseline = _metrics["avg_mape_baseline"] or avg_mape
+    avg_mape_sarimax  = _metrics["avg_mape_sarimax"]  or avg_mape
     avg_mape_improve  = avg_mape_baseline - avg_mape_sarimax
 
     mlflow.log_metrics({
@@ -450,63 +410,19 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
         "avg_mape_baseline_pct":    round(avg_mape_baseline, 2),
         "avg_mape_sarimax_pct":     round(avg_mape_sarimax, 2),
         "avg_mape_improvement_pct": round(avg_mape_improve, 2),
-        "total_output_rows":        total_rows,
         "segments_fitted":          40,
     })
 
-    # Count segments with GARCH fitted
-    _garch_seg_count = (
-        sarima_results_df
-        .filter(F.col("record_type") == "forecast")
-        .filter(F.col("garch_alpha").isNotNull())
-        .select("segment_id").distinct().count()
-    )
-
-    print(f"SARIMAX+GARCH complete | Total rows: {total_rows}")
-    print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
-    print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
-    print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
-    print(f"  GARCH(1,1) fitted:     {_garch_seg_count}/40 segments (ARCH-LM p < 0.10)")
+    print(f"SARIMAX+GARCH complete → {CATALOG}.{SCHEMA}.predictions_sarima")
+    print(f"  MAPE: baseline={avg_mape_baseline:.1f}%, SARIMAX={avg_mape_sarimax:.1f}%, improvement={avg_mape_improve:+.1f}%")
+    print(f"  GARCH(1,1) fitted: {_metrics['garch_seg_count']}/40 segments")
     print(f"MLflow run: {run.info.run_id}")
 
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Save SARIMA Results
-
-# COMMAND ----------
-
-(sarima_results_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_sarima"))
-
-print(f"Saved to {CATALOG}.{SCHEMA}.predictions_sarima")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. ARCH-LM Diagnostic — GARCH(1,1) on SARIMA Residuals
-# MAGIC
-# MAGIC Engle's ARCH-LM test on SARIMAX residuals. Segments with p < 0.10 get GARCH(1,1)
-# MAGIC for time-varying prediction intervals and Monte Carlo CVs.
-
-# COMMAND ----------
-
-# Summarize ARCH-LM results across all 40 segments
-_arch_summary = (
-    sarima_results_df
-    .filter(F.col("record_type") == "forecast")
-    .select("segment_id", "arch_lm_pvalue", "garch_alpha", "garch_beta")
-    .distinct()
-    .orderBy("arch_lm_pvalue")
-)
-_arch_count = _arch_summary.filter(F.col("arch_lm_pvalue") < 0.10).count()
-_arch_total = _arch_summary.filter(F.col("arch_lm_pvalue").isNotNull()).count()
-print(f"ARCH-LM summary: {_arch_count}/{_arch_total} segments show significant ARCH effects (p < 0.10)")
-print("Segments with GARCH(1,1) fitted have time-varying CIs in predictions_sarima.")
+# MAGIC ## 4. Monte Carlo Portfolio Calibration
 
 
 # COMMAND ----------
@@ -708,12 +624,11 @@ _calibrated_corr = _log_losses.corr().values
 _eigvals, _eigvecs = np.linalg.eigh(_calibrated_corr)
 _eigvals = np.maximum(_eigvals, 1e-8)
 _calibrated_corr = _eigvecs @ np.diag(_eigvals) @ _eigvecs.T
-np.fill_diagonal(_calibrated_corr, 1.0)
 _calibrated_corr = np.clip(_calibrated_corr, -0.99, 0.99)
 np.fill_diagonal(_calibrated_corr, 1.0)
 
 # Copula df grid search: AIC on empirical tail dependence
-from scipy.stats import t as tdist, kendalltau
+from scipy.stats import kendalltau
 _best_df, _best_aic = 4, float('inf')
 for _df_candidate in [3, 4, 5, 6, 8, 10]:
     _ll = 0.0
@@ -764,10 +679,8 @@ for _mc_seg in ["Property", "Auto"]:
     # Fit Negative Binomial: mean = μ, var = μ + μ²/k → k = μ² / (var - μ)
     _mu_freq = float(_monthly_counts.mean())
     _var_freq = float(_monthly_counts.var())
-    if _var_freq > _mu_freq:  # overdispersed
-        _k_freq = _mu_freq ** 2 / (_var_freq - _mu_freq)
-    else:  # equidispersed or underdispersed → Poisson (k→∞)
-        _k_freq = 1e6
+    # NegBin k parameter (synthetic data is always overdispersed: var > mean)
+    _k_freq = _mu_freq ** 2 / max(_var_freq - _mu_freq, 1e-6)
 
     _FREQ_PARAMS[_mc_seg] = {"lambda": round(_mu_freq, 1), "k": round(_k_freq, 2)}
 
@@ -809,8 +722,7 @@ for _seg in ["Property", "Auto", "Liability"]:
 # The GARCH(1,1) fitted on SARIMA residuals (inside fit_sarimax_per_segment)
 # produces conditional volatility in claims_count units.  The textbook CV is
 # simply σ/μ — no ad-hoc scaling needed because the units are already correct.
-_sarima_cv_pd = sarima_results_df.toPandas()
-_sarima_cv_pd["product_line"] = _sarima_cv_pd["segment_id"].str.split("__").str[0]
+_sarima_cv_pd = _sarima_pd  # reuse from calibration bridge (already has product_line)
 
 # Filter to actuals with GARCH conditional volatility
 _actual_garch = _sarima_cv_pd[
@@ -1028,14 +940,13 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
     })
 
     # Log calibration report as JSON artifact
-    if _calib_report is not None:
-        import json as _json, tempfile as _tmpf, os as _os
-        with _tmpf.TemporaryDirectory() as _td:
-            _cr_path = _os.path.join(_td, "calibration_report.json")
-            with open(_cr_path, "w") as _f:
-                _json.dump(_calib_report, _f, indent=2, default=str)
-            mlflow.log_artifact(_cr_path, artifact_path="calibration")
-        print("Calibration report logged as MLflow artifact")
+    import json as _json, tempfile as _tmpf, os as _os
+    with _tmpf.TemporaryDirectory() as _td:
+        _cr_path = _os.path.join(_td, "calibration_report.json")
+        with open(_cr_path, "w") as _f:
+            _json.dump(_calib_report, _f, indent=2, default=str)
+        mlflow.log_artifact(_cr_path, artifact_path="calibration")
+    print("Calibration report logged as MLflow artifact")
 
     # ── Dispatch all tasks before collecting any ───────────────────────────
     # Baseline: static PORTFOLIO means (seeds 42–45)
@@ -1255,12 +1166,21 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
         _total_claims = int(_n_claims.sum())
         _claim_sevs = _cr_rng.lognormal(mean=_mu_s, sigma=_sig_s, size=_total_claims)
 
-        # Aggregate per scenario
+        # Aggregate per scenario using np.add.reduceat (vectorized, no Python loop)
         _cum_idx = np.cumsum(_n_claims)
-        _cum_idx_shifted = np.concatenate([[0], _cum_idx[:-1]])
-        for _si in range(_CR_N_SCENARIOS):
-            _start, _end = _cum_idx_shifted[_si], _cum_idx[_si]
-            _cr_total_losses[_si] += _claim_sevs[_start:_end].sum() / 1_000_000  # to $M
+        _split_pts = np.concatenate([[0], _cum_idx[:-1]])
+        # reduceat sums claim severities within each scenario's slice
+        _nonzero_mask = _n_claims > 0
+        if _nonzero_mask.all():
+            _seg_losses = np.add.reduceat(_claim_sevs, _split_pts) / 1_000_000
+        else:
+            _seg_losses = np.zeros(_CR_N_SCENARIOS)
+            _nz_idx = np.where(_nonzero_mask)[0]
+            if len(_nz_idx) > 0:
+                _seg_losses[_nz_idx] = np.add.reduceat(
+                    _claim_sevs, _split_pts[_nz_idx]
+                )[:len(_nz_idx)] / 1_000_000
+        _cr_total_losses += _seg_losses
 
     _cr_mean = float(_cr_total_losses.mean())
     _cr_var99 = float(np.percentile(_cr_total_losses, 99))
@@ -1305,11 +1225,10 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
                    'Crisis': {'Normal': 0.15, 'Crisis': 0.85}}
 
     # Monthly premium = annualized earned premium / 12 (from gold_claims_monthly)
-    try:
-        _prem_pdf = spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly").select("earned_premium").toPandas()
-        _monthly_premium = float(_prem_pdf["earned_premium"].mean()) / 1_000_000  # monthly avg in $M
-    except Exception:
-        _monthly_premium = sum(_calibrated_means) / 12 * 1.05  # 5% margin fallback
+    _monthly_premium = float(
+        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+        .agg(F.mean("earned_premium")).collect()[0][0]
+    ) / 1_000_000
 
     _investment_rate_monthly = 0.04 / 12  # 4% annual risk-free rate
 
@@ -1422,8 +1341,7 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
 
 _triangle_table = f"{CATALOG}.{SCHEMA}.gold_reserve_triangle"
 triangle_df = spark.table(_triangle_table)
-_tri_count = triangle_df.count()
-print(f"gold_reserve_triangle: {_tri_count:,} rows")
+print("Loaded gold_reserve_triangle")
 
 # Aggregate triangle to get latest cumulative incurred per segment × accident month
 # (use the maximum dev_lag available for each accident month as the most mature estimate)
@@ -1461,10 +1379,7 @@ predictions_reserve_validation = (
     .option("overwriteSchema", "true")
     .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_reserve_validation"))
 
-_avg_adequacy = predictions_reserve_validation.agg(F.mean("reserve_adequacy_ratio")).collect()[0][0]
 print(f"Reserve validation saved → {CATALOG}.{SCHEMA}.predictions_reserve_validation")
-print(f"  Average reserve adequacy ratio: {_avg_adequacy:.2f}")
-print(f"  (>1.0 = over-reserved, <1.0 = under-reserved, ~1.0 = adequate)")
 
 # COMMAND ----------
 
@@ -1818,11 +1733,19 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
                 total_claims = int(n_claims.sum())
                 claim_sevs = rng.lognormal(mean=sev_mu[i], sigma=sev_sigma[i],
                                            size=max(total_claims, 1))
-                cum_idx = np.cumsum(n_claims)
-                cum_idx_shifted = np.concatenate([[0], cum_idx[:-1]])
-                for s in range(n_scenarios):
-                    start, end = cum_idx_shifted[s], cum_idx[s]
-                    total[s] += claim_sevs[start:end].sum() / 1_000_000
+                # Vectorized aggregation per scenario
+                split_pts = np.concatenate([[0], np.cumsum(n_claims)[:-1]])
+                nonzero = n_claims > 0
+                if nonzero.all():
+                    total += np.add.reduceat(claim_sevs, split_pts) / 1_000_000
+                else:
+                    nz_idx = np.where(nonzero)[0]
+                    if len(nz_idx) > 0:
+                        seg_losses = np.zeros(n_scenarios)
+                        seg_losses[nz_idx] = np.add.reduceat(
+                            claim_sevs, split_pts[nz_idx]
+                        )[:len(nz_idx)] / 1_000_000
+                        total += seg_losses
         else:
             # ── Aggregate Model: t-Copula + Lognormal ────────────────────
             sigma2   = np.log(1 + cv**2)
@@ -1902,9 +1825,9 @@ _mc_baseline_input = pd.DataFrame([{
     "mean_property_M": _calibrated_means[0],
     "mean_auto_M":     _calibrated_means[1],
     "mean_liability_M":_calibrated_means[2],
-    "cv_property": _garch_cvs[0] if isinstance(_garch_cvs, list) else float(_garch_cvs[0]),
-    "cv_auto":     _garch_cvs[1] if isinstance(_garch_cvs, list) else float(_garch_cvs[1]),
-    "cv_liability":_garch_cvs[2] if isinstance(_garch_cvs, list) else float(_garch_cvs[2]),
+    "cv_property": float(_garch_cvs[0]),
+    "cv_auto":     float(_garch_cvs[1]),
+    "cv_liability":float(_garch_cvs[2]),
     "corr_prop_auto": round(float(_calibrated_corr[0, 1]), 3),
     "corr_prop_liab": round(float(_calibrated_corr[0, 2]), 3),
     "corr_auto_liab": round(float(_calibrated_corr[1, 2]), 3),
@@ -1980,9 +1903,9 @@ with mlflow.start_run(run_name="monte_carlo_portfolio_champion") as _mc_reg_run:
         "mean_property_M_base":   _calibrated_means[0],
         "mean_auto_M_base":       _calibrated_means[1],
         "mean_liability_M_base":  _calibrated_means[2],
-        "cv_property_base":       _garch_cvs[0] if isinstance(_garch_cvs, list) else float(_garch_cvs[0]),
-        "cv_auto_base":           _garch_cvs[1] if isinstance(_garch_cvs, list) else float(_garch_cvs[1]),
-        "cv_liability_base":      _garch_cvs[2] if isinstance(_garch_cvs, list) else float(_garch_cvs[2]),
+        "cv_property_base":       float(_garch_cvs[0]),
+        "cv_auto_base":           float(_garch_cvs[1]),
+        "cv_liability_base":      float(_garch_cvs[2]),
         "cv_source":              "GARCH(1,1) on SARIMA residuals",
         "corr_prop_auto_base":    round(float(_calibrated_corr[0, 1]), 3),
         "corr_prop_liab_base":    round(float(_calibrated_corr[0, 2]), 3),

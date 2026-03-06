@@ -102,21 +102,14 @@ else:
 
 def generate_reserve_development_data(spark, catalog: str, schema: str):
     """
-    Generate synthetic claims reserve development CDC records and write to a Delta
-    table that acts as the Bronze source for the declarative pipeline.
+    Generate synthetic claims reserve development CDC records and write to Delta.
 
-    Reserve development is core actuarial data: case reserves are set when a claim
-    is first reported, then revised as the claim develops (additional information,
-    partial payments, settlements). The SCD2 pattern captures how reserve estimates
-    change over time — a standard actuarial workflow for loss triangle construction.
-
-    Each (segment_id, accident_month) has multiple development snapshots at
-    increasing development lags (1, 2, …, 12+). Earlier lags have higher case
-    reserves (claims are uncertain); later lags converge as claims settle.
+    Uses Spark-native generation: a small control table (3,360 rows) is exploded
+    to individual development lag entries with random values via Spark SQL functions.
+    Single Delta write.
     """
     import numpy as np
     import pandas as pd
-    from itertools import product as iterproduct
 
     np.random.seed(2024)
 
@@ -126,27 +119,20 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
     ]
-    # Accident months: Jan 2019 – Dec 2025 (84 months, matching claims data)
     ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
-    # Base ultimate incurred by product line (per accident month, Alberta reference)
-    # Scaled ~50x to match ~500K claims/month volume
     BASE_ULTIMATE = {
         "Personal_Auto":       185_000_000,
         "Commercial_Auto":     105_000_000,
         "Homeowners":          155_000_000,
         "Commercial_Property":  73_000_000,
     }
-    # Population-weighted province multipliers (2025 Stats Canada, relative to Alberta = 1.00)
     REGION_MULT = {
         "Ontario": 3.19, "Quebec": 1.85, "British_Columbia": 1.15,
         "Alberta": 1.00, "Manitoba": 0.30, "Saskatchewan": 0.25,
         "New_Brunswick": 0.17, "Nova_Scotia": 0.22,
         "Prince_Edward_Island": 0.04, "Newfoundland": 0.11,
     }
-
-    # Development pattern: cumulative paid % of ultimate at each dev lag (months)
-    # Realistic pattern — fast-settling personal lines, slower commercial/liability
     DEV_PATTERN = {
         "Personal_Auto":       [0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.82, 0.87, 0.91, 0.94, 0.97, 0.99],
         "Commercial_Auto":     [0.10, 0.22, 0.35, 0.46, 0.55, 0.63, 0.70, 0.77, 0.83, 0.88, 0.93, 0.97],
@@ -154,84 +140,80 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "Commercial_Property": [0.08, 0.18, 0.30, 0.40, 0.50, 0.59, 0.67, 0.74, 0.81, 0.87, 0.92, 0.96],
     }
 
-    rows = []
-    event_seq = 1
+    n_months = len(ACCIDENT_MONTHS)
+    month_strs = [m.strftime("%Y-%m-%d") for m in ACCIDENT_MONTHS]
 
-    for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
-        segment_id = f"{prod}__{region}"
-        base_ult = BASE_ULTIMATE[prod] * REGION_MULT[region]
-        dev_pct = DEV_PATTERN[prod]
+    # Control table: one row per (segment, month) with pre-drawn ultimate (3,360 rows)
+    control_rows = []
+    for prod in PRODUCT_LINES:
+        for region in REGIONS:
+            base_ult = BASE_ULTIMATE[prod] * REGION_MULT[region]
+            ult_noise = np.random.uniform(0.85, 1.15, size=n_months)
+            control_rows.extend(
+                (prod, region, f"{prod}__{region}",
+                 month_strs[mi], min(12, n_months - mi),
+                 float(base_ult * ult_noise[mi] * (1 + 0.003 * mi)))
+                for mi in range(n_months)
+                if min(12, n_months - mi) >= 1
+            )
 
-        for acc_month in ACCIDENT_MONTHS:
-            # Ultimate incurred with noise (±15%)
-            ultimate = base_ult * np.random.uniform(0.85, 1.15)
+    control_schema = StructType([
+        StructField("product_line",   StringType(),  False),
+        StructField("region",         StringType(),  False),
+        StructField("segment_id",     StringType(),  False),
+        StructField("accident_month", StringType(),  False),
+        StructField("max_lag",        IntegerType(), False),
+        StructField("ultimate",       DoubleType(),  False),
+    ])
+    control_sdf = spark.createDataFrame(control_rows, schema=control_schema)
 
-            # Slight trend: +0.3% per month
-            month_idx = (acc_month.year - 2019) * 12 + (acc_month.month - 1)
-            ultimate *= (1 + 0.003 * month_idx)
-
-            # Max development lags available depends on how old the accident month is
-            # (newer months have fewer lags observed)
-            max_lag = min(12, len(ACCIDENT_MONTHS) - month_idx)
-            if max_lag < 1:
-                continue
-
-            for lag in range(1, max_lag + 1):
-                cum_paid_pct = dev_pct[lag - 1] * np.random.uniform(0.92, 1.08)
-                cum_paid = ultimate * min(cum_paid_pct, 1.0)
-                incurred = ultimate * np.random.uniform(0.95, 1.05)  # incurred fluctuates
-
-                # Case reserve = incurred - cumulative paid (what's still expected)
-                case_reserve = max(0, incurred - cum_paid)
-
-                # Development month = accident month + lag months
-                dev_month = acc_month + pd.DateOffset(months=lag)
-
-                rows.append({
-                    "event_id":           event_seq,
-                    "segment_id":         segment_id,
-                    "product_line":       prod,
-                    "region":             region,
-                    "accident_month":     acc_month.strftime("%Y-%m-%d"),
-                    "development_month":  dev_month.strftime("%Y-%m-%d"),
-                    "dev_lag":            lag,
-                    "cumulative_paid":    round(cum_paid, 2),
-                    "cumulative_incurred": round(incurred, 2),
-                    "case_reserve":       round(case_reserve, 2),
-                    "op":                 "INSERT" if lag == 1 else "UPDATE",
-                    "ingested_at":        pd.Timestamp.now().isoformat(),
-                })
-                event_seq += 1
-
-    pdf = pd.DataFrame(rows)
-
-    reserve_schema = StructType([
-        StructField("event_id",            IntegerType(), False),
-        StructField("segment_id",          StringType(),  False),
-        StructField("product_line",        StringType(),  False),
-        StructField("region",              StringType(),  False),
-        StructField("accident_month",      StringType(),  False),
-        StructField("development_month",   StringType(),  False),
-        StructField("dev_lag",             IntegerType(), False),
-        StructField("cumulative_paid",     DoubleType(),  True),
-        StructField("cumulative_incurred", DoubleType(),  True),
-        StructField("case_reserve",        DoubleType(),  True),
-        StructField("op",                  StringType(),  False),
-        StructField("ingested_at",         StringType(),  False),
+    # Dev pattern lookup: product_line → array of cumulative paid %
+    dev_pct_map = F.create_map(*[
+        x for prod in PRODUCT_LINES for x in [
+            F.lit(prod),
+            F.array(*[F.lit(float(v)) for v in DEV_PATTERN[prod]])
+        ]
     ])
 
-    sdf = spark.createDataFrame(pdf, schema=reserve_schema)
+    # Explode to individual lag entries, compute values in Spark
+    reserve_sdf = (
+        control_sdf
+        .withColumn("dev_lag", F.explode(F.sequence(F.lit(1), F.col("max_lag"))))
+        .withColumn("development_month",
+            F.date_format(
+                F.add_months(F.to_date("accident_month"), F.col("dev_lag")),
+                "yyyy-MM-dd"))
+        .withColumn("cumulative_paid",
+            F.round(F.col("ultimate") * F.least(
+                F.element_at(dev_pct_map[F.col("product_line")], F.col("dev_lag"))
+                * (F.lit(0.92) + F.rand(seed=2024) * F.lit(0.16)),
+                F.lit(1.0)), 2))
+        .withColumn("cumulative_incurred",
+            F.round(F.col("ultimate")
+                    * (F.lit(0.95) + F.rand(seed=2025) * F.lit(0.10)), 2))
+        .withColumn("case_reserve",
+            F.round(F.greatest(F.lit(0.0),
+                F.col("cumulative_incurred") - F.col("cumulative_paid")), 2))
+        .withColumn("op",
+            F.when(F.col("dev_lag") == 1, "INSERT").otherwise("UPDATE"))
+        .withColumn("event_id", F.monotonically_increasing_id())
+        .withColumn("ingested_at", F.current_timestamp().cast("string"))
+        .select("event_id", "segment_id", "product_line", "region",
+                "accident_month", "development_month", "dev_lag",
+                "cumulative_paid", "cumulative_incurred", "case_reserve",
+                "op", "ingested_at")
+    )
 
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
-    (sdf.write
+    (reserve_sdf.write
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
         .saveAsTable(f"{catalog}.{schema}.raw_reserve_development"))
 
-    count = sdf.count()
+    count = spark.table(f"{catalog}.{schema}.raw_reserve_development").count()
     print(f"Generated {count:,} reserve development CDC events → {catalog}.{schema}.raw_reserve_development")
-    return sdf
+    return spark.table(f"{catalog}.{schema}.raw_reserve_development")
 
 # ── Helper: generate synthetic claim incident data ────────────────────────────
 def generate_claims_events_data(spark, catalog: str, schema: str):
@@ -239,15 +221,12 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
     Generate individual claim incident records for Jan 2019 – Dec 2025.
 
     Volume calibrated to Alberta Open Data 2013 loss ratios with population-weighted
-    provincial multipliers (~500K claims/month, ~42M total). Each row is one claim
-    event. Writes to raw_claims_events per-segment batch to manage memory,
-    which feeds the SDP bronze_claims → gold_claims_monthly pipeline.
-
-    Returns the Spark DataFrame.
+    provincial multipliers (~500K claims/month, ~42M total). Uses Spark-native
+    generation: a small control table (3,360 rows) is exploded to ~42M claim rows
+    with random values computed via Spark SQL functions — single Delta write.
     """
     import numpy as np
     import pandas as pd
-    from itertools import product as iterproduct
 
     np.random.seed(2025)
 
@@ -259,29 +238,24 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
     ]
     MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
-    # Monthly claim counts for Alberta (region multiplier = 1.00)
-    # Scaled ~58x for ~500K claims/month across all provinces
     BASE_CLAIMS = {
         "Personal_Auto":       26_000,
         "Commercial_Auto":     10_500,
         "Homeowners":          18_500,
         "Commercial_Property":  5_200,
     }
-    # Alberta Open Data 2013: loss ratio calibration
     LOSS_RATIO_TARGET = {
         "Personal_Auto":       0.70,
         "Commercial_Auto":     0.67,
         "Homeowners":          0.62,
         "Commercial_Property": 0.65,
     }
-    # Average claim severity by product line
     AVG_SEVERITY = {
         "Personal_Auto":       6_500.0,
         "Commercial_Auto":     9_200.0,
         "Homeowners":          8_400.0,
         "Commercial_Property": 14_000.0,
     }
-    # Population-weighted province multipliers (2025 Stats Canada, relative to Alberta = 1.00)
     REGION_MULTIPLIER = {
         "Ontario":              3.19,
         "Quebec":               1.85,
@@ -301,68 +275,76 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Commercial_Property": ["Fire", "Water", "Wind", "Equipment"],
     }
 
-    claims_schema = StructType([
-        StructField("claim_id",              IntegerType(), False),
-        StructField("product_line",          StringType(),  False),
-        StructField("region",                StringType(),  False),
-        StructField("loss_date",             StringType(),  False),
-        StructField("claim_amount",          DoubleType(),  True),
-        StructField("monthly_prem_exposure", DoubleType(),  True),
-        StructField("claim_type",            StringType(),  True),
-        StructField("ingested_at",           StringType(),  False),
+    sigma2 = np.log(1.0 + 0.5 ** 2)
+    month_strs = [m.strftime("%Y-%m-%d") for m in MONTHS]
+
+    # Control table: one row per (segment, month) with pre-drawn Poisson counts (3,360 rows)
+    # Poisson is drawn in numpy (no Spark SQL equivalent); everything else is Spark-native
+    control_rows = []
+    for prod in PRODUCT_LINES:
+        mu_ln = float(np.log(AVG_SEVERITY[prod]) - sigma2 / 2.0)
+        sigma_ln = float(np.sqrt(sigma2))
+        loss_ratio = float(LOSS_RATIO_TARGET[prod])
+        for region in REGIONS:
+            base = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
+            n_per_month = np.random.poisson(base, size=len(MONTHS))
+            control_rows.extend(
+                (prod, region, month_strs[mi], int(n_per_month[mi]),
+                 mu_ln, sigma_ln, loss_ratio)
+                for mi in range(len(MONTHS))
+            )
+
+    control_schema = StructType([
+        StructField("product_line", StringType(),  False),
+        StructField("region",       StringType(),  False),
+        StructField("loss_date",    StringType(),  False),
+        StructField("n_claims",     IntegerType(), False),
+        StructField("mu_ln",        DoubleType(),  False),
+        StructField("sigma_ln",     DoubleType(),  False),
+        StructField("loss_ratio",   DoubleType(),  False),
+    ])
+    control_sdf = (spark.createDataFrame(control_rows, schema=control_schema)
+                       .repartition(40))
+
+    # Claim type lookup: product_line → array of types
+    ctype_map = F.create_map(*[
+        x for prod in PRODUCT_LINES for x in [
+            F.lit(prod),
+            F.array(*[F.lit(t) for t in CLAIM_TYPES[prod]])
+        ]
     ])
 
-    # Write per-segment batch to avoid >10 GB in-memory DataFrame for ~42M rows
-    claim_id_offset = 0
-    first = True
-    total_count = 0
-    for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
-        base       = BASE_CLAIMS[prod] * REGION_MULTIPLIER[region]
-        loss_ratio = LOSS_RATIO_TARGET[prod]
-        avg_sev    = AVG_SEVERITY[prod]
-        ctypes     = CLAIM_TYPES[prod]
+    # Explode to individual claims, compute random values with Spark
+    claims_sdf = (
+        control_sdf
+        .withColumn("_seq", F.explode(F.sequence(F.lit(1), F.col("n_claims"))))
+        # Lognormal severity: exp(mu + sigma * Z), Z ~ N(0,1)
+        .withColumn("claim_amount",
+            F.round(F.exp(F.col("mu_ln") + F.col("sigma_ln") * F.randn(seed=42)), 2))
+        # Premium = claim / loss_ratio * U(0.85, 1.15)
+        .withColumn("monthly_prem_exposure",
+            F.round(F.col("claim_amount") / F.col("loss_ratio")
+                    * (F.lit(0.85) + F.rand(seed=43) * F.lit(0.30)), 2))
+        # Random claim type from product-specific list
+        .withColumn("_ctypes", ctype_map[F.col("product_line")])
+        .withColumn("claim_type",
+            F.element_at(F.col("_ctypes"),
+                F.floor(F.rand(seed=44) * F.size(F.col("_ctypes"))).cast("int") + 1))
+        .withColumn("claim_id", F.monotonically_increasing_id())
+        .withColumn("ingested_at", F.current_timestamp().cast("string"))
+        .select("claim_id", "product_line", "region", "loss_date",
+                "claim_amount", "monthly_prem_exposure", "claim_type", "ingested_at")
+    )
 
-        # Poisson number of claims per month (vectorized for all months at once)
-        n_per_month = np.random.poisson(base, size=len(MONTHS))
-        total_n     = int(n_per_month.sum())
-        if total_n == 0:
-            continue
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+    (claims_sdf.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{catalog}.{schema}.raw_claims_events"))
 
-        # Lognormal claim amounts (CV ≈ 0.5)
-        sigma2  = np.log(1.0 + 0.5 ** 2)
-        mu_ln   = np.log(avg_sev) - sigma2 / 2.0
-        amounts = np.random.lognormal(mu_ln, np.sqrt(sigma2), size=total_n)
-
-        # Premium exposure derived from amount and loss ratio (with small noise)
-        prems    = amounts / loss_ratio * np.random.uniform(0.85, 1.15, size=total_n)
-        type_idx = np.random.randint(0, len(ctypes), size=total_n)
-
-        # Assign loss_date = first of the claim's month
-        loss_dates = np.repeat([m.strftime("%Y-%m-%d") for m in MONTHS], n_per_month)
-
-        segment_pdf = pd.DataFrame({
-            "claim_id":              range(claim_id_offset + 1, claim_id_offset + total_n + 1),
-            "product_line":          prod,
-            "region":                region,
-            "loss_date":             loss_dates,
-            "claim_amount":          np.round(amounts, 2),
-            "monthly_prem_exposure": np.round(prems, 2),
-            "claim_type":            [ctypes[i] for i in type_idx],
-            "ingested_at":           pd.Timestamp.now().isoformat(),
-        })
-        claim_id_offset += total_n
-        total_count += total_n
-
-        sdf = spark.createDataFrame(segment_pdf, schema=claims_schema)
-        mode = "overwrite" if first else "append"
-        (sdf.write
-            .format("delta")
-            .mode(mode)
-            .option("overwriteSchema", "true" if first else "false")
-            .saveAsTable(f"{catalog}.{schema}.raw_claims_events"))
-        first = False
-
-    print(f"Generated {total_count:,} claim events → {catalog}.{schema}.raw_claims_events")
+    count = spark.table(f"{catalog}.{schema}.raw_claims_events").count()
+    print(f"Generated {count:,} claim events → {catalog}.{schema}.raw_claims_events")
     return spark.table(f"{catalog}.{schema}.raw_claims_events")
 
 
