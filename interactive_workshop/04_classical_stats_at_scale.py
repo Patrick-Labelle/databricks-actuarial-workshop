@@ -1879,7 +1879,7 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
         # Safety bounds
         n_scenarios = max(1_000, min(n_scenarios, 100_000))
         copula_df   = max(2,     min(copula_df,   30))
-        means       = np.clip(means, 0.01, 1_000.0)
+        means       = np.clip(means, 0.01, 50_000.0)
         cv          = np.clip(cv,    0.01, 5.0)
         corr_prop_auto = np.clip(corr_prop_auto, -0.99, 0.99)
         corr_prop_liab = np.clip(corr_prop_liab, -0.99, 0.99)
@@ -1904,6 +1904,16 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
 
         if model_type == "collective_risk":
             # ── Collective Risk Model: frequency-severity bottom-up ──────
+            # Auto-calibrate severity mu so that freq_lambda * E[X] matches
+            # the passed means (in $M), keeping sev_sigma fixed for tail shape.
+            for i in range(3):
+                target_mean_dollars = means[i] * 1_000_000  # $M → $
+                raw_ex = np.exp(sev_mu[i] + sev_sigma[i]**2 / 2)
+                implied_mean = freq_lambda[i] * raw_ex
+                if implied_mean > 0:
+                    # Shift sev_mu to match: E[S] = lambda * exp(mu + sig^2/2)
+                    sev_mu[i] += np.log(target_mean_dollars / implied_mean)
+
             from scipy.stats import nbinom as nbinom_dist
             z = rng.standard_normal((n_scenarios, 3))
             z_cor = z @ chol.T
