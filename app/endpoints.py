@@ -34,6 +34,9 @@ def call_monte_carlo_endpoint(scenario: dict) -> dict | None:
     if w is None:
         st.error(f"Databricks SDK unavailable: {get_auth_init_error() or 'unknown error'}")
         return None
+    # Ensure required fields have defaults
+    scenario.setdefault("model_type", "aggregate")
+    scenario.setdefault("simulation_mode", "single_period")
     try:
         response = w.serving_endpoints.query(
             name=MC_ENDPOINT_NAME,
