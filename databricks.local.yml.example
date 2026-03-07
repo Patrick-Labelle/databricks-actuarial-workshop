@@ -20,12 +20,15 @@ targets:
       profile: your-profile                                       # ← replace (from ~/.databrickscfg)
     variables:
       catalog: your_catalog                                       # ← replace (UC catalog, must exist)
-      schema: actuarial_workshop
-      endpoint_name: actuarial-workshop-sarima-forecaster
+      data_schema: actuarial_data
+      models_schema: actuarial_models
+      app_schema: actuarial_app
+      endpoint_name: actuarial-workshop-frequency-forecaster
+      mc_endpoint_name: actuarial-workshop-bootstrap-reserves
       warehouse_id: "your_warehouse_id"                           # ← replace (workspace SQL settings)
       pg_database: actuarial_workshop_db                          # ← Lakebase database name (provisioned by bundle)
       notification_email: your.email@example.com                 # ← optional
-      genie_space_id: ""                                         # ← set after first deploy creates the space
+      genie_space_id: ""                                         # ← auto-populated after first deploy
       llm_endpoint_name: databricks-meta-llama-3-3-70b-instruct  # ← Foundation Model API endpoint
     resources:
       jobs:
