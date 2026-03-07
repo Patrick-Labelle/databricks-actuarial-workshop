@@ -44,8 +44,8 @@ WAREHOUSE_ID     = dbutils.widgets.get("warehouse_id")
 PG_DATABASE      = dbutils.widgets.get("pg_database")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
-SARIMA_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
-MC_MODEL_NAME     = f"{CATALOG}.{MODELS_SCHEMA}.bootstrap_reserve_simulator"
+FREQ_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
+BOOT_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.bootstrap_reserve_simulator"
 FEATURE_TABLE     = f"{CATALOG}.{DATA_SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
@@ -61,8 +61,8 @@ _HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/jso
 LAKEBASE_ENDPOINT_PATH = "projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
 
 print(f"Workspace:       {WORKSPACE_URL}")
-print(f"Frequency model:  {SARIMA_MODEL_NAME}")
-print(f"Bootstrap model:  {MC_MODEL_NAME}")
+print(f"Frequency model:  {FREQ_MODEL_NAME}")
+print(f"Bootstrap model:  {BOOT_MODEL_NAME}")
 print(f"Frequency endpoint: {ENDPOINT_NAME}")
 print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
 print(f"Feature table:   {FEATURE_TABLE}")
@@ -84,24 +84,24 @@ from mlflow.tracking import MlflowClient
 client = MlflowClient()
 
 # Look up latest model versions
-sarima_versions = client.search_model_versions(f"name='{SARIMA_MODEL_NAME}'")
-sarima_latest_ver = max(int(v.version) for v in sarima_versions)
-print(f"Frequency model:  {SARIMA_MODEL_NAME}  → version {sarima_latest_ver}")
+freq_versions = client.search_model_versions(f"name='{FREQ_MODEL_NAME}'")
+freq_latest_ver = max(int(v.version) for v in freq_versions)
+print(f"Frequency model:  {FREQ_MODEL_NAME}  → version {freq_latest_ver}")
 
-mc_versions = client.search_model_versions(f"name='{MC_MODEL_NAME}'")
-mc_latest_ver = max(int(v.version) for v in mc_versions)
-print(f"Bootstrap model:  {MC_MODEL_NAME}  → version {mc_latest_ver}")
+boot_versions = client.search_model_versions(f"name='{BOOT_MODEL_NAME}'")
+boot_latest_ver = max(int(v.version) for v in boot_versions)
+print(f"Bootstrap model:  {BOOT_MODEL_NAME}  → version {boot_latest_ver}")
 
 # COMMAND ----------
 
 # ── Step 1: Create/update endpoint (served_models only) ─────────────────────
-_sarima_endpoint_body = {
+_freq_endpoint_body = {
     "name": ENDPOINT_NAME,
     "config": {
         "served_models": [{
             "name":                   "frequency-champion",
-            "model_name":             SARIMA_MODEL_NAME,
-            "model_version":          str(sarima_latest_ver),
+            "model_name":             FREQ_MODEL_NAME,
+            "model_version":          str(freq_latest_ver),
             "workload_size":          "Small",
             "scale_to_zero_enabled":  True,
         }],
@@ -117,14 +117,14 @@ if resp.status_code == 200:
     resp = requests.put(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}/config",
         headers=_HEADERS,
-        json=_sarima_endpoint_body["config"],
+        json=_freq_endpoint_body["config"],
     )
     print(f"Frequency endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
-        json=_sarima_endpoint_body,
+        json=_freq_endpoint_body,
     )
     print(f"Frequency endpoint created: {resp.status_code}")
 
@@ -134,7 +134,7 @@ else:
     print(f"  Error: {resp.text}")
 
 # ── Step 2: Configure AI Gateway (separate API call) ────────────────────────
-_sarima_ai_gateway = {
+_freq_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
@@ -148,7 +148,7 @@ _sarima_ai_gateway = {
 gw_resp = requests.put(
     f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}/ai-gateway",
     headers=_HEADERS,
-    json=_sarima_ai_gateway,
+    json=_freq_ai_gateway,
 )
 if gw_resp.status_code == 200:
     print(f"  AI Gateway configured: inference tables + rate limits")
@@ -165,13 +165,13 @@ else:
 # COMMAND ----------
 
 # ── Step 1: Create/update endpoint ──────────────────────────────────────────
-_mc_endpoint_body = {
+_boot_endpoint_body = {
     "name": MC_ENDPOINT_NAME,
     "config": {
         "served_models": [{
             "name":                  "bootstrap-reserve-champion",
-            "model_name":            MC_MODEL_NAME,
-            "model_version":         str(mc_latest_ver),
+            "model_name":            BOOT_MODEL_NAME,
+            "model_version":         str(boot_latest_ver),
             "workload_size":         "Small",
             "scale_to_zero_enabled": True,
         }],
@@ -187,14 +187,14 @@ if resp.status_code == 200:
     resp = requests.put(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{MC_ENDPOINT_NAME}/config",
         headers=_HEADERS,
-        json=_mc_endpoint_body["config"],
+        json=_boot_endpoint_body["config"],
     )
     print(f"Bootstrap endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
-        json=_mc_endpoint_body,
+        json=_boot_endpoint_body,
     )
     print(f"Bootstrap endpoint created: {resp.status_code}")
 
@@ -204,7 +204,7 @@ else:
     print(f"  Error: {resp.text}")
 
 # ── Step 2: Configure AI Gateway ────────────────────────────────────────────
-_mc_ai_gateway = {
+_boot_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
@@ -218,7 +218,7 @@ _mc_ai_gateway = {
 gw_resp = requests.put(
     f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{MC_ENDPOINT_NAME}/ai-gateway",
     headers=_HEADERS,
-    json=_mc_ai_gateway,
+    json=_boot_ai_gateway,
 )
 if gw_resp.status_code == 200:
     print(f"  AI Gateway configured: inference tables + rate limits")

@@ -183,7 +183,7 @@ for t in data.get('tasks', []):
 
     _DONE=$(echo "$_TASK_STATES" | grep -c "TERMINATED SUCCESS" || true)
     _RUNNING=$(echo "$_TASK_STATES" | awk '$2=="RUNNING"{printf "%s ", $1}')
-    echo "    [${_DONE}/7 tasks] ${_RUNNING:-waiting...}"
+    echo "    [${_DONE}/8 tasks] ${_RUNNING:-waiting...}"
 done
 
 wait $_BUNDLE_RUN_PID 2>/dev/null || true
