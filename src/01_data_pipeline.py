@@ -38,10 +38,10 @@ from pyspark.sql.types import StructType, StructField, IntegerType, StringType, 
 # When running as a job task, values come from widgets (base_parameters in resources/jobs.yml).
 if IN_PIPELINE:
     CATALOG = spark.conf.get("catalog", "my_catalog")
-    SCHEMA  = spark.conf.get("schema",  "actuarial_workshop")
+    SCHEMA  = spark.conf.get("schema",  "actuarial_data")
 else:
     dbutils.widgets.text("catalog", "my_catalog",         "UC Catalog")
-    dbutils.widgets.text("schema",  "actuarial_workshop", "UC Schema")
+    dbutils.widgets.text("schema",  "actuarial_data", "UC Schema")
     CATALOG = dbutils.widgets.get("catalog")
     SCHEMA  = dbutils.widgets.get("schema")
 

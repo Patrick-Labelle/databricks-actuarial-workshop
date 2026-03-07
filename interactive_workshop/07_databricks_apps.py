@@ -90,7 +90,7 @@ spark = DatabricksSession.builder.serverless(True).getOrCreate()
 # All workspace-specific values come from env vars injected by the bundle app
 # resource (resources/app.yml → config.env). No hardcoded values here.
 CATALOG = os.environ.get("CATALOG", "my_catalog")
-SCHEMA  = os.environ.get("SCHEMA",  "actuarial_workshop")
+SCHEMA  = os.environ.get("SCHEMA",  "actuarial_data")
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
@@ -139,7 +139,7 @@ def get_lakebase_conn():
     return psycopg2.connect(
         host     = os.environ.get("LAKEBASE_HOST", ""),
         port     = int(os.environ.get("LAKEBASE_PORT", "5432")),
-        database = os.environ.get("LAKEBASE_DB", "actuarial_workshop"),
+        database = os.environ.get("LAKEBASE_DB", "actuarial_workshop_db"),
         user     = os.environ.get("LAKEBASE_USER", ""),
         password = os.environ.get("LAKEBASE_PASSWORD", ""),
     )

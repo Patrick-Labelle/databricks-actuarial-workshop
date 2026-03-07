@@ -17,15 +17,21 @@
 # All values default to the workshop defaults but can be overridden via widgets
 # (or via job base_parameters) to clean up any target catalog/schema.
 dbutils.widgets.text("catalog",           "my_catalog",                           "UC Catalog")
-dbutils.widgets.text("schema",            "actuarial_workshop",                   "UC Schema")
+dbutils.widgets.text("data_schema",      "actuarial_data",                       "Data Schema")
+dbutils.widgets.text("models_schema",    "actuarial_models",                     "Models Schema")
+dbutils.widgets.text("app_schema",       "actuarial_app",                        "App Schema")
 dbutils.widgets.text("endpoint_name",     "actuarial-workshop-frequency-forecaster", "Serving Endpoint")
 dbutils.widgets.text("pg_database",       "actuarial_workshop_db",                "Lakebase DB name")
 dbutils.widgets.text("lakebase_instance", "actuarial-workshop-lakebase",          "Lakebase instance name")
 CATALOG           = dbutils.widgets.get("catalog")
-SCHEMA            = dbutils.widgets.get("schema")
+DATA_SCHEMA       = dbutils.widgets.get("data_schema")
+MODELS_SCHEMA     = dbutils.widgets.get("models_schema")
+APP_SCHEMA        = dbutils.widgets.get("app_schema")
 ENDPOINT_NAME     = dbutils.widgets.get("endpoint_name")
 PG_DATABASE       = dbutils.widgets.get("pg_database")
 LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance")
+
+ALL_SCHEMAS = [APP_SCHEMA, MODELS_SCHEMA, DATA_SCHEMA]  # drop order: app first, data last
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import requests, mlflow, time, os
@@ -46,7 +52,8 @@ if not TOKEN:
     TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 
 print(f"Workspace: {WORKSPACE_URL}")
-print(f"Target catalog/schema: {CATALOG}.{SCHEMA}")
+print(f"Target catalog: {CATALOG}")
+print(f"  Schemas: {', '.join(ALL_SCHEMAS)}")
 print(f"Endpoint: {ENDPOINT_NAME}")
 print(f"Lakebase: {LAKEBASE_INSTANCE} / {PG_DATABASE}")
 print(f"Token acquired: {'yes' if TOKEN else 'no'}")
@@ -59,16 +66,21 @@ print(f"Token acquired: {'yes' if TOKEN else 'no'}")
 # COMMAND ----------
 
 # List tables before dropping (for verification)
-tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{SCHEMA}").collect()
-print(f"Tables to be dropped ({len(tables)}):")
-for t in tables:
-    print(f"  - {CATALOG}.{SCHEMA}.{t['tableName']}")
+for _schema in ALL_SCHEMAS:
+    try:
+        tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{_schema}").collect()
+        print(f"Tables in {_schema} ({len(tables)}):")
+        for t in tables:
+            print(f"  - {CATALOG}.{_schema}.{t['tableName']}")
+    except Exception:
+        print(f"Schema {CATALOG}.{_schema} does not exist (skipping)")
 
 # COMMAND ----------
 
-# Drop the schema and all contained objects
-spark.sql(f"DROP SCHEMA IF EXISTS {CATALOG}.{SCHEMA} CASCADE")
-print(f"Schema {CATALOG}.{SCHEMA} dropped (CASCADE — all tables, views, functions, volumes removed).")
+# Drop all schemas and their contained objects
+for _schema in ALL_SCHEMAS:
+    spark.sql(f"DROP SCHEMA IF EXISTS {CATALOG}.{_schema} CASCADE")
+    print(f"Schema {CATALOG}.{_schema} dropped (CASCADE).")
 
 # COMMAND ----------
 
@@ -77,7 +89,7 @@ print(f"Schema {CATALOG}.{SCHEMA} dropped (CASCADE — all tables, views, functi
 
 # COMMAND ----------
 
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.segment_features_online"
+ONLINE_TABLE_NAME = f"{CATALOG}.{MODELS_SCHEMA}.segment_features_online"
 
 resp = requests.delete(
     f"https://{WORKSPACE_URL}/api/2.0/online-tables/{ONLINE_TABLE_NAME}",
@@ -117,7 +129,7 @@ else:
 
 # COMMAND ----------
 
-MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
+MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
 
 mlflow.set_registry_uri("databricks-uc")
 client = mlflow.tracking.MlflowClient()
@@ -136,10 +148,12 @@ except Exception as e:
 # COMMAND ----------
 
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial_workshop_frequency_forecaster"
-EXPERIMENT_NAME_4 = f"/Users/{_current_user}/actuarial_workshop_claims_sarima"
+_EXPERIMENT_NAMES = [
+    f"/Users/{_current_user}/actuarial_workshop_frequency_forecast",
+    f"/Users/{_current_user}/actuarial_workshop_bootstrap_reserves",
+]
 
-for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_4]:
+for exp_name in _EXPERIMENT_NAMES:
     try:
         experiment = mlflow.get_experiment_by_name(exp_name)
         if experiment:
@@ -296,12 +310,13 @@ if LB_HOST:
 
 print("=== Cleanup Verification ===\n")
 
-# Check schema
-try:
-    tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{SCHEMA}").count()
-    print(f"[WARN] Schema {CATALOG}.{SCHEMA} still exists with {tables} tables")
-except Exception:
-    print(f"[OK] Schema {CATALOG}.{SCHEMA} does not exist")
+# Check schemas
+for _schema in ALL_SCHEMAS:
+    try:
+        tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{_schema}").count()
+        print(f"[WARN] Schema {CATALOG}.{_schema} still exists with {tables} tables")
+    except Exception:
+        print(f"[OK] Schema {CATALOG}.{_schema} does not exist")
 
 # Check serving endpoint
 resp = requests.get(

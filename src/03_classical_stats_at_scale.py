@@ -35,10 +35,12 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, DateType
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-dbutils.widgets.text("catalog",  "my_catalog",         "UC Catalog")
-dbutils.widgets.text("schema",   "actuarial_workshop", "UC Schema")
-CATALOG   = dbutils.widgets.get("catalog")
-SCHEMA    = dbutils.widgets.get("schema")
+dbutils.widgets.text("catalog",       "my_catalog",       "UC Catalog")
+dbutils.widgets.text("data_schema",   "actuarial_data",   "Data Schema (gold tables)")
+dbutils.widgets.text("models_schema", "actuarial_models", "Models Schema (predictions)")
+CATALOG       = dbutils.widgets.get("catalog")
+DATA_SCHEMA   = dbutils.widgets.get("data_schema")
+MODELS_SCHEMA = dbutils.widgets.get("models_schema")
 
 np.random.seed(42)
 
@@ -53,14 +55,14 @@ MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")
 
 # ─── Read from SDP gold layer ─────────────────────────────────────────────────
 claims_df = (
-    spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+    spark.table(f"{CATALOG}.{DATA_SCHEMA}.gold_claims_monthly")
     .filter(F.col("month").between("2019-01-01", "2025-12-01"))
 )
 claims_df.createOrReplaceTempView("claims_ts")
 print(f"Loaded gold_claims_monthly")
 
 # Load reserve triangle (primary data for stochastic reserving)
-triangle_sdf = spark.table(f"{CATALOG}.{SCHEMA}.gold_reserve_triangle")
+triangle_sdf = spark.table(f"{CATALOG}.{DATA_SCHEMA}.gold_reserve_triangle")
 print(f"Loaded gold_reserve_triangle")
 
 # COMMAND ----------
@@ -70,7 +72,7 @@ print(f"Loaded gold_reserve_triangle")
 
 # COMMAND ----------
 
-macro_df = spark.table(f"{CATALOG}.{SCHEMA}.gold_macro_features")
+macro_df = spark.table(f"{CATALOG}.{DATA_SCHEMA}.gold_macro_features")
 print("Loaded gold_macro_features")
 
 claims_with_macro = (
@@ -87,7 +89,7 @@ claims_with_macro.createOrReplaceTempView("claims_with_macro")
 # COMMAND ----------
 
 # Load Feature Store features and join to claims data
-_fs_table = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
+_fs_table = f"{CATALOG}.{DATA_SCHEMA}.features_segment_monthly"
 fs_features = spark.table(_fs_table)
 print("Loaded features_segment_monthly")
 
@@ -291,7 +293,7 @@ _current_user = spark.sql("SELECT current_user()").collect()[0][0]
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_frequency_forecast")
 
 _claims_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
+    table_name=f"{CATALOG}.{DATA_SCHEMA}.gold_claims_monthly",
     name="gold_claims_monthly",
 )
 
@@ -313,13 +315,16 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
         .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
     )
 
+    # Ensure models schema exists before first write
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{MODELS_SCHEMA}")
+
     (sarima_results_df.write
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_frequency_forecast"))
+        .saveAsTable(f"{CATALOG}.{MODELS_SCHEMA}.predictions_frequency_forecast"))
 
-    sarima_results_df = spark.table(f"{CATALOG}.{SCHEMA}.predictions_frequency_forecast")
+    sarima_results_df = spark.table(f"{CATALOG}.{MODELS_SCHEMA}.predictions_frequency_forecast")
 
     _metrics = (
         sarima_results_df
@@ -347,10 +352,136 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
         "segments_fitted":          40,
     })
 
-    print(f"Frequency forecasting complete → {CATALOG}.{SCHEMA}.predictions_frequency_forecast")
+    print(f"Frequency forecasting complete → {CATALOG}.{MODELS_SCHEMA}.predictions_frequency_forecast")
     print(f"  MAPE: baseline={avg_mape_baseline:.1f}%, SARIMAX={avg_mape_sarimax:.1f}%, improvement={avg_mape_improve:+.1f}%")
     print(f"  GARCH(1,1) fitted: {_metrics['garch_seg_count']}/40 segments")
     print(f"MLflow run: {run.info.run_id}")
+
+    # ── Register Frequency Forecaster PyFunc to UC ────────────────────────
+    import os, pickle, tempfile, cloudpickle, scipy
+    import statsmodels as _statsmodels
+    import arch as _arch_pkg
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    from mlflow.tracking import MlflowClient
+
+    class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
+        """
+        MLflow PyFunc wrapper for fitted SARIMAX + optional GARCH(1,1) model.
+        Forecasts future accident period claim counts (frequency forecasting).
+        """
+
+        def load_context(self, context):
+            import pickle, os
+            model_path = os.path.join(context.artifacts["sarimax_model"], "model.pkl")
+            with open(model_path, "rb") as f:
+                self.model_fit = pickle.load(f)
+            garch_path = os.path.join(context.artifacts["sarimax_model"], "garch.pkl")
+            self.garch_fit = None
+            if os.path.exists(garch_path):
+                with open(garch_path, "rb") as f:
+                    self.garch_fit = pickle.load(f)
+
+        def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+            horizon = int(model_input["horizon"].iloc[0])
+            horizon = max(1, min(horizon, 24))
+
+            forecast = self.model_fit.get_forecast(steps=horizon)
+            mean_fcst = forecast.predicted_mean
+
+            if self.garch_fit is not None:
+                fc = self.garch_fit.forecast(horizon=horizon, reindex=False)
+                garch_vol = np.sqrt(np.asarray(fc.variance).flatten()[:horizon])
+                lo95 = np.asarray(mean_fcst) - 1.96 * garch_vol
+                hi95 = np.asarray(mean_fcst) + 1.96 * garch_vol
+            else:
+                ci = np.asarray(forecast.conf_int(alpha=0.05))
+                lo95, hi95 = ci[:, 0], ci[:, 1]
+
+            return pd.DataFrame({
+                "month_offset":   list(range(1, horizon + 1)),
+                "forecast_mean":  list(np.round(mean_fcst, 1)),
+                "forecast_lo95":  list(np.round(lo95, 1)),
+                "forecast_hi95":  list(np.round(hi95, 1)),
+            })
+
+    # Train representative model on Personal_Auto__Ontario (highest volume segment)
+    _reg_claims_pdf = (
+        spark.table(f"{CATALOG}.{DATA_SCHEMA}.gold_claims_monthly")
+        .filter("segment_id = 'Personal_Auto__Ontario'")
+        .orderBy("month")
+        .select("month", "claims_count")
+        .toPandas()
+    )
+    _y_train = _reg_claims_pdf["claims_count"].astype(float).values
+
+    _reg_model = SARIMAX(
+        _y_train, order=(1, 0, 1), seasonal_order=(1, 1, 0, 12),
+        enforce_stationarity=False, enforce_invertibility=False,
+    )
+    _reg_fit = _reg_model.fit(disp=False, maxiter=200)
+
+    from arch import arch_model
+    from statsmodels.stats.diagnostic import het_arch
+    _reg_resid = _reg_fit.resid[12:]
+    _reg_garch_fit = None
+    try:
+        _lm_stat, _lm_pval, _, _ = het_arch(_reg_resid, nlags=4)
+        if _lm_pval < 0.10:
+            _am = arch_model(_reg_resid, mean='Zero', vol='Garch', p=1, q=1, dist='normal')
+            _reg_garch_fit = _am.fit(disp='off', show_warning=False)
+            print(f"GARCH fitted for serving model (ARCH-LM p={_lm_pval:.4f})")
+        else:
+            print(f"No significant ARCH effects (p={_lm_pval:.4f}) — GARCH skipped for serving model")
+    except Exception as _garch_reg_err:
+        print(f"GARCH fit failed for serving model: {_garch_reg_err}")
+
+    _SARIMA_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        _model_pkl_path = os.path.join(_tmpdir, "model.pkl")
+        with open(_model_pkl_path, "wb") as _f:
+            pickle.dump(_reg_fit, _f)
+
+        if _reg_garch_fit is not None:
+            _garch_pkl_path = os.path.join(_tmpdir, "garch.pkl")
+            with open(_garch_pkl_path, "wb") as _f:
+                pickle.dump(_reg_garch_fit, _f)
+
+        _input_schema  = mlflow.types.Schema([mlflow.types.ColSpec("integer", "horizon")])
+        _output_schema = mlflow.types.Schema([
+            mlflow.types.ColSpec("integer", "month_offset"),
+            mlflow.types.ColSpec("double",  "forecast_mean"),
+            mlflow.types.ColSpec("double",  "forecast_lo95"),
+            mlflow.types.ColSpec("double",  "forecast_hi95"),
+        ])
+        _signature = mlflow.models.ModelSignature(inputs=_input_schema, outputs=_output_schema)
+
+        mlflow.pyfunc.log_model(
+            artifact_path="frequency_forecaster",
+            python_model=SARIMAXForecaster(),
+            artifacts={"sarimax_model": _tmpdir},
+            signature=_signature,
+            registered_model_name=_SARIMA_MODEL_NAME,
+            pip_requirements=[
+                f"statsmodels=={_statsmodels.__version__}",
+                f"numpy=={np.__version__}",
+                f"scipy=={scipy.__version__}",
+                f"cloudpickle=={cloudpickle.__version__}",
+                f"arch=={_arch_pkg.__version__}",
+            ],
+        )
+
+    print(f"\nFrequency forecaster registered to: {_SARIMA_MODEL_NAME}")
+
+    _client = MlflowClient()
+    _sarima_versions = _client.search_model_versions(f"name='{_SARIMA_MODEL_NAME}'")
+    _sarima_latest_ver = max(int(v.version) for v in _sarima_versions)
+    _client.set_registered_model_alias(name=_SARIMA_MODEL_NAME, alias="Champion", version=_sarima_latest_ver)
+    _client.set_model_version_tag(name=_SARIMA_MODEL_NAME, version=str(_sarima_latest_ver),
+                                  key="approved_by", value="actuarial-workshop-demo")
+    print(f"Set @Champion → version {_sarima_latest_ver}")
 
 
 # COMMAND ----------
@@ -560,8 +691,8 @@ _ldf_vol_df = spark.createDataFrame(pd.DataFrame(_ldf_vol_rows))
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_ldf_volatility"))
-print(f"LDF volatility saved → {CATALOG}.{SCHEMA}.predictions_ldf_volatility")
+    .saveAsTable(f"{CATALOG}.{MODELS_SCHEMA}.predictions_ldf_volatility"))
+print(f"LDF volatility saved → {CATALOG}.{MODELS_SCHEMA}.predictions_ldf_volatility")
 for _r in _ldf_vol_rows:
     print(f"  {_r['product_line']}: avg LDF={_r['avg_ldf']:.3f}, σ={_r['std_ldf']:.3f}, "
           f"mean resid={_r['mean_residual']:.3f}, σ_resid={_r['std_residual']:.3f}")
@@ -576,6 +707,135 @@ for _r in _ldf_vol_rows:
 # MAGIC refit chain ladder → project reserves → add process variance (Gamma noise).
 # MAGIC
 # MAGIC Ray distributes replications across workers for scalability.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Bootstrap Reserve Simulator PyFunc
+# MAGIC
+# MAGIC Defined here so it can be validated after the bootstrap run and registered
+# MAGIC to UC within the same MLflow experiment.
+
+# COMMAND ----------
+
+class BootstrapReservePyFunc(mlflow.pyfunc.PythonModel):
+    """
+    MLflow PyFunc wrapper for Bootstrap Chain Ladder reserve simulation.
+
+    Accepts reserve parameters and scenario configuration, returns reserve
+    distribution metrics (IBNR best estimate, VaR, CVaR, reserve risk capital).
+
+    Supports scenarios: baseline, adverse_development, judicial_inflation,
+    pandemic_tail, superimposed_inflation.
+    """
+
+    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        import numpy as np
+
+        row = model_input.iloc[0]
+
+        scenario = str(row.get("scenario", "baseline"))
+        n_replications = int(row.get("n_replications", 50_000))
+        n_replications = max(1_000, min(n_replications, 500_000))
+
+        # Reserve parameters (expected IBNR components by product line in $M)
+        mean_ibnr_personal_auto = float(row.get("mean_ibnr_personal_auto_M", 50.0))
+        mean_ibnr_commercial_auto = float(row.get("mean_ibnr_commercial_auto_M", 30.0))
+        mean_ibnr_homeowners = float(row.get("mean_ibnr_homeowners_M", 40.0))
+        mean_ibnr_commercial_property = float(row.get("mean_ibnr_commercial_property_M", 20.0))
+
+        # LDF volatility parameters (CV of development factors)
+        cv_personal_auto = float(row.get("cv_personal_auto", 0.15))
+        cv_commercial_auto = float(row.get("cv_commercial_auto", 0.18))
+        cv_homeowners = float(row.get("cv_homeowners", 0.12))
+        cv_commercial_property = float(row.get("cv_commercial_property", 0.20))
+
+        # Scenario adjustments
+        ldf_multiplier = float(row.get("ldf_multiplier", 1.0))
+        inflation_adj = float(row.get("inflation_adj", 0.0))
+
+        means = np.array([mean_ibnr_personal_auto, mean_ibnr_commercial_auto,
+                          mean_ibnr_homeowners, mean_ibnr_commercial_property])
+        cvs = np.array([cv_personal_auto, cv_commercial_auto,
+                        cv_homeowners, cv_commercial_property])
+
+        # Apply scenario adjustments
+        if scenario == 'adverse_development':
+            means *= ldf_multiplier if ldf_multiplier > 1.0 else 1.2
+            cvs *= 1.3
+        elif scenario == 'judicial_inflation':
+            means[:2] *= 1.3  # Auto lines
+            cvs[:2] *= 1.2
+        elif scenario == 'pandemic_tail':
+            means *= 1.1
+            cvs *= 1.4
+        elif scenario == 'superimposed_inflation':
+            infl = inflation_adj if inflation_adj > 0 else 0.03
+            means *= (1.0 + infl)
+
+        rng = np.random.default_rng(42)
+
+        # Bootstrap: lognormal IBNR per line with correlation
+        corr = np.array([
+            [1.0,  0.5,  0.3,  0.2],
+            [0.5,  1.0,  0.2,  0.3],
+            [0.3,  0.2,  1.0,  0.4],
+            [0.2,  0.3,  0.4,  1.0],
+        ])
+        try:
+            chol = np.linalg.cholesky(corr)
+        except np.linalg.LinAlgError:
+            chol = np.eye(4)
+
+        sigma2 = np.log(1 + cvs**2)
+        mu_ln = np.log(means) - sigma2 / 2
+        sigma_ln = np.sqrt(sigma2)
+
+        z = rng.standard_normal((n_replications, 4))
+        z_cor = z @ chol.T
+        ibnr_samples = np.exp(mu_ln + sigma_ln * z_cor)
+        total = ibnr_samples.sum(axis=1)
+
+        best_estimate = float(total.mean())
+        var_99 = float(np.percentile(total, 99))
+        var_995 = float(np.percentile(total, 99.5))
+        cvar_99_threshold = np.percentile(total, 99)
+        tail = total[total >= cvar_99_threshold]
+        cvar_99 = float(tail.mean()) if len(tail) > 0 else var_99
+
+        return pd.DataFrame([{
+            "best_estimate_M":       round(best_estimate, 3),
+            "var_95_M":              round(float(np.percentile(total, 95)), 3),
+            "var_99_M":              round(var_99, 3),
+            "var_995_M":             round(var_995, 3),
+            "cvar_99_M":             round(cvar_99, 3),
+            "reserve_risk_capital_M": round(var_995 - best_estimate, 3),
+            "max_ibnr_M":            round(float(total.max()), 3),
+            "n_replications_used":   n_replications,
+            "scenario":              scenario,
+        }])
+
+
+# Validate the PyFunc locally
+_boot_baseline_input = pd.DataFrame([{
+    "mean_ibnr_personal_auto_M": round(_cl_results['Personal_Auto']['total_ibnr'] / 1e6, 2),
+    "mean_ibnr_commercial_auto_M": round(_cl_results['Commercial_Auto']['total_ibnr'] / 1e6, 2),
+    "mean_ibnr_homeowners_M": round(_cl_results['Homeowners']['total_ibnr'] / 1e6, 2),
+    "mean_ibnr_commercial_property_M": round(_cl_results['Commercial_Property']['total_ibnr'] / 1e6, 2),
+    "cv_personal_auto": 0.15,
+    "cv_commercial_auto": 0.18,
+    "cv_homeowners": 0.12,
+    "cv_commercial_property": 0.20,
+    "n_replications": 50_000,
+    "scenario": "baseline",
+    "ldf_multiplier": 1.0,
+    "inflation_adj": 0.0,
+}])
+
+_boot_pyfunc = BootstrapReservePyFunc()
+_boot_result = _boot_pyfunc.predict(None, _boot_baseline_input)
+print("Bootstrap Reserve Simulator validation (50,000 replications):")
+print(_boot_result.to_string(index=False))
 
 # COMMAND ----------
 
@@ -822,7 +1082,7 @@ print(f'Launching {N_RUNS} runs × {N_TASKS} tasks × {N_PER_TASK:,} replication
 mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_bootstrap_reserves")
 
 _triangle_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.gold_reserve_triangle",
+    table_name=f"{CATALOG}.{DATA_SCHEMA}.gold_reserve_triangle",
     name="gold_reserve_triangle",
 )
 
@@ -940,8 +1200,8 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         .format('delta')
         .mode('overwrite')
         .option('overwriteSchema', 'true')
-        .saveAsTable(f'{CATALOG}.{SCHEMA}.predictions_bootstrap_reserves'))
-    print(f'\nBaseline saved → {CATALOG}.{SCHEMA}.predictions_bootstrap_reserves')
+        .saveAsTable(f'{CATALOG}.{MODELS_SCHEMA}.predictions_bootstrap_reserves'))
+    print(f'\nBaseline saved → {CATALOG}.{MODELS_SCHEMA}.predictions_bootstrap_reserves')
 
     # ── Save scenario comparison → predictions_reserve_scenarios ───────────
     _SCENARIO_LABELS = {
@@ -997,8 +1257,8 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         .format('delta')
         .mode('overwrite')
         .option('overwriteSchema', 'true')
-        .saveAsTable(f'{CATALOG}.{SCHEMA}.predictions_reserve_scenarios'))
-    print(f'\nScenarios saved → {CATALOG}.{SCHEMA}.predictions_reserve_scenarios')
+        .saveAsTable(f'{CATALOG}.{MODELS_SCHEMA}.predictions_reserve_scenarios'))
+    print(f'\nScenarios saved → {CATALOG}.{MODELS_SCHEMA}.predictions_reserve_scenarios')
 
     # ── 12-month reserve evolution ─────────────────────────────────────────
     evolution_rows = []
@@ -1037,8 +1297,8 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         .format('delta')
         .mode('overwrite')
         .option('overwriteSchema', 'true')
-        .saveAsTable(f'{CATALOG}.{SCHEMA}.predictions_reserve_evolution'))
-    print(f'\nReserve evolution saved → {CATALOG}.{SCHEMA}.predictions_reserve_evolution')
+        .saveAsTable(f'{CATALOG}.{MODELS_SCHEMA}.predictions_reserve_evolution'))
+    print(f'\nReserve evolution saved → {CATALOG}.{MODELS_SCHEMA}.predictions_reserve_evolution')
 
     # ── Run-off projection (surplus evolution with reserve development) ────
     print('\n  Running run-off projection (regime-switching)...')
@@ -1061,7 +1321,7 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
 
     # Monthly premium from gold_claims_monthly
     _monthly_premium = float(
-        spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
+        spark.table(f"{CATALOG}.{DATA_SCHEMA}.gold_claims_monthly")
         .agg(F.mean("earned_premium")).collect()[0][0]
     ) / 1_000_000
 
@@ -1121,8 +1381,8 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         .format('delta')
         .mode('overwrite')
         .option('overwriteSchema', 'true')
-        .saveAsTable(f'{CATALOG}.{SCHEMA}.predictions_runoff_projection'))
-    print(f'Run-off projection saved → {CATALOG}.{SCHEMA}.predictions_runoff_projection')
+        .saveAsTable(f'{CATALOG}.{MODELS_SCHEMA}.predictions_runoff_projection'))
+    print(f'Run-off projection saved → {CATALOG}.{MODELS_SCHEMA}.predictions_runoff_projection')
 
     # Save regime parameters
     regime_rows = []
@@ -1139,8 +1399,8 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         .format('delta')
         .mode('overwrite')
         .option('overwriteSchema', 'true')
-        .saveAsTable(f'{CATALOG}.{SCHEMA}.predictions_regime_parameters'))
-    print(f'Regime parameters saved → {CATALOG}.{SCHEMA}.predictions_regime_parameters')
+        .saveAsTable(f'{CATALOG}.{MODELS_SCHEMA}.predictions_regime_parameters'))
+    print(f'Regime parameters saved → {CATALOG}.{MODELS_SCHEMA}.predictions_regime_parameters')
 
     mlflow.log_metrics({
         'surplus_median_month12': round(float(_surplus_pctiles[2, -1]), 2),
@@ -1148,6 +1408,65 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
         'initial_surplus_M': round(_initial_surplus, 2),
     })
     print(f'  Initial surplus: ${_initial_surplus:.1f}M | Month-12 median: ${_surplus_pctiles[2, -1]:.1f}M | Ruin prob: {_ruin_prob[-1]:.4%}')
+
+    # ── Register Bootstrap Reserve Simulator PyFunc to UC ─────────────────
+    import scipy
+    from mlflow.tracking import MlflowClient
+    _client = MlflowClient()
+    _BOOT_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.bootstrap_reserve_simulator"
+
+    _boot_reg_dataset = mlflow.data.load_delta(
+        table_name=f"{CATALOG}.{DATA_SCHEMA}.gold_reserve_triangle",
+        name="gold_reserve_triangle",
+    )
+    mlflow.log_input(_boot_reg_dataset, context="bootstrap_calibration")
+
+    _boot_input_schema = mlflow.types.Schema([
+        mlflow.types.ColSpec("double",  "mean_ibnr_personal_auto_M"),
+        mlflow.types.ColSpec("double",  "mean_ibnr_commercial_auto_M"),
+        mlflow.types.ColSpec("double",  "mean_ibnr_homeowners_M"),
+        mlflow.types.ColSpec("double",  "mean_ibnr_commercial_property_M"),
+        mlflow.types.ColSpec("double",  "cv_personal_auto"),
+        mlflow.types.ColSpec("double",  "cv_commercial_auto"),
+        mlflow.types.ColSpec("double",  "cv_homeowners"),
+        mlflow.types.ColSpec("double",  "cv_commercial_property"),
+        mlflow.types.ColSpec("long",    "n_replications"),
+        mlflow.types.ColSpec("string",  "scenario"),
+        mlflow.types.ColSpec("double",  "ldf_multiplier"),
+        mlflow.types.ColSpec("double",  "inflation_adj"),
+    ])
+    _boot_output_schema = mlflow.types.Schema([
+        mlflow.types.ColSpec("double", "best_estimate_M"),
+        mlflow.types.ColSpec("double", "var_95_M"),
+        mlflow.types.ColSpec("double", "var_99_M"),
+        mlflow.types.ColSpec("double", "var_995_M"),
+        mlflow.types.ColSpec("double", "cvar_99_M"),
+        mlflow.types.ColSpec("double", "reserve_risk_capital_M"),
+        mlflow.types.ColSpec("double", "max_ibnr_M"),
+        mlflow.types.ColSpec("long",   "n_replications_used"),
+        mlflow.types.ColSpec("string", "scenario"),
+    ])
+    _boot_signature = mlflow.models.ModelSignature(inputs=_boot_input_schema, outputs=_boot_output_schema)
+
+    mlflow.pyfunc.log_model(
+        artifact_path="bootstrap_reserve_pyfunc",
+        python_model=BootstrapReservePyFunc(),
+        signature=_boot_signature,
+        registered_model_name=_BOOT_MODEL_NAME,
+        pip_requirements=[
+            f"scipy=={scipy.__version__}",
+            f"numpy=={np.__version__}",
+        ],
+    )
+
+    print(f"\nBootstrap Reserve Simulator registered to: {_BOOT_MODEL_NAME}")
+
+    _boot_versions = _client.search_model_versions(f"name='{_BOOT_MODEL_NAME}'")
+    _boot_latest_ver = max(int(v.version) for v in _boot_versions)
+    _client.set_registered_model_alias(name=_BOOT_MODEL_NAME, alias="Champion", version=_boot_latest_ver)
+    _client.set_model_version_tag(name=_BOOT_MODEL_NAME, version=str(_boot_latest_ver),
+                                  key="approved_by", value="actuarial-workshop-demo")
+    print(f"Set @Champion → version {_boot_latest_ver}")
 
 
 # COMMAND ----------
@@ -1160,7 +1479,7 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
 # COMMAND ----------
 
 # Re-read predictions for validation (Ray has shut down)
-sarima_results_df = spark.table(f"{CATALOG}.{SCHEMA}.predictions_frequency_forecast")
+sarima_results_df = spark.table(f"{CATALOG}.{MODELS_SCHEMA}.predictions_frequency_forecast")
 
 from pyspark.sql import Window as _RW
 _max_lag_win = _RW.partitionBy("segment_id", "accident_month").orderBy(F.col("dev_lag").desc())
@@ -1193,420 +1512,9 @@ predictions_reserve_validation = (
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{CATALOG}.{SCHEMA}.predictions_reserve_validation"))
+    .saveAsTable(f"{CATALOG}.{MODELS_SCHEMA}.predictions_reserve_validation"))
 
-print(f"Reserve validation saved → {CATALOG}.{SCHEMA}.predictions_reserve_validation")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 8. Model Registration — MLflow + Unity Catalog
-# MAGIC
-# MAGIC Register Frequency Forecaster (SARIMAX+GARCH) and Bootstrap Reserve Simulator
-# MAGIC to UC with `@Champion` alias for serving endpoint deployment.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 8a. Frequency Forecaster (SARIMAX+GARCH)
-
-# COMMAND ----------
-
-import os, pickle, tempfile, cloudpickle, scipy
-import statsmodels as _statsmodels
-import arch as _arch_pkg
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from mlflow.tracking import MlflowClient
-
-class SARIMAXForecaster(mlflow.pyfunc.PythonModel):
-    """
-    MLflow PyFunc wrapper for fitted SARIMAX + optional GARCH(1,1) model.
-    Forecasts future accident period claim counts (frequency forecasting).
-    """
-
-    def load_context(self, context):
-        import pickle, os
-        model_path = os.path.join(context.artifacts["sarimax_model"], "model.pkl")
-        with open(model_path, "rb") as f:
-            self.model_fit = pickle.load(f)
-        garch_path = os.path.join(context.artifacts["sarimax_model"], "garch.pkl")
-        self.garch_fit = None
-        if os.path.exists(garch_path):
-            with open(garch_path, "rb") as f:
-                self.garch_fit = pickle.load(f)
-
-    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
-        horizon = int(model_input["horizon"].iloc[0])
-        horizon = max(1, min(horizon, 24))
-
-        forecast = self.model_fit.get_forecast(steps=horizon)
-        mean_fcst = forecast.predicted_mean
-
-        if self.garch_fit is not None:
-            fc = self.garch_fit.forecast(horizon=horizon, reindex=False)
-            garch_vol = np.sqrt(np.asarray(fc.variance).flatten()[:horizon])
-            lo95 = np.asarray(mean_fcst) - 1.96 * garch_vol
-            hi95 = np.asarray(mean_fcst) + 1.96 * garch_vol
-        else:
-            ci = np.asarray(forecast.conf_int(alpha=0.05))
-            lo95, hi95 = ci[:, 0], ci[:, 1]
-
-        return pd.DataFrame({
-            "month_offset":   list(range(1, horizon + 1)),
-            "forecast_mean":  list(np.round(mean_fcst, 1)),
-            "forecast_lo95":  list(np.round(lo95, 1)),
-            "forecast_hi95":  list(np.round(hi95, 1)),
-        })
-
-# Train on Personal_Auto__Ontario (highest volume segment)
-_reg_claims_pdf = (
-    spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
-    .filter("segment_id = 'Personal_Auto__Ontario'")
-    .orderBy("month")
-    .select("month", "claims_count")
-    .toPandas()
-)
-_y_train = _reg_claims_pdf["claims_count"].astype(float).values
-
-mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_frequency_forecaster")
-
-_sarima_reg_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.gold_claims_monthly",
-    name="gold_claims_monthly",
-)
-
-with mlflow.start_run(run_name="frequency_forecaster_champion") as _sarima_reg_run:
-    mlflow.log_input(_sarima_reg_dataset, context="training")
-
-    _reg_model = SARIMAX(
-        _y_train, order=(1, 0, 1), seasonal_order=(1, 1, 0, 12),
-        enforce_stationarity=False, enforce_invertibility=False,
-    )
-    _reg_fit = _reg_model.fit(disp=False, maxiter=200)
-
-    from arch import arch_model
-    from statsmodels.stats.diagnostic import het_arch
-    _reg_resid = _reg_fit.resid[12:]
-    _reg_garch_fit = None
-    try:
-        _lm_stat, _lm_pval, _, _ = het_arch(_reg_resid, nlags=4)
-        if _lm_pval < 0.10:
-            _am = arch_model(_reg_resid, mean='Zero', vol='Garch', p=1, q=1, dist='normal')
-            _reg_garch_fit = _am.fit(disp='off', show_warning=False)
-            print(f"GARCH fitted (ARCH-LM p={_lm_pval:.4f})")
-        else:
-            print(f"No significant ARCH effects (p={_lm_pval:.4f}) — GARCH skipped")
-    except Exception as _garch_reg_err:
-        print(f"GARCH fit failed: {_garch_reg_err}")
-
-    _reg_fitted = _reg_fit.fittedvalues[12:]
-    _reg_actual = _y_train[12:]
-    _reg_mape = float(np.mean(np.abs((_reg_actual - _reg_fitted) / np.clip(_reg_actual, 1, None))) * 100)
-    _reg_rmse = float(np.sqrt(np.mean((_reg_actual - _reg_fitted)**2)))
-
-    _model_type_tag = "SARIMAX(1,0,1)(1,1,0,12)+GARCH(1,1)" if _reg_garch_fit else "SARIMAX(1,0,1)(1,1,0,12)"
-    mlflow.set_tags({
-        "segment_id":      "Personal_Auto__Ontario",
-        "workshop_module": "3",
-        "model_class":     "SARIMAX",
-        "model_type":      _model_type_tag,
-        "audience":        "actuarial-workshop",
-        "purpose":         "frequency_forecasting",
-    })
-    mlflow.log_params({
-        "order_p": 1, "order_d": 0, "order_q": 1,
-        "seasonal_P": 1, "seasonal_D": 1, "seasonal_Q": 0,
-        "seasonal_m": 12,
-        "training_months": len(_y_train),
-        "segment": "Personal_Auto__Ontario",
-        "garch_fitted": _reg_garch_fit is not None,
-    })
-    mlflow.log_metrics({
-        "mape_pct": round(_reg_mape, 2),
-        "rmse":     round(_reg_rmse, 1),
-        "aic":      round(_reg_fit.aic, 2),
-        "bic":      round(_reg_fit.bic, 2),
-    })
-
-    _fig, _ax = plt.subplots(figsize=(12, 4))
-    _ax.plot(range(len(_y_train)), _y_train, label="Actual", lw=1.5)
-    _ax.plot(range(12, len(_reg_fit.fittedvalues)), _reg_fit.fittedvalues[12:],
-             label="Fitted", lw=1.5, ls="--")
-    _fc = _reg_fit.get_forecast(steps=12)
-    _fc_mean = _fc.predicted_mean
-    _fc_ci   = np.asarray(_fc.conf_int())
-    _t_fc = range(len(_y_train), len(_y_train) + 12)
-    _ax.plot(_t_fc, _fc_mean, label="Forecast (12m)", color="orange", lw=2)
-    _ax.fill_between(_t_fc, _fc_ci[:, 0], _fc_ci[:, 1], alpha=0.2, color="orange")
-    _ax.set_title(f"{_model_type_tag} — Personal Auto Ontario (Frequency Forecast)")
-    _ax.set_xlabel("Month offset")
-    _ax.set_ylabel("Monthly Claims Count")
-    _ax.legend()
-    _ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    with tempfile.TemporaryDirectory() as _tmpdir:
-        _plot_path = os.path.join(_tmpdir, "forecast_plot.png")
-        _fig.savefig(_plot_path, dpi=120, bbox_inches="tight")
-        mlflow.log_artifact(_plot_path, artifact_path="plots")
-    plt.close()
-
-    _SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
-    with tempfile.TemporaryDirectory() as _tmpdir:
-        _model_pkl_path = os.path.join(_tmpdir, "model.pkl")
-        with open(_model_pkl_path, "wb") as _f:
-            pickle.dump(_reg_fit, _f)
-
-        if _reg_garch_fit is not None:
-            _garch_pkl_path = os.path.join(_tmpdir, "garch.pkl")
-            with open(_garch_pkl_path, "wb") as _f:
-                pickle.dump(_reg_garch_fit, _f)
-
-        _input_schema  = mlflow.types.Schema([mlflow.types.ColSpec("integer", "horizon")])
-        _output_schema = mlflow.types.Schema([
-            mlflow.types.ColSpec("integer", "month_offset"),
-            mlflow.types.ColSpec("double",  "forecast_mean"),
-            mlflow.types.ColSpec("double",  "forecast_lo95"),
-            mlflow.types.ColSpec("double",  "forecast_hi95"),
-        ])
-        _signature = mlflow.models.ModelSignature(inputs=_input_schema, outputs=_output_schema)
-
-        mlflow.pyfunc.log_model(
-            artifact_path="frequency_forecaster",
-            python_model=SARIMAXForecaster(),
-            artifacts={"sarimax_model": _tmpdir},
-            signature=_signature,
-            registered_model_name=_SARIMA_MODEL_NAME,
-            pip_requirements=[
-                f"statsmodels=={_statsmodels.__version__}",
-                f"numpy=={np.__version__}",
-                f"scipy=={scipy.__version__}",
-                f"cloudpickle=={cloudpickle.__version__}",
-                f"arch=={_arch_pkg.__version__}",
-            ],
-        )
-
-    print(f"\nFrequency forecaster registered to: {_SARIMA_MODEL_NAME}")
-    print(f"MAPE: {_reg_mape:.1f}%  |  RMSE: {_reg_rmse:.0f}  |  AIC: {_reg_fit.aic:.1f}")
-
-_client = MlflowClient()
-_sarima_versions = _client.search_model_versions(f"name='{_SARIMA_MODEL_NAME}'")
-_sarima_latest_ver = max(int(v.version) for v in _sarima_versions)
-_client.set_registered_model_alias(name=_SARIMA_MODEL_NAME, alias="Champion", version=_sarima_latest_ver)
-_client.set_model_version_tag(name=_SARIMA_MODEL_NAME, version=str(_sarima_latest_ver),
-                              key="approved_by", value="actuarial-workshop-demo")
-print(f"Set @Champion → version {_sarima_latest_ver}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 8b. Bootstrap Reserve Simulator
-
-# COMMAND ----------
-
-class BootstrapReservePyFunc(mlflow.pyfunc.PythonModel):
-    """
-    MLflow PyFunc wrapper for Bootstrap Chain Ladder reserve simulation.
-
-    Accepts reserve parameters and scenario configuration, returns reserve
-    distribution metrics (IBNR best estimate, VaR, CVaR, reserve risk capital).
-
-    Supports scenarios: baseline, adverse_development, judicial_inflation,
-    pandemic_tail, superimposed_inflation.
-    """
-
-    def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
-        import numpy as np
-
-        row = model_input.iloc[0]
-
-        scenario = str(row.get("scenario", "baseline"))
-        n_replications = int(row.get("n_replications", 50_000))
-        n_replications = max(1_000, min(n_replications, 500_000))
-
-        # Reserve parameters (expected IBNR components by product line in $M)
-        mean_ibnr_personal_auto = float(row.get("mean_ibnr_personal_auto_M", 50.0))
-        mean_ibnr_commercial_auto = float(row.get("mean_ibnr_commercial_auto_M", 30.0))
-        mean_ibnr_homeowners = float(row.get("mean_ibnr_homeowners_M", 40.0))
-        mean_ibnr_commercial_property = float(row.get("mean_ibnr_commercial_property_M", 20.0))
-
-        # LDF volatility parameters (CV of development factors)
-        cv_personal_auto = float(row.get("cv_personal_auto", 0.15))
-        cv_commercial_auto = float(row.get("cv_commercial_auto", 0.18))
-        cv_homeowners = float(row.get("cv_homeowners", 0.12))
-        cv_commercial_property = float(row.get("cv_commercial_property", 0.20))
-
-        # Scenario adjustments
-        ldf_multiplier = float(row.get("ldf_multiplier", 1.0))
-        inflation_adj = float(row.get("inflation_adj", 0.0))
-
-        means = np.array([mean_ibnr_personal_auto, mean_ibnr_commercial_auto,
-                          mean_ibnr_homeowners, mean_ibnr_commercial_property])
-        cvs = np.array([cv_personal_auto, cv_commercial_auto,
-                        cv_homeowners, cv_commercial_property])
-
-        # Apply scenario adjustments
-        if scenario == 'adverse_development':
-            means *= ldf_multiplier if ldf_multiplier > 1.0 else 1.2
-            cvs *= 1.3
-        elif scenario == 'judicial_inflation':
-            means[:2] *= 1.3  # Auto lines
-            cvs[:2] *= 1.2
-        elif scenario == 'pandemic_tail':
-            means *= 1.1
-            cvs *= 1.4
-        elif scenario == 'superimposed_inflation':
-            infl = inflation_adj if inflation_adj > 0 else 0.03
-            means *= (1.0 + infl)
-
-        rng = np.random.default_rng(42)
-
-        # Bootstrap: lognormal IBNR per line with correlation
-        corr = np.array([
-            [1.0,  0.5,  0.3,  0.2],
-            [0.5,  1.0,  0.2,  0.3],
-            [0.3,  0.2,  1.0,  0.4],
-            [0.2,  0.3,  0.4,  1.0],
-        ])
-        try:
-            chol = np.linalg.cholesky(corr)
-        except np.linalg.LinAlgError:
-            chol = np.eye(4)
-
-        sigma2 = np.log(1 + cvs**2)
-        mu_ln = np.log(means) - sigma2 / 2
-        sigma_ln = np.sqrt(sigma2)
-
-        z = rng.standard_normal((n_replications, 4))
-        z_cor = z @ chol.T
-        ibnr_samples = np.exp(mu_ln + sigma_ln * z_cor)
-        total = ibnr_samples.sum(axis=1)
-
-        best_estimate = float(total.mean())
-        var_99 = float(np.percentile(total, 99))
-        var_995 = float(np.percentile(total, 99.5))
-        cvar_99_threshold = np.percentile(total, 99)
-        tail = total[total >= cvar_99_threshold]
-        cvar_99 = float(tail.mean()) if len(tail) > 0 else var_99
-
-        return pd.DataFrame([{
-            "best_estimate_M":       round(best_estimate, 3),
-            "var_95_M":              round(float(np.percentile(total, 95)), 3),
-            "var_99_M":              round(var_99, 3),
-            "var_995_M":             round(var_995, 3),
-            "cvar_99_M":             round(cvar_99, 3),
-            "reserve_risk_capital_M": round(var_995 - best_estimate, 3),
-            "max_ibnr_M":            round(float(total.max()), 3),
-            "n_replications_used":   n_replications,
-            "scenario":              scenario,
-        }])
-
-
-# Validate locally
-_boot_baseline_input = pd.DataFrame([{
-    "mean_ibnr_personal_auto_M": round(_cl_results['Personal_Auto']['total_ibnr'] / 1e6, 2),
-    "mean_ibnr_commercial_auto_M": round(_cl_results['Commercial_Auto']['total_ibnr'] / 1e6, 2),
-    "mean_ibnr_homeowners_M": round(_cl_results['Homeowners']['total_ibnr'] / 1e6, 2),
-    "mean_ibnr_commercial_property_M": round(_cl_results['Commercial_Property']['total_ibnr'] / 1e6, 2),
-    "cv_personal_auto": 0.15,
-    "cv_commercial_auto": 0.18,
-    "cv_homeowners": 0.12,
-    "cv_commercial_property": 0.20,
-    "n_replications": 50_000,
-    "scenario": "baseline",
-    "ldf_multiplier": 1.0,
-    "inflation_adj": 0.0,
-}])
-
-_boot_pyfunc = BootstrapReservePyFunc()
-_boot_result = _boot_pyfunc.predict(None, _boot_baseline_input)
-print("Bootstrap Reserve Simulator validation (50,000 replications):")
-print(_boot_result.to_string(index=False))
-
-# COMMAND ----------
-
-# ── Register Bootstrap Reserve Simulator to UC ────────────────────────────────
-_BOOT_MODEL_NAME = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
-mlflow.set_experiment(f"/Users/{_current_user}/actuarial_workshop_bootstrap_reserve_simulator")
-
-_boot_reg_dataset = mlflow.data.load_delta(
-    table_name=f"{CATALOG}.{SCHEMA}.gold_reserve_triangle",
-    name="gold_reserve_triangle",
-)
-
-_boot_input_schema = mlflow.types.Schema([
-    mlflow.types.ColSpec("double",  "mean_ibnr_personal_auto_M"),
-    mlflow.types.ColSpec("double",  "mean_ibnr_commercial_auto_M"),
-    mlflow.types.ColSpec("double",  "mean_ibnr_homeowners_M"),
-    mlflow.types.ColSpec("double",  "mean_ibnr_commercial_property_M"),
-    mlflow.types.ColSpec("double",  "cv_personal_auto"),
-    mlflow.types.ColSpec("double",  "cv_commercial_auto"),
-    mlflow.types.ColSpec("double",  "cv_homeowners"),
-    mlflow.types.ColSpec("double",  "cv_commercial_property"),
-    mlflow.types.ColSpec("long",    "n_replications"),
-    mlflow.types.ColSpec("string",  "scenario"),
-    mlflow.types.ColSpec("double",  "ldf_multiplier"),
-    mlflow.types.ColSpec("double",  "inflation_adj"),
-])
-_boot_output_schema = mlflow.types.Schema([
-    mlflow.types.ColSpec("double", "best_estimate_M"),
-    mlflow.types.ColSpec("double", "var_95_M"),
-    mlflow.types.ColSpec("double", "var_99_M"),
-    mlflow.types.ColSpec("double", "var_995_M"),
-    mlflow.types.ColSpec("double", "cvar_99_M"),
-    mlflow.types.ColSpec("double", "reserve_risk_capital_M"),
-    mlflow.types.ColSpec("double", "max_ibnr_M"),
-    mlflow.types.ColSpec("long",   "n_replications_used"),
-    mlflow.types.ColSpec("string", "scenario"),
-])
-_boot_signature = mlflow.models.ModelSignature(inputs=_boot_input_schema, outputs=_boot_output_schema)
-
-with mlflow.start_run(run_name="bootstrap_reserve_simulator_champion") as _boot_reg_run:
-    mlflow.log_input(_boot_reg_dataset, context="training")
-
-    mlflow.set_tags({
-        "model_class":     "BootstrapReservePyFunc",
-        "method":          "Bootstrap Chain Ladder",
-        "workshop_module": "3",
-        "audience":        "actuarial-workshop",
-    })
-    mlflow.log_params({
-        'n_product_lines': 4,
-        'default_n_replications': 50_000,
-        'scenarios': 'baseline,adverse_development,judicial_inflation,pandemic_tail,superimposed_inflation',
-    })
-
-    _br = _boot_result.iloc[0]
-    mlflow.log_metrics({
-        "baseline_best_estimate_M":    float(_br["best_estimate_M"]),
-        "baseline_var_99_M":           float(_br["var_99_M"]),
-        "baseline_var_995_M":          float(_br["var_995_M"]),
-        "baseline_cvar_99_M":          float(_br["cvar_99_M"]),
-        "baseline_reserve_risk_cap_M": float(_br["reserve_risk_capital_M"]),
-    })
-
-    mlflow.pyfunc.log_model(
-        artifact_path="bootstrap_reserve_pyfunc",
-        python_model=BootstrapReservePyFunc(),
-        signature=_boot_signature,
-        registered_model_name=_BOOT_MODEL_NAME,
-        pip_requirements=[
-            f"scipy=={scipy.__version__}",
-            f"numpy=={np.__version__}",
-        ],
-    )
-
-    print(f"\nBootstrap Reserve Simulator registered to: {_BOOT_MODEL_NAME}")
-
-_boot_versions = _client.search_model_versions(f"name='{_BOOT_MODEL_NAME}'")
-_boot_latest_ver = max(int(v.version) for v in _boot_versions)
-_client.set_registered_model_alias(name=_BOOT_MODEL_NAME, alias="Champion", version=_boot_latest_ver)
-_client.set_model_version_tag(name=_BOOT_MODEL_NAME, version=str(_boot_latest_ver),
-                              key="approved_by", value="actuarial-workshop-demo")
-print(f"Set @Champion → version {_boot_latest_ver}")
+print(f"Reserve validation saved → {CATALOG}.{MODELS_SCHEMA}.predictions_reserve_validation")
 
 # COMMAND ----------
 

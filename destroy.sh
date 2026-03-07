@@ -50,7 +50,9 @@ PROFILE=$(_ws profile)
 WORKSPACE_HOST=$(echo "$VALIDATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',{}).get('host','').rstrip('/'))")
 CURRENT_USER=$(echo "$VALIDATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',{}).get('current_user',{}).get('userName',''))")
 CATALOG=$(_var catalog)
-SCHEMA=$(_var schema)
+DATA_SCHEMA=$(_var data_schema)
+MODELS_SCHEMA=$(_var models_schema)
+APP_SCHEMA=$(_var app_schema)
 ENDPOINT_NAME=$(_var endpoint_name)
 MC_ENDPOINT_NAME=$(_var mc_endpoint_name)
 WAREHOUSE_ID=$(_var warehouse_id)
@@ -59,7 +61,7 @@ GENIE_SPACE_ID=$(_var genie_space_id)
 PROFILE_ARGS=()
 [ -n "$PROFILE" ] && PROFILE_ARGS=(--profile "$PROFILE")
 
-echo "    Host: ${WORKSPACE_HOST}  Catalog: ${CATALOG}.${SCHEMA}"
+echo "    Host: ${WORKSPACE_HOST}  Catalog: ${CATALOG} (schemas: ${DATA_SCHEMA}, ${MODELS_SCHEMA}, ${APP_SCHEMA})"
 
 TOKEN=$(databricks auth token --host "${WORKSPACE_HOST}" "${PROFILE_ARGS[@]}" 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || echo "")
@@ -81,13 +83,15 @@ api_delete() {
     esac
 }
 
-# 2a. Drop UC schema (CASCADE)
-if [ -n "$WAREHOUSE_ID" ] && [ -n "$CATALOG" ] && [ -n "$SCHEMA" ]; then
-    echo "    Dropping ${CATALOG}.${SCHEMA} (CASCADE)..."
-    python3 - <<PYEOF
+# 2a. Drop UC schemas (CASCADE)
+if [ -n "$WAREHOUSE_ID" ] && [ -n "$CATALOG" ]; then
+    for _SCHEMA in "$APP_SCHEMA" "$MODELS_SCHEMA" "$DATA_SCHEMA"; do
+        [ -z "$_SCHEMA" ] && continue
+        echo "    Dropping ${CATALOG}.${_SCHEMA} (CASCADE)..."
+        python3 - <<PYEOF
 import json, time, sys, urllib.request, urllib.error
 host, token, wh_id = "${WORKSPACE_HOST}", "${TOKEN}", "${WAREHOUSE_ID}"
-catalog, schema = "${CATALOG}", "${SCHEMA}"
+catalog, schema = "${CATALOG}", "${_SCHEMA}"
 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 def req(method, path, body=None):
     data = json.dumps(body).encode() if body else None
@@ -110,18 +114,19 @@ for _ in range(30):
 if state == "SUCCEEDED": print(f"    [OK]   Schema {catalog}.{schema} dropped")
 else: print(f"    [WARN] Schema drop: {state}", file=sys.stderr)
 PYEOF
+    done
 fi
 
 # 2b. Online Table
-api_delete "Online Table" "/api/2.0/online-tables/${CATALOG}.${SCHEMA}.segment_features_online"
+api_delete "Online Table" "/api/2.0/online-tables/${CATALOG}.${MODELS_SCHEMA}.segment_features_online"
 
 # 2c. Serving endpoints
 api_delete "Endpoint ${ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${ENDPOINT_NAME}"
 api_delete "Endpoint ${MC_ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${MC_ENDPOINT_NAME}"
 
 # 2d. UC models
-api_delete "Model frequency_forecaster" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.frequency_forecaster"
-api_delete "Model bootstrap_reserve_simulator" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.bootstrap_reserve_simulator"
+api_delete "Model frequency_forecaster" "/api/2.1/unity-catalog/models/${CATALOG}.${MODELS_SCHEMA}.frequency_forecaster"
+api_delete "Model bootstrap_reserve_simulator" "/api/2.1/unity-catalog/models/${CATALOG}.${MODELS_SCHEMA}.bootstrap_reserve_simulator"
 
 # 2e. Genie space
 if [ -n "$GENIE_SPACE_ID" ]; then
@@ -164,8 +169,8 @@ def req(method, path, body=None):
     try:
         with urllib.request.urlopen(r) as resp: return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b'{}')
-for name in [f"/Users/{user}/actuarial_workshop_frequency_forecaster",
-             f"/Users/{user}/actuarial_workshop_bootstrap_reserve_simulator",
+for name in [f"/Users/{user}/actuarial_workshop_frequency_forecast",
+             f"/Users/{user}/actuarial_workshop_bootstrap_reserves",
              "/Shared/actuarial-workshop-app-traces"]:
     status, data = req("GET", f"/api/2.0/mlflow/experiments/get-by-name?experiment_name={urllib.parse.quote(name)}")
     if status == 404 or "experiment" not in data:

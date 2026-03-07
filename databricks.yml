@@ -6,9 +6,17 @@ variables:
     description: "Unity Catalog catalog name — must already exist"
     default: my_catalog
 
-  schema:
-    description: "UC schema name — will be created if it does not exist"
-    default: actuarial_workshop
+  data_schema:
+    description: "UC schema for data pipeline tables (raw → bronze → silver → gold + features)"
+    default: actuarial_data
+
+  models_schema:
+    description: "UC schema for model outputs (predictions, UC models, monitoring)"
+    default: actuarial_models
+
+  app_schema:
+    description: "UC schema for app consumption (Lakebase synced tables)"
+    default: actuarial_app
 
   endpoint_name:
     description: "Name for the Frequency Forecaster Model Serving endpoint"
@@ -62,7 +70,9 @@ targets:
     mode: development
     variables:
       catalog: my_catalog
-      schema: actuarial_workshop
+      data_schema: actuarial_data
+      models_schema: actuarial_models
+      app_schema: actuarial_app
 
   # ── Add your workspace target in databricks.local.yml (gitignored) ───────────
   # See databricks.local.yml.example for a template.

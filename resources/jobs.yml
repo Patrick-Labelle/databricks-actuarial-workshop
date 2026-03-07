@@ -3,6 +3,11 @@
 #   1. actuarial_workshop_setup     — one-time full setup (Modules 1–5)
 #   2. actuarial_workshop_refresh   — monthly model refresh (SDP pipeline + Module 4)
 #
+# Schema layout:
+#   - data_schema:   medallion pipeline (raw → bronze → silver → gold + features)
+#   - models_schema: model outputs (predictions, UC models, AI Gateway monitoring)
+#   - app_schema:    app consumption (Lakebase synced tables)
+#
 # All tasks run on the classic ML cluster (ray_ml_cluster) — single cluster spin-up,
 # no per-task cold starts. Required for Ray-on-Spark, applyInPandas, psycopg2,
 # FeatureEngineeringClient, and workspace file access for code_paths.
@@ -34,32 +39,26 @@ resources:
 
         # Task 1 — Generate synthetic source data (reserve CDC + claim events)
         - task_key: generate_source_data
-          description: "Generate synthetic reserve CDC + claims data → raw_reserve_development, raw_claims_events"
+          description: "Generate synthetic reserve CDC + claims data → data_schema"
           job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/01_data_pipeline.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              schema: "${var.data_schema}"
               notification_email: "${var.notification_email}"
 
         # Task 1b — Fetch real macro data from Statistics Canada
-        # Runs in parallel with generate_source_data — both handle schema creation
-        # independently (CREATE SCHEMA IF NOT EXISTS). Must complete before
-        # run_dlt_pipeline so that raw_macro_indicators is populated when the
-        # SDP bronze_macro_indicators streaming table runs.
         - task_key: fetch_macro_data
-          description: "Fetch StatCan unemployment, HPI, housing starts → raw_macro_indicators"
+          description: "Fetch StatCan unemployment, HPI, housing starts → data_schema"
           job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              schema: "${var.data_schema}"
 
         # Task 2 — Run the declarative pipeline (Bronze → Silver → Gold)
-        # full_refresh: true because generate_source_data recreates source tables via
-        # CREATE OR REPLACE TABLE, which invalidates any existing streaming checkpoint.
         - task_key: run_dlt_pipeline
           description: "SDP: Bronze → Silver (SCD Type 2) → Gold (reserve triangle + claims + macro)"
           depends_on:
@@ -69,9 +68,9 @@ resources:
             pipeline_id: "${resources.pipelines.actuarial_workshop_dlt.id}"
             full_refresh: true
 
-        # Task 3 — Register Feature Store table (Module 3)
+        # Task 3 — Register Feature Store table (Module 2)
         - task_key: build_feature_store
-          description: "UC Feature Store registration (Online Table created by Module 5)"
+          description: "UC Feature Store registration → data_schema"
           depends_on:
             - task_key: run_dlt_pipeline
           job_cluster_key: ray_ml_cluster
@@ -79,12 +78,12 @@ resources:
             notebook_path: ../src/02_feature_store.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              schema: "${var.data_schema}"
               warehouse_id: "${var.warehouse_id}"
 
-        # Task 4 — Fit SARIMAX / GARCH / Bootstrap Chain Ladder + register models (Module 4)
+        # Task 4 — Fit SARIMAX / GARCH / Bootstrap Chain Ladder + register models
         - task_key: fit_statistical_models
-          description: "SARIMAX/GARCH/Bootstrap Chain Ladder + register both models (Frequency + Bootstrap) to UC"
+          description: "SARIMAX/GARCH/Bootstrap Chain Ladder → models_schema; reads from data_schema"
           depends_on:
             - task_key: build_feature_store
           job_cluster_key: ray_ml_cluster
@@ -92,11 +91,12 @@ resources:
             notebook_path: ../src/03_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"
 
         # Task 4b — Set UC table & column descriptions for Genie / lineage
         - task_key: set_table_metadata
-          description: "Add human-readable descriptions to all UC tables and columns (inherited by Genie spaces)"
+          description: "Add human-readable descriptions to all UC tables and columns"
           depends_on:
             - task_key: fit_statistical_models
           job_cluster_key: ray_ml_cluster
@@ -104,9 +104,10 @@ resources:
             notebook_path: ../src/ops/set_table_metadata.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"
 
-        # Task 5 — Prepare all app infrastructure (Module 5)
+        # Task 5 — Prepare all app infrastructure (Module 4)
         - task_key: prepare_app_infrastructure
           description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup, Genie Space"
           depends_on:
@@ -116,7 +117,8 @@ resources:
             notebook_path: ../src/04_model_serving.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"
               endpoint_name: "${var.endpoint_name}"
               mc_endpoint_name: "${var.mc_endpoint_name}"
               warehouse_id: "${var.warehouse_id}"
@@ -126,7 +128,7 @@ resources:
 
         # Task 6 — App setup: UC grants + model serving endpoint grants
         - task_key: setup_app_dependencies
-          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP; grant CAN_QUERY on all serving endpoints"
+          description: "Grant USE CATALOG/SCHEMA/SELECT to app SP on all 3 schemas"
           depends_on:
             - task_key: prepare_app_infrastructure
           job_cluster_key: ray_ml_cluster
@@ -134,7 +136,9 @@ resources:
             notebook_path: ../src/ops/app_setup.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"
+              app_schema: "${var.app_schema}"
               app_sp_client_id: "${resources.apps.actuarial_workshop_app.service_principal_client_id}"
               endpoint_name: "${var.endpoint_name}"
               mc_endpoint_name: "${var.mc_endpoint_name}"
@@ -142,7 +146,6 @@ resources:
 
 
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
-    # Scheduled job: refreshes data via the declarative pipeline then re-fits the SARIMA models.
     actuarial_workshop_refresh:
       name: "Actuarial Workshop — Monthly Model Refresh"
       description: >-
@@ -167,13 +170,13 @@ resources:
       tasks:
 
         - task_key: fetch_macro_data
-          description: "Fetch latest StatCan macro indicators → raw_macro_indicators"
+          description: "Fetch latest StatCan macro indicators → data_schema"
           job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../scripts/fetch_macro_data.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              schema: "${var.data_schema}"
 
         - task_key: refresh_dlt_pipeline
           description: "Refresh Bronze→Silver→Gold via SDP Apply Changes (incl. macro SCD2)"
@@ -192,7 +195,8 @@ resources:
             notebook_path: ../src/03_classical_stats_at_scale.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"
 
         - task_key: set_table_metadata
           description: "Refresh UC table and column descriptions"
@@ -203,4 +207,5 @@ resources:
             notebook_path: ../src/ops/set_table_metadata.py
             base_parameters:
               catalog: "${var.catalog}"
-              schema: "${var.schema}"
+              data_schema: "${var.data_schema}"
+              models_schema: "${var.models_schema}"

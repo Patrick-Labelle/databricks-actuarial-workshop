@@ -9,9 +9,9 @@ resources:
   pipelines:
     actuarial_workshop_dlt:
       name: "actuarial-workshop-medallion"
-      # Unity Catalog target — tables are created in ${var.catalog}.${var.schema}
+      # Unity Catalog target — pipeline tables go to the data schema
       catalog: "${var.catalog}"
-      target: "${var.schema}"
+      target: "${var.data_schema}"
 
       # Serverless preferred; falls back gracefully to classic compute
       serverless: true
@@ -21,7 +21,7 @@ resources:
       # These key-value pairs are accessible in the notebook via spark.conf.get()
       configuration:
         catalog: "${var.catalog}"
-        schema: "${var.schema}"
+        schema: "${var.data_schema}"
         notification_email: "${var.notification_email}"
 
       libraries:

@@ -55,7 +55,7 @@ warnings.filterwarnings("ignore")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
-dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
+dbutils.widgets.text("schema",           "actuarial_data",                       "UC Schema")
 dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster Endpoint")
 dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves Endpoint")
 dbutils.widgets.text("warehouse_id",     "",                                     "SQL Warehouse ID")

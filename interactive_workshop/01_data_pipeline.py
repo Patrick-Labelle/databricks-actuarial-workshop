@@ -74,11 +74,11 @@ from pyspark.sql.types import StructType, StructField, IntegerType, StringType, 
 # (base_parameters in resources/jobs.yml, or the defaults below).
 if IN_PIPELINE:
     CATALOG            = spark.conf.get("catalog",             "my_catalog")
-    SCHEMA             = spark.conf.get("schema",              "actuarial_workshop")
+    SCHEMA             = spark.conf.get("schema",              "actuarial_data")
     NOTIFICATION_EMAIL = spark.conf.get("notification_email", "")
 else:
     dbutils.widgets.text("catalog",            "my_catalog",         "UC Catalog")
-    dbutils.widgets.text("schema",             "actuarial_workshop", "UC Schema")
+    dbutils.widgets.text("schema",             "actuarial_data", "UC Schema")
     dbutils.widgets.text("notification_email", "",                   "Notification Email")
     CATALOG            = dbutils.widgets.get("catalog")
     SCHEMA             = dbutils.widgets.get("schema")

@@ -48,7 +48,7 @@ from pyspark.sql.window import Window
 # ─── Configuration ────────────────────────────────────────────────────────────
 # Passed as base_parameters by the bundle job; defaults used when interactive.
 dbutils.widgets.text("catalog",      "my_catalog",         "UC Catalog")
-dbutils.widgets.text("schema",       "actuarial_workshop", "UC Schema")
+dbutils.widgets.text("schema",       "actuarial_data", "UC Schema")
 dbutils.widgets.text("warehouse_id", "",                   "SQL Warehouse ID")
 CATALOG       = dbutils.widgets.get("catalog")
 SCHEMA        = dbutils.widgets.get("schema")

@@ -76,7 +76,7 @@
 # MAGIC       root_path: /Shared/.bundle/${bundle.name}/staging
 # MAGIC     variables:
 # MAGIC       catalog:  staging_catalog
-# MAGIC       schema:   actuarial_workshop
+# MAGIC       schema:   actuarial_data
 # MAGIC
 # MAGIC   production:
 # MAGIC     workspace:
@@ -84,7 +84,7 @@
 # MAGIC       root_path: /Shared/.bundle/${bundle.name}/prod
 # MAGIC     variables:
 # MAGIC       catalog:  your_catalog          # or your production catalog
-# MAGIC       schema:   actuarial_workshop
+# MAGIC       schema:   actuarial_data
 # MAGIC ```
 
 # COMMAND ----------
@@ -98,7 +98,7 @@
 # MAGIC   catalog:
 # MAGIC     default: your_catalog
 # MAGIC   schema:
-# MAGIC     default: actuarial_workshop
+# MAGIC     default: actuarial_data
 # MAGIC
 # MAGIC resources:
 # MAGIC   jobs:
