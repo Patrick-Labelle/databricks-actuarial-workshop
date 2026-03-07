@@ -11,12 +11,12 @@ variables:
     default: actuarial_workshop
 
   endpoint_name:
-    description: "Name for the SARIMA Model Serving endpoint"
-    default: actuarial-workshop-sarima-forecaster
+    description: "Name for the Frequency Forecaster Model Serving endpoint"
+    default: actuarial-workshop-frequency-forecaster
 
   mc_endpoint_name:
-    description: "Name for the Monte Carlo portfolio risk serving endpoint"
-    default: actuarial-workshop-monte-carlo
+    description: "Name for the Bootstrap Reserve simulation serving endpoint"
+    default: actuarial-workshop-bootstrap-reserves
 
   warehouse_id:
     description: "SQL Warehouse ID for the Statement Execution API (used by the app)"

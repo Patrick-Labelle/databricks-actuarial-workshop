@@ -11,11 +11,11 @@ from constants import SCENARIO_TYPES, APPROVAL_STATUSES
 
 def render(tab):
     with tab:
-        st.subheader("Claims Volume Forecast by Product & Region")
+        st.subheader("Reserve Development Forecast by Product & Region")
 
         with st.expander("ℹ️ About this forecast", expanded=False):
             st.markdown("""
-**What this shows:** Projected monthly claim volumes for the selected product line and region, based on 7 years of historical claims data (Jan 2019 – Dec 2025).
+**What this shows:** Projected monthly claim frequency for the selected product line and region, based on 7 years of historical data (Jan 2019 – Dec 2025). Claim frequency drives the exposure base for reserve projections.
 
 **The shaded band** is the forecast uncertainty range — the model expects 95% of actual future months to fall within this range. A wider band means higher uncertainty, which is normal for longer forecast horizons.
 

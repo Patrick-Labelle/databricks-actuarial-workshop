@@ -22,14 +22,15 @@ from config import (
 # ── Data query tool (SQL via warehouse) ──────────────────────────────────────
 
 AVAILABLE_TABLES = {
-    "predictions_sarima": "Monthly SARIMA+GARCH forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
-    "predictions_monte_carlo": "Portfolio-level Monte Carlo simulation results. Columns: mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M.",
-    "predictions_stress_scenarios": "Pre-computed stress test comparisons. Columns: scenario_label, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
-    "predictions_risk_timeline": "12-month SARIMA-driven VaR evolution. Columns: forecast_month, month_idx, total_mean_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
-    "predictions_surplus_evolution": "Multi-period surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
+    "predictions_frequency_forecast": "Monthly SARIMAX+GARCH frequency forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
+    "predictions_bootstrap_reserves": "Portfolio-level Bootstrap Chain Ladder reserve distribution. Columns: best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, max_ibnr_M.",
+    "predictions_reserve_scenarios": "Pre-computed reserve deterioration scenarios. Columns: scenario_label, best_estimate_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
+    "predictions_reserve_evolution": "12-month reserve adequacy evolution. Columns: forecast_month, month_idx, best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, var_995_vs_baseline.",
+    "predictions_runoff_projection": "Multi-period run-off surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
+    "predictions_ldf_volatility": "Development factor volatility per product line. Columns: product_line, avg_ldf, std_ldf, n_factors.",
     "predictions_reserve_validation": "Reserve adequacy validation. Columns: segment_id, accident_month, reserve_adequacy_ratio.",
-    "gold_claims_monthly": "Historical monthly claims aggregated by segment. Columns: segment_id, product_line, region, month, claims_count, total_incurred, avg_severity.",
-    "gold_reserve_triangle": "Loss development triangle. Columns: segment_id, product_line, region, accident_month, dev_lag, cumulative_paid, cumulative_incurred, case_reserve.",
+    "gold_claims_monthly": "Historical monthly claims aggregated by segment. Columns: segment_id, product_line, region, month, claims_count, total_incurred, avg_severity, earned_premium.",
+    "gold_reserve_triangle": "Loss development triangle. Columns: segment_id, product_line, region, accident_month, dev_lag, cumulative_paid, cumulative_incurred, case_reserve, incremental_paid, incremental_incurred.",
     "silver_reserves": "SCD Type 2 reserve development. Columns: reserve_id, segment_id, accident_month, dev_lag, paid_cumulative, incurred_cumulative, case_reserve, effective_date, end_date, is_current.",
     "silver_rolling_features": "Rolling statistical features per segment. Columns: segment_id, month, claims_count, rolling_mean_3m, rolling_std_3m, rolling_mean_6m, rolling_std_6m, yoy_change.",
     "features_segment_monthly": "Feature Store table with macro features. Columns: segment_id, month, claims_count, plus rolling and macro-economic features.",
@@ -42,11 +43,12 @@ def query_data(sql_query: str) -> str:
     Args:
         sql_query: A SELECT query against the actuarial workshop tables.
             Available tables (all in {catalog}.{schema}):
-            - predictions_sarima: Monthly SARIMA+GARCH forecasts per segment
-            - predictions_monte_carlo: Portfolio Monte Carlo simulation results
-            - predictions_stress_scenarios: Pre-computed stress tests
-            - predictions_risk_timeline: 12-month VaR evolution
-            - predictions_surplus_evolution: Multi-period surplus trajectory
+            - predictions_frequency_forecast: Monthly SARIMAX+GARCH forecasts per segment
+            - predictions_bootstrap_reserves: Bootstrap Chain Ladder reserve distribution
+            - predictions_reserve_scenarios: Pre-computed reserve deterioration scenarios
+            - predictions_reserve_evolution: 12-month reserve adequacy evolution
+            - predictions_runoff_projection: Run-off surplus trajectory
+            - predictions_ldf_volatility: Development factor volatility
             - gold_claims_monthly: Historical monthly claims by segment
             - gold_reserve_triangle: Loss development triangle
             - silver_reserves: SCD2 reserve development
@@ -97,10 +99,10 @@ def query_data(sql_query: str) -> str:
         return f"SQL execution error: {e}"
 
 
-# ── SARIMA forecast tool ─────────────────────────────────────────────────────
+# ── Frequency forecast tool ──────────────────────────────────────────────────
 
-def run_sarima_forecast(horizon: int) -> str:
-    """Generate an on-demand SARIMA claims forecast for the portfolio.
+def run_frequency_forecast(horizon: int) -> str:
+    """Generate an on-demand SARIMAX frequency forecast for the portfolio.
 
     Args:
         horizon: Number of months ahead to forecast (1-24).
@@ -121,98 +123,87 @@ def run_sarima_forecast(horizon: int) -> str:
         )
         if response.predictions:
             df = pd.DataFrame(response.predictions)
-            return f"SARIMA Forecast ({horizon} months):\n\n{df.to_markdown(index=False)}"
+            return f"Frequency Forecast ({horizon} months):\n\n{df.to_markdown(index=False)}"
         return "Endpoint returned no predictions."
     except Exception as e:
-        return f"SARIMA endpoint error: {e}"
+        return f"Frequency forecast endpoint error: {e}"
 
 
-# ── Monte Carlo simulation tool ──────────────────────────────────────────────
+# ── Bootstrap reserve simulation tool ────────────────────────────────────────
 
-def run_monte_carlo(
-    mean_property_M: float = 12.5,
-    mean_auto_M: float = 8.3,
-    mean_liability_M: float = 5.7,
-    cv_property: float = 0.35,
-    cv_auto: float = 0.28,
-    cv_liability: float = 0.42,
-    corr_prop_auto: float = 0.40,
-    corr_prop_liab: float = 0.20,
-    corr_auto_liab: float = 0.30,
-    n_scenarios: int = 10_000,
-    copula_df: int = 4,
-    model_type: str = "aggregate",
-    simulation_mode: str = "single_period",
+def run_bootstrap_reserve(
+    scenario: str = "baseline",
+    ldf_multiplier: float = 1.0,
+    inflation_adj: float = 0.0,
+    cv_personal_auto: float = 0.15,
+    cv_commercial_auto: float = 0.18,
+    cv_homeowners: float = 0.12,
+    cv_commercial_property: float = 0.20,
+    n_replications: int = 50_000,
 ) -> str:
-    """Run a Monte Carlo portfolio loss simulation with custom parameters.
+    """Run a Bootstrap Chain Ladder reserve simulation with custom parameters.
 
-    Use this to answer "what if" questions about capital requirements under
-    different assumptions. Default values represent the baseline scenario.
+    Use this to answer "what if" questions about reserve adequacy under
+    different reserve deterioration assumptions. Default values represent the
+    baseline scenario.
 
-    Supports two model types:
-    - "aggregate" (default): t-Copula + Lognormal Marginals (standard formula)
-    - "collective_risk": Frequency-Severity bottom-up (internal model)
-
-    And two simulation modes:
-    - "single_period" (default): Single annual loss distribution
-    - "multi_period": 12-month surplus evolution with regime-switching
+    Supports scenarios:
+    - "baseline" (default): Standard reserve development
+    - "adverse_development": LDFs inflated — reserves develop worse than expected
+    - "judicial_inflation": Social inflation / nuclear verdicts on Auto lines
+    - "pandemic_tail": Extended development periods due to delayed settlements
+    - "superimposed_inflation": Calendar-year trend (CPI + X%) across all lines
 
     Args:
-        mean_property_M: Expected annual property loss in $M (default: 12.5).
-        mean_auto_M: Expected annual auto loss in $M (default: 8.3).
-        mean_liability_M: Expected annual liability loss in $M (default: 5.7).
-        cv_property: Coefficient of variation for property (default: 0.35).
-        cv_auto: Coefficient of variation for auto (default: 0.28).
-        cv_liability: Coefficient of variation for liability (default: 0.42).
-        corr_prop_auto: Correlation between property and auto (default: 0.40).
-        corr_prop_liab: Correlation between property and liability (default: 0.20).
-        corr_auto_liab: Correlation between auto and liability (default: 0.30).
-        n_scenarios: Number of simulation paths (default: 10000).
-        copula_df: Degrees of freedom for t-copula (default: 4).
-        model_type: "aggregate" for t-Copula or "collective_risk" for frequency-severity (default: aggregate).
-        simulation_mode: "single_period" for annual loss or "multi_period" for surplus evolution (default: single_period).
+        scenario: Reserve scenario type (default: baseline).
+        ldf_multiplier: LDF multiplier — values above 1.0 inflate development factors (default: 1.0).
+        inflation_adj: Calendar-year superimposed inflation rate (default: 0.0).
+        cv_personal_auto: Reserve volatility for Personal Auto (default: 0.15).
+        cv_commercial_auto: Reserve volatility for Commercial Auto (default: 0.18).
+        cv_homeowners: Reserve volatility for Homeowners (default: 0.12).
+        cv_commercial_property: Reserve volatility for Commercial Property (default: 0.20).
+        n_replications: Number of bootstrap replications (default: 10000).
 
     Returns:
-        Risk metrics including Expected Loss, VaR 99%, SCR (VaR 99.5%),
-        CVaR 99%, and maximum simulated loss.
+        Reserve risk metrics including Best Estimate IBNR, VaR 99%, Reserve Risk
+        Capital (VaR 99.5%), CVaR 99%, and maximum simulated IBNR.
     """
     w = get_workspace_client()
     if w is None:
         return "Error: Databricks SDK not available."
 
-    scenario = {
-        "mean_property_M": mean_property_M,
-        "mean_auto_M": mean_auto_M,
-        "mean_liability_M": mean_liability_M,
-        "cv_property": cv_property,
-        "cv_auto": cv_auto,
-        "cv_liability": cv_liability,
-        "corr_prop_auto": corr_prop_auto,
-        "corr_prop_liab": corr_prop_liab,
-        "corr_auto_liab": corr_auto_liab,
-        "n_scenarios": n_scenarios,
-        "copula_df": copula_df,
-        "model_type": model_type,
-        "simulation_mode": simulation_mode,
+    params = {
+        "scenario": scenario,
+        "ldf_multiplier": ldf_multiplier,
+        "inflation_adj": inflation_adj,
+        "cv_personal_auto": cv_personal_auto,
+        "cv_commercial_auto": cv_commercial_auto,
+        "cv_homeowners": cv_homeowners,
+        "cv_commercial_property": cv_commercial_property,
+        "n_replications": n_replications,
+        "mean_ibnr_personal_auto_M": 7200.0,
+        "mean_ibnr_commercial_auto_M": 4000.0,
+        "mean_ibnr_homeowners_M": 5900.0,
+        "mean_ibnr_commercial_property_M": 2700.0,
     }
 
     try:
         response = w.serving_endpoints.query(
             name=MC_ENDPOINT_NAME,
-            dataframe_records=[scenario],
+            dataframe_records=[params],
         )
         if response.predictions:
             p = response.predictions[0] if isinstance(response.predictions, list) else response.predictions
-            lines = ["Monte Carlo Simulation Results:", ""]
+            lines = ["Bootstrap Reserve Simulation Results:", ""]
             for k, v in p.items():
                 if isinstance(v, (int, float)):
-                    lines.append(f"- **{k}**: {v:.2f}M")
+                    lines.append(f"- **{k}**: {'${:.1f}B'.format(v/1000) if abs(v) >= 1000 else '${:.2f}M'.format(v)}")
                 else:
                     lines.append(f"- **{k}**: {v}")
             return "\n".join(lines)
         return "Endpoint returned no predictions."
     except Exception as e:
-        return f"Monte Carlo endpoint error: {e}"
+        return f"Bootstrap reserve endpoint error: {e}"
 
 
 # ── Lakebase annotations tool ────────────────────────────────────────────────
@@ -345,6 +336,6 @@ def ask_genie(question: str) -> str:
 
 # ── Tool registry ────────────────────────────────────────────────────────────
 
-TOOLS = [ask_genie, query_data, run_sarima_forecast, run_monte_carlo, query_annotations]
+TOOLS = [ask_genie, query_data, run_frequency_forecast, run_bootstrap_reserve, query_annotations]
 
 TOOL_MAP = {fn.__name__: fn for fn in TOOLS}

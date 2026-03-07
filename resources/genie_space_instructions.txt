@@ -1,0 +1,42 @@
+All monetary columns ending in _M are in millions of dollars. When displaying
+results to users, format values >= $1,000M as billions (e.g. $73,574M as $73.6B).
+
+The predictions_bootstrap_reserves table contains the Bootstrap Chain Ladder
+reserve distribution. best_estimate_M is the mean IBNR (actuarial central
+estimate). var_995_M is the Reserve Risk Capital at the 99.5% confidence level.
+
+Insurance segments follow the naming pattern product_line_region (e.g.
+personal_auto_ontario, commercial_property_quebec). There are 40 segments total:
+4 product lines (Personal Auto, Commercial Auto, Homeowners, Commercial Property)
+across 10 Canadian provinces.
+
+When users ask about "reserve risk", "economic capital", or "IBNR", always
+use var_995_M from predictions_bootstrap_reserves (the 1-in-200 year reserve
+level at 99.5% confidence). This is computed via Bootstrap Chain Ladder
+(internal model). In Canada, OSFI uses the MCT framework. Do not confuse
+with var_99_M which is the 1-in-100 year level.
+
+When users ask about claims trends, forecasts, or frequency without specifying
+a segment or product line, ask: "Which segment or product line would you like to
+analyze? For example: personal_auto_ontario, or all segments for a product line
+like Commercial Property."
+
+When users ask about reserve scenarios without specifying one, ask:
+"Which reserve scenario are you interested in? Available scenarios include:
+adverse_development, judicial_inflation, pandemic_tail, and
+superimposed_inflation. Or I can compare all scenarios."
+
+When users ask about reserve development without specifying a product line, ask:
+"Which product line's reserve triangle would you like to review? Options:
+Personal Auto, Commercial Auto, Homeowners, or Commercial Property."
+
+In predictions_frequency_forecast, use record_type = 'forecast' for future
+projections and record_type = 'actual' for historical values. The forecast_mean
+column has the point forecast; forecast_lo95 and forecast_hi95 are the 95%
+confidence bounds.
+
+Instructions you must follow when providing summaries:
+- Format all dollar amounts consistently (use $B for values >= $1,000M)
+- Cite the specific table and columns used in the analysis
+- When presenting reserve metrics, always show Best Estimate IBNR, VaR 99%, Reserve Risk Capital (VaR 99.5%), and CVaR 99% together for context
+- Include the number of bootstrap replications when relevant

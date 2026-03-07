@@ -10,7 +10,7 @@
 # MAGIC
 # MAGIC This module prepares **every service the Streamlit app needs** before it launches:
 # MAGIC
-# MAGIC 1. **Model Serving Endpoints** — Deploy SARIMA and Monte Carlo as REST APIs
+# MAGIC 1. **Model Serving Endpoints** — Deploy Frequency Forecaster and Bootstrap Reserve Simulator as REST APIs
 # MAGIC 2. **AI Gateway** — Inference tables, usage tracking, rate limits
 # MAGIC 3. **Online Table** — Low-latency feature lookup from the Feature Store
 # MAGIC 4. **Lakebase (Managed PostgreSQL)** — Database, table, and SP grants for analyst annotations
@@ -22,8 +22,8 @@
 # MAGIC
 # MAGIC | Service | What the App Does | Created Here |
 # MAGIC |---|---|---|
-# MAGIC | SARIMA endpoint | Calls for per-segment claim forecasts (Forecasts tab) | Section 1 |
-# MAGIC | Monte Carlo endpoint | Runs stressed/baseline portfolio simulations (Risk + Stress tabs) | Section 2 |
+# MAGIC | Frequency Forecaster endpoint | Calls for per-segment claim forecasts (Forecasts tab) | Section 1 |
+# MAGIC | Bootstrap Reserve endpoint | Runs reserve risk simulations (Reserve Adequacy + Scenario tabs) | Section 2 |
 # MAGIC | Online Table | Reads latest rolling features for segment context (sidebar) | Section 3 |
 # MAGIC | Lakebase PostgreSQL | Persists analyst annotations + scenario notes | Section 4 |
 # MAGIC | Genie Space | Natural-language data queries (chatbot Risk Assistant) | Section 5 |
@@ -56,8 +56,8 @@ warnings.filterwarnings("ignore")
 # ─── Configuration ────────────────────────────────────────────────────────────
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
 dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
-dbutils.widgets.text("endpoint_name",    "actuarial-workshop-sarima-forecaster", "SARIMA Endpoint")
-dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-monte-carlo",       "MC Endpoint Name")
+dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster Endpoint")
+dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves Endpoint")
 dbutils.widgets.text("warehouse_id",     "",                                     "SQL Warehouse ID")
 dbutils.widgets.text("pg_database",      "actuarial_workshop_db",                "Lakebase Database")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP Client ID")
@@ -70,8 +70,8 @@ WAREHOUSE_ID     = dbutils.widgets.get("warehouse_id")
 PG_DATABASE      = dbutils.widgets.get("pg_database")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
-SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
-MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.monte_carlo_portfolio"
+SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
+MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
 FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
@@ -186,10 +186,10 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Monte Carlo Serving Endpoint
+# MAGIC ## 2. Bootstrap Reserve Serving Endpoint
 # MAGIC
-# MAGIC Same pattern — CPU endpoint for on-demand scenario analysis. The simulation
-# MAGIC runs entirely on NumPy and SciPy; no GPU acceleration needed.
+# MAGIC Same pattern — CPU endpoint for on-demand reserve risk analysis. The Bootstrap
+# MAGIC Chain Ladder runs entirely on NumPy; no GPU acceleration needed.
 
 # COMMAND ----------
 
@@ -238,7 +238,7 @@ _mc_ai_gateway = {
     "inference_table_config": {
         "catalog_name":      CATALOG,
         "schema_name":       SCHEMA,
-        "table_name_prefix": "monte_carlo_endpoint",
+        "table_name_prefix": "bootstrap_reserve_endpoint",
         "enabled":           True,
     },
     "rate_limits": [{"calls": 20, "renewal_period": "minute"}],
@@ -475,12 +475,88 @@ try:
 except Exception:
     pass
 
+_GENIE_DESCRIPTION = (
+    "Actuarial Risk Analytics for a Canadian P&C Insurance Portfolio.\n\n"
+    "IMPORTANT RULES:\n"
+    "- Economic Capital = VaR at the 99.5% confidence level (var_995_M column). "
+    "This is an internal model result (simulation-based), not the regulatory standard formula.\n"
+    "- All monetary columns ending in _M are in millions of dollars.\n"
+    "- When asked about reserve risk from predictions_bootstrap_reserves, "
+    "SUM across product lines for portfolio totals.\n"
+    "- Insurance segments use the pattern product_line_region (e.g. commercial_auto_ontario).\n"
+    "- Product lines: Personal Auto, Commercial Auto, Homeowners, Commercial Property."
+)
+
+_GENIE_TABLES = [
+    ("features_segment_monthly",
+     ["Feature-engineered table for ML models."]),
+    ("gold_claims_monthly",
+     ["Historical monthly claims by segment. Key columns: claims_count, "
+      "total_incurred, avg_severity, earned_premium."]),
+    ("gold_reserve_triangle",
+     ["Reserve development triangle. Rows=accident periods, columns=development months."]),
+    ("predictions_bootstrap_reserves",
+     ["Bootstrap Chain Ladder reserve results. Key columns: best_estimate_M, "
+      "var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M."]),
+    ("predictions_reserve_evolution",
+     ["12-month reserve adequacy outlook."]),
+    ("predictions_frequency_forecast",
+     ["SARIMAX+GARCH forecasts. Filter record_type='forecast' for future. "
+      "Has forecast_mean, ci_lower_95, ci_upper_95."]),
+    ("predictions_reserve_scenarios",
+     ["Reserve scenarios: baseline, adverse_development, judicial_inflation, "
+      "pandemic_tail, superimposed_inflation."]),
+    ("predictions_runoff_projection",
+     ["Multi-period surplus trajectory with regime-switching."]),
+    ("silver_reserves",
+     ["Reserve development with SCD2 change tracking."]),
+    ("silver_rolling_features",
+     ["Rolling statistical features (12/24-month windows)."]),
+]
+
+import uuid as _uuid
+
+_GENIE_SAMPLE_QUESTIONS = [
+    {"id": _uuid.uuid4().hex, "question": [q]}
+    for q in [
+        "What is the current Economic Capital (VaR 99.5%)?",
+        "Show monthly claims trend for the last 12 months",
+        "Which stress scenario has the highest impact on VaR 99.5%?",
+        "What is the portfolio expected annual loss?",
+        "Compare Property vs Auto segment loss trends",
+    ]
+]
+
+def _build_serialized_space():
+    return json.dumps({
+        "version": 2,
+        "data_sources": {
+            "tables": [
+                {"identifier": f"{CATALOG}.{SCHEMA}.{name}", "description": desc}
+                for name, desc in _GENIE_TABLES
+            ]
+        },
+        "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
+    })
+
 if _genie_space_id and WAREHOUSE_ID:
     try:
         from databricks.sdk import WorkspaceClient
         _gw = WorkspaceClient()
         _gw.genie.get_space(space_id=_genie_space_id)
         print(f"Genie Space already exists: {_genie_space_id}")
+        try:
+            _gw.api_client.do(
+                "PATCH",
+                f"/api/2.0/genie/spaces/{_genie_space_id}",
+                body={
+                    "description": _GENIE_DESCRIPTION,
+                    "serialized_space": _build_serialized_space(),
+                },
+            )
+            print("  Description + table descriptions + sample questions updated.")
+        except Exception as _e:
+            print(f"  Could not update Genie space config: {_e}")
     except Exception:
         print(f"Genie Space {_genie_space_id} not found — will create a new one.")
         _genie_space_id = None
@@ -490,58 +566,15 @@ if WAREHOUSE_ID and not _genie_space_id:
         from databricks.sdk import WorkspaceClient
         _gw = WorkspaceClient()
 
-        _GENIE_TABLES = sorted([
-            {"catalog": CATALOG, "schema": SCHEMA, "table": t}
-            for t in [
-                "gold_claims_monthly", "gold_reserve_triangle",
-                "predictions_monte_carlo", "predictions_risk_timeline",
-                "predictions_sarima", "predictions_surplus_evolution",
-                "features_segment_monthly", "silver_reserves",
-                "silver_rolling_features", "predictions_stress_scenarios",
-            ]
-        ], key=lambda x: x["table"])
-
-        _GENIE_INSTRUCTIONS = (
-            "You are an actuarial data analyst. The tables contain insurance claims data, "
-            "SARIMA+GARCH forecasts, Monte Carlo simulation results, stress test scenarios, "
-            "and reserve development triangles. Segments follow the pattern "
-            "'product_line_region' (e.g. commercial_auto_ontario). "
-            "When asked about trends, use gold_claims_monthly. "
-            "For forecasts, use predictions_sarima (record_type='forecast'). "
-            "For risk metrics, use predictions_monte_carlo or predictions_stress_scenarios. "
-            "For capital evolution, use predictions_risk_timeline."
-        )
-
-        _GENIE_EXAMPLES = [
-            {"question": "What are the top 5 segments by average monthly claims?",
-             "sql": f"SELECT segment_id, AVG(claims_count) AS avg_claims FROM {CATALOG}.{SCHEMA}.gold_claims_monthly GROUP BY segment_id ORDER BY avg_claims DESC LIMIT 5"},
-            {"question": "Show me the VaR 99.5% across all stress scenarios",
-             "sql": f"SELECT scenario_label, var_995_M, var_995_vs_baseline FROM {CATALOG}.{SCHEMA}.predictions_stress_scenarios ORDER BY var_995_M DESC"},
-            {"question": "What is the forecast for the next 6 months?",
-             "sql": f"SELECT month, SUM(forecast_mean) AS total_forecast FROM {CATALOG}.{SCHEMA}.predictions_sarima WHERE record_type='forecast' GROUP BY month ORDER BY month LIMIT 6"},
-        ]
-
-        # Build serialized_space JSON
-        _space_tables = [
-            {"identifier": f"{t['catalog']}.{t['schema']}.{t['table']}"}
-            for t in _GENIE_TABLES
-        ]
-        _space_json = json.dumps({
-            "data_sources": {"tables": _space_tables},
-            "instructions": _GENIE_INSTRUCTIONS,
-            "sample_questions": [{"question": e["question"], "sql": e["sql"]} for e in _GENIE_EXAMPLES],
-        })
-
         _space = _gw.genie.create_space(
             title="Actuarial Workshop — Risk Assistant",
-            description="AI/BI Genie space for the actuarial workshop chatbot. Covers claims, forecasts, risk metrics, and reserves.",
+            description=_GENIE_DESCRIPTION,
             warehouse_id=WAREHOUSE_ID,
-            serialized_space=_space_json,
+            serialized_space=_build_serialized_space(),
         )
         _genie_space_id = _space.space_id
         print(f"Genie Space created: {_genie_space_id}")
         print(f"  Tables: {len(_GENIE_TABLES)}")
-        print(f"  Example queries: {len(_GENIE_EXAMPLES)}")
 
         # Grant app SP access to the Genie space
         if APP_SP_CLIENT_ID:
@@ -558,7 +591,9 @@ if WAREHOUSE_ID and not _genie_space_id:
                 print(f"  Genie permission grant skipped: {_perm_err}")
 
     except Exception as _genie_err:
-        print(f"Genie space creation skipped: {_genie_err}")
+        import traceback
+        print(f"Genie space creation failed: {_genie_err}")
+        traceback.print_exc()
 elif not WAREHOUSE_ID and not _genie_space_id:
     print("[SKIP] No warehouse_id — Genie space creation skipped.")
     print("Set genie_space_id in databricks.local.yml after creating the space manually.")
@@ -601,12 +636,12 @@ print(json.dumps(sarima_result, indent=2))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 6b. Monte Carlo Scenario (Model Serving)
+# MAGIC ### 6b. Bootstrap Reserve Scenario (Model Serving)
 
 # COMMAND ----------
 
 def call_mc_endpoint(scenario_params: dict) -> dict:
-    """Call the Monte Carlo endpoint. Returns result dict or error."""
+    """Call the Bootstrap Reserve endpoint. Returns result dict or error."""
     try:
         resp = requests.post(
             f"https://{WORKSPACE_URL}/serving-endpoints/{MC_ENDPOINT_NAME}/invocations",
@@ -624,38 +659,29 @@ def call_mc_endpoint(scenario_params: dict) -> dict:
 
 
 _baseline_params = {
-    "mean_property_M": 12.5, "mean_auto_M": 8.3, "mean_liability_M": 5.7,
-    "cv_property": 0.35, "cv_auto": 0.28, "cv_liability": 0.42,
-    "corr_prop_auto": 0.40, "corr_prop_liab": 0.20, "corr_auto_liab": 0.30,
-    "n_scenarios": 10000, "copula_df": 4,
+    "scenario": "baseline",
+    "n_replications": 10000,
 }
 
-_stressed_params = {
-    "mean_property_M": 15.0,   # +20% — hard market
-    "mean_auto_M": 9.96,       # +20%
-    "mean_liability_M": 6.84,  # +20%
-    "cv_property": 0.40,       # elevated uncertainty
-    "cv_auto": 0.33,
-    "cv_liability": 0.50,
-    "corr_prop_auto": 0.55,    # elevated cat correlation
-    "corr_prop_liab": 0.35,
-    "corr_auto_liab": 0.45,
-    "n_scenarios": 10000, "copula_df": 4,
+_adverse_params = {
+    "scenario": "adverse_development",
+    "ldf_multiplier": 1.2,
+    "n_replications": 10000,
 }
 
-print("Calling MC endpoint — baseline scenario...")
+print("Calling Bootstrap Reserve endpoint — baseline scenario...")
 _b = call_mc_endpoint(_baseline_params)
-print("Calling MC endpoint — stressed scenario (+20% loss costs, elevated correlations)...")
-_s = call_mc_endpoint(_stressed_params)
+print("Calling Bootstrap Reserve endpoint — adverse development scenario...")
+_s = call_mc_endpoint(_adverse_params)
 
-for label, result in [("Baseline", _b), ("Stressed (+20% / cat correlations)", _s)]:
+for label, result in [("Baseline", _b), ("Adverse Development (LDFs +20%)", _s)]:
     print(f"\n{label}:")
     if "predictions" in result:
         pred = result["predictions"][0] if isinstance(result["predictions"], list) else result["predictions"]
-        print(f"  E[Loss]:    ${pred.get('expected_loss_M', 'N/A'):.1f}M")
-        print(f"  VaR(99%):   ${pred.get('var_99_M', 'N/A'):.1f}M")
-        print(f"  VaR(99.5%): ${pred.get('var_995_M', 'N/A'):.1f}M")
-        print(f"  CVaR(99%):  ${pred.get('cvar_99_M', 'N/A'):.1f}M")
+        print(f"  Best Estimate IBNR: ${pred.get('best_estimate_M', 'N/A'):.1f}M")
+        print(f"  VaR(99%):           ${pred.get('var_99_M', 'N/A'):.1f}M")
+        print(f"  VaR(99.5%):         ${pred.get('var_995_M', 'N/A'):.1f}M")
+        print(f"  CVaR(99%):          ${pred.get('cvar_99_M', 'N/A'):.1f}M")
     else:
         print(f"  {result}")
 
@@ -733,9 +759,9 @@ else:
 # MAGIC        ↓ (training data)
 # MAGIC MLflow Experiments (Module 4)
 # MAGIC        ↓ (registered models)
-# MAGIC sarima_claims_forecaster@Champion  /  monte_carlo_portfolio@Champion
+# MAGIC frequency_forecaster@Champion  /  bootstrap_reserve_simulator@Champion
 # MAGIC        ↓ (serving)
-# MAGIC Model Serving endpoints (SARIMA + Monte Carlo)
+# MAGIC Model Serving endpoints (Frequency Forecaster + Bootstrap Reserves)
 # MAGIC        ↓ (AI Gateway)
 # MAGIC Inference tables + system.serving.served_entities_request_logs
 # MAGIC ```
@@ -769,8 +795,8 @@ except Exception as e:
 # MAGIC
 # MAGIC | Service | What Was Set Up | App Tab |
 # MAGIC |---|---|---|
-# MAGIC | SARIMA endpoint | `sarima_claims_forecaster@Champion` → REST API + AI Gateway | Forecasts |
-# MAGIC | MC endpoint | `monte_carlo_portfolio@Champion` → CPU REST API + AI Gateway | Risk, Stress Testing |
+# MAGIC | Frequency Forecaster endpoint | `frequency_forecaster@Champion` → REST API + AI Gateway | Forecasts |
+# MAGIC | Bootstrap Reserve endpoint | `bootstrap_reserve_simulator@Champion` → CPU REST API + AI Gateway | Reserve Adequacy, Scenario Analysis |
 # MAGIC | Online Table | `segment_features_online` → low-latency feature lookup | Sidebar |
 # MAGIC | Lakebase | `scenario_annotations` table + SP grants | All tabs (annotations) |
 # MAGIC | Genie Space | AI/BI Genie with 10 tables + example queries | Risk Assistant (chatbot) |

@@ -1195,7 +1195,7 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
     print('='*55)
     print(f'  Expected Annual Loss:   ${aggregate_mean:.1f}M')
     print(f'  VaR(99%):              ${aggregate_var99:.1f}M')
-    print(f'  VaR(99.5%):            ${aggregate_var995:.1f}M <- Solvency II SCR')
+    print(f'  VaR(99.5%):            ${aggregate_var995:.1f}M <- Economic Capital (1-in-200yr)')
     print(f'  CVaR(99%):             ${aggregate_cvar99:.1f}M')
     print(f'  Risk Margin (CVaR/EL): {(aggregate_cvar99/aggregate_mean - 1)*100:.0f}%')
     print('='*55)
@@ -1365,8 +1365,8 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
     })
 
     print(f'  Collective Risk Model ({_CR_N_SCENARIOS:,} scenarios):')
-    print(f'    Expected Loss: ${_cr_mean:.1f}M  |  VaR(99%): ${_cr_var99:.1f}M  |  SCR: ${_cr_var995:.1f}M  |  CVaR: ${_cr_cvar99:.1f}M')
-    print(f'    vs Aggregate:  EL ${aggregate_mean:.1f}M  |  VaR(99%) ${aggregate_var99:.1f}M  |  SCR ${aggregate_var995:.1f}M')
+    print(f'    Expected Loss: ${_cr_mean:.1f}M  |  VaR(99%): ${_cr_var99:.1f}M  |  EC(99.5%): ${_cr_var995:.1f}M  |  CVaR: ${_cr_cvar99:.1f}M')
+    print(f'    vs Aggregate:  EL ${aggregate_mean:.1f}M  |  VaR(99%) ${aggregate_var99:.1f}M  |  EC(99.5%) ${aggregate_var995:.1f}M')
 
     # ── Multi-Period Portfolio Evolution (regime-switching) ───────────────
     # 2-state regime model: Normal and Crisis, with Markov transition.
@@ -1403,7 +1403,7 @@ with mlflow.start_run(run_name='monte_carlo_portfolio_ray') as run:
     _investment_rate_monthly = 0.04 / 12  # 4% annual risk-free rate
 
     # Initialize surplus trajectories
-    _initial_surplus = aggregate_var995 * 1.2  # start at 120% of SCR
+    _initial_surplus = aggregate_var995 * 1.2  # start at 120% of Economic Capital
     _surplus = np.full((_MP_N_SCENARIOS, _MP_HORIZON + 1), _initial_surplus)
     _regime_state = np.zeros(_MP_N_SCENARIOS, dtype=int)  # 0=Normal, 1=Crisis
 
@@ -1823,9 +1823,9 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
     """
     MLflow PyFunc wrapper for Monte Carlo portfolio loss simulation.
 
-    Supports two model types:
-      - "aggregate" (default): t-Copula + Lognormal Marginals (standard formula)
-      - "collective_risk": Frequency-Severity bottom-up (internal model)
+    Supports two internal model approaches (both simulation-based, not regulatory standard formula):
+      - "aggregate" (default): t-Copula + Lognormal Marginals (top-down)
+      - "collective_risk": Frequency-Severity bottom-up (bottom-up)
 
     And two simulation modes:
       - "single_period" (default): Single annual loss distribution
@@ -1879,7 +1879,7 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
         # Safety bounds
         n_scenarios = max(1_000, min(n_scenarios, 100_000))
         copula_df   = max(2,     min(copula_df,   30))
-        means       = np.clip(means, 0.01, 1_000.0)
+        means       = np.clip(means, 0.01, 50_000.0)
         cv          = np.clip(cv,    0.01, 5.0)
         corr_prop_auto = np.clip(corr_prop_auto, -0.99, 0.99)
         corr_prop_liab = np.clip(corr_prop_liab, -0.99, 0.99)
@@ -1904,6 +1904,16 @@ class MonteCarloPyFunc(mlflow.pyfunc.PythonModel):
 
         if model_type == "collective_risk":
             # ── Collective Risk Model: frequency-severity bottom-up ──────
+            # Auto-calibrate severity mu so that freq_lambda * E[X] matches
+            # the passed means (in $M), keeping sev_sigma fixed for tail shape.
+            for i in range(3):
+                target_mean_dollars = means[i] * 1_000_000  # $M → $
+                raw_ex = np.exp(sev_mu[i] + sev_sigma[i]**2 / 2)
+                implied_mean = freq_lambda[i] * raw_ex
+                if implied_mean > 0:
+                    # Shift sev_mu to match: E[S] = lambda * exp(mu + sig^2/2)
+                    sev_mu[i] += np.log(target_mean_dollars / implied_mean)
+
             from scipy.stats import nbinom as nbinom_dist
             z = rng.standard_normal((n_scenarios, 3))
             z_cor = z @ chol.T
@@ -2131,7 +2141,7 @@ print(f"Set @Champion → version {_mc_latest_ver}")
 # MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 84 months | Baseline claim volume forecast |
 # MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
 # MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 40 segments | Time-varying CIs + MC CVs (σ/μ) |
-# MAGIC | Monte Carlo — baseline | Ray + NumPy CPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, SCR — GARCH-calibrated |
+# MAGIC | Monte Carlo — baseline | Ray + NumPy CPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, Economic Capital — GARCH-calibrated |
 # MAGIC | Monte Carlo — VaR evolution | Ray + NumPy CPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
 # MAGIC | Monte Carlo — stress tests | Ray + NumPy CPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |
 # MAGIC | Reserve validation | Spark join | Triangle × SARIMA | Reserve adequacy vs. forecasted claims |

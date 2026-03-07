@@ -3,331 +3,342 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from db import load_monte_carlo_summary, load_stress_scenarios, load_var_timeline, load_reserve_triangle, load_surplus_evolution
-from endpoints import call_monte_carlo_endpoint
+from db import load_bootstrap_summary, load_reserve_scenarios, load_reserve_evolution, load_reserve_triangle, load_runoff_projection
+from endpoints import call_bootstrap_endpoint
 from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
-from constants import CAT_PRESETS, RETURN_PERIOD_MULT, CANADIAN_PROVINCES
+from constants import RESERVE_SCENARIO_PRESETS, SEVERITY_LEVELS, CANADIAN_PROVINCES, fmt_dollars
 
 
 def render(tab):
     with tab:
-        st.subheader("Catastrophe Event Analysis")
+        st.subheader("Scenario Analysis")
         st.caption(
-            "Pre-modelled natural disasters and market events, plus custom catastrophe simulation"
+            "Pre-modelled scenarios, custom stress tests with audit logging, reserve evolution, and triangle analysis"
         )
 
-        # ── Section 1: Pre-computed stress scenarios ───────────────────────────────
-        st.markdown("### Pre-Modelled Catastrophe Stress Tests")
+        # ── Section 1: Pre-computed reserve scenarios ───────────────────────────────
+        st.markdown("### Pre-Modelled Reserve Scenarios")
         st.caption(
-            "Pre-run at deployment across 3 major stress scenarios — 120 million simulated loss paths each."
+            "Pre-run at deployment — adverse development, judicial inflation, pandemic tail, "
+            "and superimposed inflation scenarios."
         )
 
-        _baseline_smry = load_monte_carlo_summary()
-        _stress_df     = load_stress_scenarios()
+        _baseline_smry = load_bootstrap_summary()
+        _scenario_df   = load_reserve_scenarios()
 
-        if not _stress_df.empty:
+        if not _scenario_df.empty:
             _b_var995  = float(_baseline_smry.get('var_995', 0))
             _b_var99   = float(_baseline_smry.get('var_99', 0))
             _b_cvar99  = float(_baseline_smry.get('cvar_99', 0))
-            _b_mean    = float(_baseline_smry.get('expected_loss', 0))
+            _b_best_est = float(_baseline_smry.get('best_estimate', 0))
 
-            _disp_rows = [{"Scenario": "Baseline", "Exp. Loss": f"${_b_mean:.1f}M",
-                           "VaR(99%)": f"${_b_var99:.1f}M", "VaR(99.5%) SCR": f"${_b_var995:.1f}M",
-                           "CVaR(99%)": f"${_b_cvar99:.1f}M", "Δ SCR": "—"}]
-            for _, row in _stress_df.iterrows():
+            _disp_rows = [{"Scenario": "Baseline", "Best Estimate": fmt_dollars(_b_best_est),
+                           "VaR(99%)": fmt_dollars(_b_var99), "Reserve Risk 99.5%": fmt_dollars(_b_var995),
+                           "CVaR(99%)": fmt_dollars(_b_cvar99), "Δ VaR 99.5%": "—"}]
+            _scenario_df = _scenario_df[_scenario_df["scenario_label"] != "Baseline"]
+            for _, row in _scenario_df.iterrows():
                 _disp_rows.append({
                     "Scenario":       row["scenario_label"],
-                    "Exp. Loss":      f"${row['total_mean_M']:.1f}M",
-                    "VaR(99%)":       f"${row['var_99_M']:.1f}M",
-                    "VaR(99.5%) SCR": f"${row['var_995_M']:.1f}M",
-                    "CVaR(99%)":      f"${row['cvar_99_M']:.1f}M",
-                    "Δ SCR":   f"{row['var_995_vs_baseline']:+.1f}%",
+                    "Best Estimate":  fmt_dollars(row['best_estimate_M']),
+                    "VaR(99%)":       fmt_dollars(row['var_99_M']),
+                    "Reserve Risk 99.5%": fmt_dollars(row['var_995_M']),
+                    "CVaR(99%)":      fmt_dollars(row['cvar_99_M']),
+                    "Δ VaR 99.5%":   f"{row['var_995_vs_baseline']:+.1f}%",
                 })
             st.dataframe(pd.DataFrame(_disp_rows), use_container_width=True, hide_index=True)
 
-            _all_labels = ["Baseline"] + _stress_df["scenario_label"].tolist()
-            _all_var995 = [_b_var995] + _stress_df["var_995_M"].tolist()
-            _all_cvar99 = [_b_cvar99] + _stress_df["cvar_99_M"].tolist()
-            _bar_colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd"]
-            _bar_colors_muted = [
-                f"rgba({int(c[1:3],16)},{int(c[3:5],16)},{int(c[5:7],16)},0.5)"
-                for c in _bar_colors
-            ]
+            _all_labels = ["Baseline"] + _scenario_df["scenario_label"].tolist()
+            _all_var995 = [_b_var995] + _scenario_df["var_995_M"].tolist()
+            _all_cvar99 = [_b_cvar99] + _scenario_df["cvar_99_M"].tolist()
+            _use_b = _b_var995 >= 1000
+            _dv = 1000.0 if _use_b else 1.0
+            _un = "B" if _use_b else "M"
+            _bar_colors = ["#1f77b4", "#ff7f0e", "#d62728", "#9467bd", "#2ca02c", "#e377c2"]
 
-            _fig_stress = go.Figure()
-            _fig_stress.add_trace(go.Bar(
-                name="VaR(99.5%) — SCR",
-                x=_all_labels, y=_all_var995,
-                marker_color=_bar_colors,
-                text=[f"${v:.1f}M" for v in _all_var995], textposition="outside",
-                hovertemplate="%{x}<br>VaR(99.5%): $%{y:.1f}M<extra></extra>",
+            _fig_scenario = go.Figure()
+            _fig_scenario.add_trace(go.Bar(
+                name="Reserve Risk (VaR 99.5%)",
+                x=_all_labels, y=[v / _dv for v in _all_var995],
+                marker_color=_bar_colors[:len(_all_labels)],
+                text=[fmt_dollars(v) for v in _all_var995], textposition="outside",
+                hovertemplate=f"%{{x}}<br>VaR(99.5%): $%{{y:.1f}}{_un}<extra></extra>",
             ))
-            _fig_stress.add_trace(go.Bar(
+            _fig_scenario.add_trace(go.Bar(
                 name="CVaR(99%)",
-                x=_all_labels, y=_all_cvar99,
-                marker_color=_bar_colors_muted,
-                text=[f"${v:.1f}M" for v in _all_cvar99], textposition="outside",
-                hovertemplate="%{x}<br>CVaR(99%): $%{y:.1f}M<extra></extra>",
+                x=_all_labels, y=[v / _dv for v in _all_cvar99],
+                marker_color=[f"rgba({int(c[1:3],16)},{int(c[3:5],16)},{int(c[5:7],16)},0.5)" for c in _bar_colors[:len(_all_labels)]],
+                text=[fmt_dollars(v) for v in _all_cvar99], textposition="outside",
+                hovertemplate=f"%{{x}}<br>CVaR(99%): $%{{y:.1f}}{_un}<extra></extra>",
             ))
-            _fig_stress.update_layout(
-                title="VaR(99.5%) and CVaR(99%) — Baseline vs. Stress Scenarios",
-                yaxis_title="Annual Portfolio Loss ($M)",
+            _fig_scenario.update_layout(
+                title="Reserve Risk by Scenario — VaR(99.5%) and CVaR(99%)",
+                yaxis_title=f"Total IBNR (${_un})",
                 barmode="group", height=400, showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                yaxis=dict(range=[0, max(_all_var995 + _all_cvar99) * 1.25]),
+                yaxis=dict(range=[0, max(_all_var995 + _all_cvar99) / _dv * 1.25]),
             )
-            st.plotly_chart(_fig_stress, use_container_width=True)
+            st.plotly_chart(_fig_scenario, use_container_width=True)
         else:
-            st.info("Stress scenario data not yet available — run the setup job.")
+            st.info("Reserve scenario data not yet available — run the setup job.")
 
-        # ── Section 2: VaR evolution timeline ─────────────────────────────────────
-        st.markdown("### Capital Requirement Outlook — Next 12 Months")
-        _timeline_df = load_var_timeline()
-        if not _timeline_df.empty:
+        # ── Section 2: Reserve evolution timeline ─────────────────────────────────
+        st.markdown("### Reserve Adequacy Outlook — Next 12 Months")
+        _evolution_df = load_reserve_evolution()
+        if not _evolution_df.empty:
+            _tl_max = max(_evolution_df["var_995_M"].max(), _evolution_df["var_99_M"].max())
+            _tl_b = _tl_max >= 1000
+            _tl_dv = 1000.0 if _tl_b else 1.0
+            _tl_un = "B" if _tl_b else "M"
+
             _fig_tl = go.Figure()
             _fig_tl.add_trace(go.Scatter(
-                x=_timeline_df["month_idx"], y=_timeline_df["var_995_M"],
-                mode="lines+markers", name="VaR(99.5%)", line=dict(color="#d62728"),
-                hovertemplate="Month +%{x}<br>VaR(99.5%): $%{y:.1f}M<extra></extra>",
+                x=_evolution_df["month_idx"], y=_evolution_df["var_995_M"] / _tl_dv,
+                mode="lines+markers", name="Reserve Risk (VaR 99.5%)", line=dict(color="#d62728"),
+                hovertemplate=f"Month +%{{x}}<br>VaR(99.5%): $%{{y:.1f}}{_tl_un}<extra></extra>",
             ))
             _fig_tl.add_trace(go.Scatter(
-                x=_timeline_df["month_idx"], y=_timeline_df["var_99_M"],
+                x=_evolution_df["month_idx"], y=_evolution_df["var_99_M"] / _tl_dv,
                 mode="lines+markers", name="VaR(99%)", line=dict(color="#ff7f0e", dash="dash"),
-                hovertemplate="Month +%{x}<br>VaR(99%): $%{y:.1f}M<extra></extra>",
+                hovertemplate=f"Month +%{{x}}<br>VaR(99%): $%{{y:.1f}}{_tl_un}<extra></extra>",
+            ))
+            _fig_tl.add_trace(go.Scatter(
+                x=_evolution_df["month_idx"], y=_evolution_df["best_estimate_M"] / _tl_dv,
+                mode="lines+markers", name="Best Estimate", line=dict(color="#2ca02c", dash="dot"),
+                hovertemplate=f"Month +%{{x}}<br>Best Est: $%{{y:.1f}}{_tl_un}<extra></extra>",
             ))
             _b_v995 = float(_baseline_smry.get('var_995', 0))
             if _b_v995 > 0:
                 _fig_tl.add_hline(
-                    y=_b_v995, line_dash="dot", line_color="grey",
-                    annotation_text=f"Current VaR(99.5%): ${_b_v995:.1f}M",
+                    y=_b_v995 / _tl_dv, line_dash="dot", line_color="grey",
+                    annotation_text=f"Current VaR(99.5%): {fmt_dollars(_b_v995)}",
                     annotation_position="bottom right",
                 )
             _fig_tl.update_layout(
-                title="How Capital Requirements Are Projected to Change Over the Next 12 Months",
-                xaxis_title="Month", yaxis_title="Required Capital ($M)",
+                title="How Reserve Risk Is Projected to Change Over the Next 12 Months",
+                xaxis_title="Month", yaxis_title=f"Reserve Requirement (${_tl_un})",
                 height=380,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(_fig_tl, use_container_width=True)
         else:
-            st.info("Capital outlook not yet available. Run the full setup job to generate this view.")
+            st.info("Reserve evolution not yet available. Run the full setup job to generate.")
 
         st.divider()
 
-        # ── Section 3: Custom CAT scenario submission ──────────────────────────────
-        st.markdown("### Model a Custom Catastrophe Event")
+        # ── Section 3: Custom reserve scenario submission ─────────────────────────
+        st.markdown("### Model a Custom Reserve Scenario")
         st.caption(
-            "Configure a natural disaster or market event and immediately see its capital impact. Results are saved to the audit log."
+            "Configure reserve deterioration assumptions and immediately see the impact "
+            "on IBNR distribution. Results are saved to the audit log."
         )
 
-        _cat_top1, _cat_top2 = st.columns(2)
-        with _cat_top1:
-            _cat_type = st.selectbox(
-                "Event type:",
-                list(CAT_PRESETS.keys()),
-                help="Each event type pre-fills realistic loss assumptions for that type of disaster. You can adjust them in the parameters section below.",
+        _sc_top1, _sc_top2 = st.columns(2)
+        with _sc_top1:
+            _sc_type = st.selectbox(
+                "Scenario type:",
+                list(RESERVE_SCENARIO_PRESETS.keys()),
+                help="Each scenario pre-fills realistic reserve assumptions. You can adjust them below.",
             )
-            st.caption(f"_{CAT_PRESETS[_cat_type]['desc']}_")
-            _return_period = st.selectbox(
-                "Event Severity:",
-                list(RETURN_PERIOD_MULT.keys()),
+            st.caption(f"_{RESERVE_SCENARIO_PRESETS[_sc_type]['desc']}_")
+            _severity = st.selectbox(
+                "Severity level:",
+                list(SEVERITY_LEVELS.keys()),
                 index=1,
-                help="How rare and severe the event is. 1-in-250yr is the Solvency II catastrophe benchmark; 1-in-500yr represents an extreme stress test.",
+                help="Scales the scenario's LDF and inflation adjustments.",
             )
-        with _cat_top2:
-            _affected_regions = st.multiselect(
-                "Affected Regions:",
-                CANADIAN_PROVINCES,
-                default=["Ontario", "Quebec"],
-                help="Which provinces are exposed to this event — used for documentation and the audit log.",
-            )
+        with _sc_top2:
             _affected_lines = st.multiselect(
                 "Affected Lines of Business:",
-                ["Commercial Property", "Commercial Auto", "Personal Auto", "Homeowners", "Liability"],
-                default=["Commercial Property", "Commercial Auto"],
-                help="Which lines of business are most directly hit — used for documentation.",
+                ["Personal Auto", "Commercial Auto", "Homeowners", "Commercial Property"],
+                default=["Personal Auto", "Commercial Auto"],
+                help="Which lines are most affected — used for documentation.",
             )
 
-        # Compute default params from preset + return period
-        _preset   = CAT_PRESETS[_cat_type]
-        _rp_mult  = RETURN_PERIOD_MULT[_return_period]
-        _bm, _bc, _bco = [12.5, 8.3, 5.7], [0.35, 0.28, 0.42], [0.40, 0.20, 0.30]
-        _def_means = [min(round(m * mu * _rp_mult, 1), 2000.0) for m, mu in zip(_bm, _preset["means_mult"])]
-        _def_cvs   = [min(round(c * cu, 2), 3.0) for c, cu in zip(_bc, _preset["cv_mult"])]
-        _def_corrs = [min(c + _preset["corr_add"], 0.95) for c in _bco]
+        _preset = RESERVE_SCENARIO_PRESETS[_sc_type]
+        _sev_mult = SEVERITY_LEVELS[_severity]
 
-        with st.expander("⚙️ Fine-tune loss assumptions", expanded=False):
-            _adj1, _adj2, _adj3 = st.columns(3)
+        with st.expander("⚙️ Fine-tune reserve assumptions", expanded=False):
+            _adj1, _adj2 = st.columns(2)
             with _adj1:
-                st.markdown("**Expected Annual Losses ($M)**")
-                _cat_mean_prop = st.number_input("Property", value=_def_means[0], min_value=0.1, max_value=2000.0, step=1.0, key="cat_mp")
-                _cat_mean_auto = st.number_input("Auto",     value=_def_means[1], min_value=0.1, max_value=2000.0, step=1.0, key="cat_ma")
-                _cat_mean_liab = st.number_input("Liability",value=_def_means[2], min_value=0.1, max_value=2000.0, step=1.0, key="cat_ml")
+                st.markdown("**Development Factor Adjustments**")
+                _sc_ldf_mult = st.slider("LDF Multiplier", 1.0, 2.0,
+                                          min(float(_preset['ldf_multiplier'] * _sev_mult), 2.0),
+                                          0.05, key="sc_ldf")
+                _sc_cv_mult = st.slider("CV Multiplier", 1.0, 3.0,
+                                         min(float(_preset['cv_mult'] * _sev_mult), 3.0),
+                                         0.1, key="sc_cv")
             with _adj2:
-                st.markdown("**Coefficients of Variation**")
-                _cat_cv_prop = st.slider("Property CV", 0.05, 3.0, _def_cvs[0], 0.05, key="cat_cvp")
-                _cat_cv_auto = st.slider("Auto CV",     0.05, 3.0, _def_cvs[1], 0.05, key="cat_cva")
-                _cat_cv_liab = st.slider("Liability CV",0.05, 3.0, _def_cvs[2], 0.05, key="cat_cvl")
-            with _adj3:
-                st.markdown("**Inter-Line Correlations**")
-                _cat_corr_pa = st.slider("Property ↔ Auto",      0.0, 0.95, _def_corrs[0], 0.05, key="cat_cpa")
-                _cat_corr_pl = st.slider("Property ↔ Liability", 0.0, 0.95, _def_corrs[1], 0.05, key="cat_cpl")
-                _cat_corr_al = st.slider("Auto ↔ Liability",     0.0, 0.95, _def_corrs[2], 0.05, key="cat_cal")
-        _cat_n_scen = st.select_slider(
-            "Simulation paths:",
+                st.markdown("**Inflation Adjustments**")
+                _sc_inflation = st.slider("Calendar-Year Inflation", 0.0, 0.10,
+                                           float(_preset['inflation_adj'] * _sev_mult),
+                                           0.005, key="sc_infl", format="%.3f")
+
+            st.markdown("**Per-Line Reserve Volatility (CV)**")
+            _cv1, _cv2, _cv3, _cv4 = st.columns(4)
+            with _cv1:
+                _sc_cv_pa = st.slider("Personal Auto", 0.05, 1.0,
+                                       min(0.15 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_pa")
+            with _cv2:
+                _sc_cv_ca = st.slider("Commercial Auto", 0.05, 1.0,
+                                       min(0.18 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_ca")
+            with _cv3:
+                _sc_cv_ho = st.slider("Homeowners", 0.05, 1.0,
+                                       min(0.12 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_ho")
+            with _cv4:
+                _sc_cv_cp = st.slider("Commercial Prop", 0.05, 1.0,
+                                       min(0.20 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_cp")
+
+        _sc_n_rep = st.select_slider(
+            "Bootstrap replications:",
             options=[5_000, 10_000, 25_000, 50_000],
-            value=25_000,
-            help="25,000 recommended for catastrophe scenarios — good balance of accuracy and speed.",
-            key="cat_nscen",
+            value=10_000,
+            key="sc_nrep",
         )
 
         _user_tok5 = st.context.headers.get("X-Forwarded-Access-Token", "")
-        _cat_analyst = email_from_token(_user_tok5) if _user_tok5 else ""
-        _cat_analyst_in = st.text_input("Analyst:", value=_cat_analyst, key="cat_analyst")
-        _cat_note_in    = st.text_area(
+        _sc_analyst = email_from_token(_user_tok5) if _user_tok5 else ""
+        _sc_analyst_in = st.text_input("Analyst:", value=_sc_analyst, key="sc_analyst")
+        _sc_note_in    = st.text_area(
             "Scenario rationale / assumptions:",
-            placeholder=f"Describe the {_cat_type} scenario — affected exposure, basis for severity, any expert judgment applied...",
-            key="cat_note",
+            placeholder=f"Describe the {_sc_type} scenario — basis for assumptions, regulatory context...",
+            key="sc_note",
         )
 
-        if st.button("🌪️ Run Catastrophe Scenario", type="primary"):
-            _cat_scenario_params = {
-                "mean_property_M":  _cat_mean_prop,
-                "mean_auto_M":      _cat_mean_auto,
-                "mean_liability_M": _cat_mean_liab,
-                "cv_property":      _cat_cv_prop,
-                "cv_auto":          _cat_cv_auto,
-                "cv_liability":     _cat_cv_liab,
-                "corr_prop_auto":   _cat_corr_pa,
-                "corr_prop_liab":   _cat_corr_pl,
-                "corr_auto_liab":   _cat_corr_al,
-                "n_scenarios":      _cat_n_scen,
-                "copula_df":        4,
+        if st.button("🔍 Run Reserve Scenario", type="primary"):
+            _sc_params = {
+                "scenario":        _preset['scenario'],
+                "ldf_multiplier":  _sc_ldf_mult,
+                "inflation_adj":   _sc_inflation,
+                "cv_personal_auto":     _sc_cv_pa,
+                "cv_commercial_auto":   _sc_cv_ca,
+                "cv_homeowners":        _sc_cv_ho,
+                "cv_commercial_property": _sc_cv_cp,
+                "n_replications":  _sc_n_rep,
             }
-            with st.spinner(f"Running {_cat_type} ({_return_period}) — {_cat_n_scen:,} scenarios..."):
-                _cat_result = call_monte_carlo_endpoint(_cat_scenario_params)
+            with st.spinner(f"Running {_sc_type} ({_severity}) — {_sc_n_rep:,} replications..."):
+                _sc_result = call_bootstrap_endpoint(_sc_params)
 
-            if _cat_result:
-                st.success(f"✅ {_cat_type} scenario complete")
+            if _sc_result:
+                st.success(f"✅ {_sc_type} scenario complete")
 
                 _b5 = _baseline_smry
 
-                def _cat_delta(sc_val, base_key):
+                def _sc_delta(sc_val, base_key):
                     bv = float(_b5.get(base_key, 0))
                     d  = sc_val - bv
-                    return f"{'+' if d >= 0 else ''}${d:.1f}M"
+                    return f"{'+' if d >= 0 else ''}{fmt_dollars(d)}"
 
                 _cr1, _cr2, _cr3, _cr4 = st.columns(4)
-                _cr1.metric("Expected Annual Loss",     f"${_cat_result['expected_loss_M']:.1f}M",
-                            delta=_cat_delta(_cat_result['expected_loss_M'], 'expected_loss'))
-                _cr2.metric("1-in-100 Year Loss",          f"${_cat_result['var_99_M']:.1f}M",
-                            delta=_cat_delta(_cat_result['var_99_M'], 'var_99'))
-                _cr3.metric("Solvency Capital Requirement",  f"${_cat_result['var_995_M']:.1f}M",
-                            delta=_cat_delta(_cat_result['var_995_M'], 'var_995'))
-                _cr4.metric("Tail Risk Estimate",         f"${_cat_result['cvar_99_M']:.1f}M",
-                            delta=_cat_delta(_cat_result['cvar_99_M'], 'cvar_99'))
+                _cr1.metric("Best Estimate IBNR",     fmt_dollars(_sc_result['best_estimate_M']),
+                            delta=_sc_delta(_sc_result['best_estimate_M'], 'best_estimate'))
+                _cr2.metric("VaR 99%",          fmt_dollars(_sc_result['var_99_M']),
+                            delta=_sc_delta(_sc_result['var_99_M'], 'var_99'))
+                _cr3.metric("Reserve Risk 99.5%",  fmt_dollars(_sc_result['var_995_M']),
+                            delta=_sc_delta(_sc_result['var_995_M'], 'var_995'))
+                _cr4.metric("CVaR 99%",         fmt_dollars(_sc_result['cvar_99_M']),
+                            delta=_sc_delta(_sc_result['cvar_99_M'], 'cvar_99'))
 
                 # Save annotation to Lakebase
-                _var_lift = ((_cat_result['var_995_M'] / max(float(_b5.get('var_995', 1)), 0.01)) - 1.0) * 100
+                _var_lift = ((_sc_result['var_995_M'] / max(float(_b5.get('var_995', 1)), 0.01)) - 1.0) * 100
                 _full_note = (
-                    f"[{_cat_type} | {_return_period}] "
-                    f"Regions: {', '.join(_affected_regions) if _affected_regions else 'N/A'} | "
+                    f"[{_sc_type} | {_severity}] "
                     f"Lines: {', '.join(_affected_lines) if _affected_lines else 'N/A'} | "
-                    f"Prop ${_cat_mean_prop:.1f}M/CV={_cat_cv_prop:.2f}, "
-                    f"Auto ${_cat_mean_auto:.1f}M/CV={_cat_cv_auto:.2f}, "
-                    f"Liab ${_cat_mean_liab:.1f}M/CV={_cat_cv_liab:.2f} | "
-                    f"VaR(99.5%)=${_cat_result['var_995_M']:.1f}M, CVaR=${_cat_result['cvar_99_M']:.1f}M"
-                    + (f" | {_cat_note_in}" if _cat_note_in else "")
+                    f"LDF×{_sc_ldf_mult:.2f}, CV×{_sc_cv_mult:.1f}, Infl={_sc_inflation:.1%} | "
+                    f"VaR(99.5%)={fmt_dollars(_sc_result['var_995_M'])}, CVaR={fmt_dollars(_sc_result['cvar_99_M'])}"
+                    + (f" | {_sc_note_in}" if _sc_note_in else "")
                 )
                 if save_scenario_annotation(
-                    segment_id="CAT_SCENARIO",
+                    segment_id="RESERVE_SCENARIO",
                     note=_full_note,
-                    analyst=_cat_analyst_in,
-                    scenario_type=f"Catastrophe: {_cat_type}",
+                    analyst=_sc_analyst_in,
+                    scenario_type=f"Reserve: {_sc_type}",
                     adjustment_pct=round(_var_lift, 1),
                     approval_status="Draft",
                 ):
                     st.caption("✓ Scenario saved to audit log")
             else:
                 st.warning(
-                    "Monte Carlo endpoint not available. "
+                    "Bootstrap endpoint not available. "
                     "Start it from Module 4 or wait for the setup job to complete."
                 )
 
-        # Recent CAT scenarios
+        # Recent scenarios
         st.divider()
-        st.markdown("### Recent Catastrophe Scenario Audit Log")
-        _cat_history = load_annotations("CAT_SCENARIO")
-        if not _cat_history.empty:
-            st.dataframe(_cat_history, use_container_width=True, hide_index=True)
+        st.markdown("### Recent Reserve Scenario Audit Log")
+        _sc_history = load_annotations("RESERVE_SCENARIO")
+        if _sc_history.empty:
+            # Try old key for backward compatibility
+            _sc_history = load_annotations("CAT_SCENARIO")
+        if not _sc_history.empty:
+            st.dataframe(_sc_history, use_container_width=True, hide_index=True)
         else:
-            st.info("No catastrophe scenarios submitted yet. Use the form above to run one.")
+            st.info("No reserve scenarios submitted yet. Use the form above to run one.")
 
-        # ── Section 4: Surplus Evolution ───────────────────────────────────────────
+        # ── Section 4: Run-off projection ─────────────────────────────────────────
         st.divider()
-        st.markdown("### Surplus Evolution — 12-Month Outlook")
+        st.markdown("### Run-Off Projection — 12-Month Outlook")
         st.caption(
-            "Multi-period portfolio simulation with 2-state regime-switching (Normal/Crisis). "
-            "Shows how surplus evolves under stochastic losses with monthly premium inflow and investment returns."
+            "Multi-period reserve development with 2-state regime-switching (Normal/Crisis). "
+            "Shows how surplus evolves as reserves develop, premiums are collected, and claims are paid."
         )
-        _surplus_df = load_surplus_evolution()
-        if not _surplus_df.empty:
-            _fig_surplus = go.Figure()
+        _runoff_df = load_runoff_projection()
+        if not _runoff_df.empty:
+            _s_max = _runoff_df[["surplus_p95", "surplus_p05", "surplus_p50"]].abs().max().max()
+            _s_b = _s_max >= 1000
+            _s_dv = 1000.0 if _s_b else 1.0
+            _s_un = "B" if _s_b else "M"
 
-            # 5th-95th percentile band
-            _fig_surplus.add_trace(go.Scatter(
-                x=_surplus_df["month"], y=_surplus_df["surplus_p95"],
+            _fig_runoff = go.Figure()
+
+            _fig_runoff.add_trace(go.Scatter(
+                x=_runoff_df["month"], y=_runoff_df["surplus_p95"] / _s_dv,
                 mode="lines", line=dict(width=0), showlegend=False,
-                hovertemplate="Month %{x}<br>95th pctl: $%{y:.1f}M<extra></extra>",
+                hovertemplate=f"Month %{{x}}<br>95th pctl: $%{{y:.1f}}{_s_un}<extra></extra>",
             ))
-            _fig_surplus.add_trace(go.Scatter(
-                x=_surplus_df["month"], y=_surplus_df["surplus_p05"],
+            _fig_runoff.add_trace(go.Scatter(
+                x=_runoff_df["month"], y=_runoff_df["surplus_p05"] / _s_dv,
                 mode="lines", line=dict(width=0), fill="tonexty",
                 fillcolor="rgba(31,119,180,0.15)", name="5th–95th percentile",
-                hovertemplate="Month %{x}<br>5th pctl: $%{y:.1f}M<extra></extra>",
+                hovertemplate=f"Month %{{x}}<br>5th pctl: $%{{y:.1f}}{_s_un}<extra></extra>",
             ))
 
-            # 25th-75th percentile band
-            _fig_surplus.add_trace(go.Scatter(
-                x=_surplus_df["month"], y=_surplus_df["surplus_p75"],
+            _fig_runoff.add_trace(go.Scatter(
+                x=_runoff_df["month"], y=_runoff_df["surplus_p75"] / _s_dv,
                 mode="lines", line=dict(width=0), showlegend=False,
             ))
-            _fig_surplus.add_trace(go.Scatter(
-                x=_surplus_df["month"], y=_surplus_df["surplus_p25"],
+            _fig_runoff.add_trace(go.Scatter(
+                x=_runoff_df["month"], y=_runoff_df["surplus_p25"] / _s_dv,
                 mode="lines", line=dict(width=0), fill="tonexty",
                 fillcolor="rgba(31,119,180,0.30)", name="25th–75th percentile",
             ))
 
-            # Median
-            _fig_surplus.add_trace(go.Scatter(
-                x=_surplus_df["month"], y=_surplus_df["surplus_p50"],
+            _fig_runoff.add_trace(go.Scatter(
+                x=_runoff_df["month"], y=_runoff_df["surplus_p50"] / _s_dv,
                 mode="lines+markers", name="Median surplus",
                 line=dict(color="#1f77b4", width=2),
-                hovertemplate="Month %{x}<br>Median: $%{y:.1f}M<extra></extra>",
+                hovertemplate=f"Month %{{x}}<br>Median: $%{{y:.1f}}{_s_un}<extra></extra>",
             ))
 
-            # Zero line (ruin threshold)
-            _fig_surplus.add_hline(y=0, line_dash="dot", line_color="red",
+            _fig_runoff.add_hline(y=0, line_dash="dot", line_color="red",
                                    annotation_text="Ruin threshold",
                                    annotation_position="bottom right")
 
-            _fig_surplus.update_layout(
-                title="Surplus Trajectory with Regime-Switching (50,000 scenarios)",
-                xaxis_title="Month", yaxis_title="Surplus ($M)", height=420,
+            _fig_runoff.update_layout(
+                title="Run-Off Surplus Trajectory with Regime-Switching (50,000 scenarios)",
+                xaxis_title="Month", yaxis_title=f"Surplus (${_s_un})", height=420,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
-            st.plotly_chart(_fig_surplus, use_container_width=True)
+            st.plotly_chart(_fig_runoff, use_container_width=True)
 
-            # Ruin probability
-            _ruin_final = _surplus_df["ruin_probability"].iloc[-1]
+            _ruin_final = _runoff_df["ruin_probability"].iloc[-1]
             if _ruin_final > 0:
                 st.metric("12-Month Ruin Probability", f"{_ruin_final:.4%}",
-                          help="Probability that surplus drops below zero within 12 months under the regime-switching model.")
+                          help="Probability that surplus drops below zero within 12 months.")
             else:
-                st.info("No ruin events observed in 50,000 scenarios — surplus remains healthy over the 12-month horizon.")
+                st.info("No ruin events observed in 50,000 scenarios — surplus remains healthy.")
         else:
-            st.info("Surplus evolution data not yet available. Run Module 3 (Ray target) to generate.")
+            st.info("Run-off projection data not yet available. Run Module 3 to generate.")
 
         # ── Section 5: Reserve Development Triangle ──────────────────────────────
         st.divider()
@@ -338,12 +349,10 @@ def render(tab):
         )
         _triangle_data = load_reserve_triangle()
         if not _triangle_data.empty:
-            # Let user select a product line to view
             _tri_products = sorted(_triangle_data["product_line"].unique())
             _tri_selected = st.selectbox("Product line:", _tri_products, key="tri_prod")
             _tri_filtered = _triangle_data[_triangle_data["product_line"] == _tri_selected]
 
-            # Aggregate across regions for the selected product line
             _tri_agg = (
                 _tri_filtered
                 .groupby(["accident_month", "dev_lag"])
@@ -351,7 +360,6 @@ def render(tab):
                 .reset_index()
             )
 
-            # Pivot to triangle format: accident_month × dev_lag → cumulative_paid
             if not _tri_agg.empty:
                 _pivot = _tri_agg.pivot_table(
                     index="accident_month", columns="dev_lag",
@@ -360,15 +368,13 @@ def render(tab):
                 _pivot.columns = [f"Lag {int(c)}" for c in _pivot.columns]
                 _pivot.index.name = "Accident Month"
 
-                # Format as currency
                 _display_tri = _pivot.map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
                 st.dataframe(_display_tri, use_container_width=True)
 
-                # Development factor summary
-                with st.expander("📊 Development Factors"):
+                with st.expander("📊 Development Factors (Link Ratios)"):
                     st.caption(
-                        "Link ratios (cumulative paid at lag N / cumulative paid at lag N-1) — "
-                        "used by actuaries to estimate ultimate losses via the chain ladder method."
+                        "Weighted link ratios — the core of the chain ladder method. "
+                        "f_k = Σ C(i,k+1) / Σ C(i,k) across accident periods."
                     )
                     _dev_factors = {}
                     _cols = sorted(_tri_agg["dev_lag"].unique())

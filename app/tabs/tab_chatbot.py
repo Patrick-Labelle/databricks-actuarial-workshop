@@ -22,23 +22,23 @@ def _escape_latex(text: str) -> str:
 
 
 EXAMPLE_QUESTIONS = [
-    "What are the current Solvency Capital Requirements for the portfolio?",
+    "What is the current best estimate IBNR for the portfolio?",
     "Show me the top 5 segments by average monthly claims",
-    "Generate a 12-month claims forecast",
-    "What would happen to capital requirements if property losses doubled?",
-    "Explain how the GARCH model captures volatility clustering",
-    "Compare the stress test scenarios — which one has the highest SCR?",
-    "Which provinces have the highest projected claims for the next year?",
-    "Show the claims trend for Commercial Property over time",
+    "Generate a 12-month frequency forecast",
+    "What would happen to reserve risk if LDFs deteriorated by 20%?",
+    "Explain how the Bootstrap Chain Ladder works",
+    "Compare the reserve scenarios — which one has the highest VaR 99.5%?",
+    "Which provinces have the highest projected claim frequency?",
+    "What is the MCT ratio and how is it calculated?",
 ]
 
 
 def render(tab):
     with tab:
-        st.subheader("Actuarial Risk Assistant")
+        st.subheader("Reserve Assistant")
         st.caption(
-            "Ask questions about claims data, forecasts, capital requirements, "
-            "stress scenarios, or actuarial concepts"
+            "Ask questions about reserve adequacy, IBNR, frequency forecasts, "
+            "reserve scenarios, or actuarial concepts"
         )
 
         # Initialize chat history
@@ -57,7 +57,7 @@ def render(tab):
         chat_container = st.container()
 
         # Chat input — always at the bottom of the page
-        prompt = st.chat_input("Ask about claims, forecasts, capital, or risk...")
+        prompt = st.chat_input("Ask about reserves, IBNR, forecasts, or risk...")
         if prompt:
             st.session_state.chat_messages.append({"role": "user", "content": prompt})
             st.rerun()
@@ -83,10 +83,12 @@ def render(tab):
                         if m["role"] in ("user", "assistant")
                     ]
 
+                    tool_status = st.empty()
                     for chunk in chat(agent_messages):
                         if chunk.startswith("_Calling"):
-                            st.caption(chunk.strip("_\n"))
+                            tool_status.caption(chunk.strip("_\n"))
                         else:
+                            tool_status.empty()
                             full_response += chunk
                             response_placeholder.markdown(_escape_latex(full_response))
 
