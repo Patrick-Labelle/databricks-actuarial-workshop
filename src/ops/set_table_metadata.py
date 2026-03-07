@@ -9,10 +9,12 @@
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "", "UC Catalog")
-dbutils.widgets.text("schema", "actuarial_workshop", "UC Schema")
+dbutils.widgets.text("data_schema", "actuarial_data", "Data Schema")
+dbutils.widgets.text("models_schema", "actuarial_models", "Models Schema")
 
 CATALOG = dbutils.widgets.get("catalog")
-SCHEMA = dbutils.widgets.get("schema")
+DATA_SCHEMA = dbutils.widgets.get("data_schema")
+MODELS_SCHEMA = dbutils.widgets.get("models_schema")
 
 # COMMAND ----------
 
@@ -183,8 +185,12 @@ TABLE_METADATA = [
 
 # COMMAND ----------
 
+# Route tables to the correct schema based on naming convention
+_MODELS_PREFIXES = ("predictions_",)
+
 for table_name, table_comment, columns in TABLE_METADATA:
-    fqn = f"`{CATALOG}`.`{SCHEMA}`.`{table_name}`"
+    schema = MODELS_SCHEMA if table_name.startswith(_MODELS_PREFIXES) else DATA_SCHEMA
+    fqn = f"`{CATALOG}`.`{schema}`.`{table_name}`"
 
     # Check table exists before setting comments
     try:

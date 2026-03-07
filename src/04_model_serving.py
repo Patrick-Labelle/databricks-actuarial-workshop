@@ -26,7 +26,8 @@ warnings.filterwarnings("ignore")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
-dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
+dbutils.widgets.text("data_schema",     "actuarial_data",                       "Data Schema")
+dbutils.widgets.text("models_schema",   "actuarial_models",                     "Models Schema")
 dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster Endpoint")
 dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves Endpoint")
 dbutils.widgets.text("warehouse_id",     "",                                     "SQL Warehouse ID")
@@ -35,16 +36,17 @@ dbutils.widgets.text("app_sp_client_id", "",                                    
 dbutils.widgets.text("genie_space_id",  "",                                     "Genie Space ID")
 
 CATALOG          = dbutils.widgets.get("catalog")
-SCHEMA           = dbutils.widgets.get("schema")
+DATA_SCHEMA      = dbutils.widgets.get("data_schema")
+MODELS_SCHEMA    = dbutils.widgets.get("models_schema")
 ENDPOINT_NAME    = dbutils.widgets.get("endpoint_name")
 MC_ENDPOINT_NAME = dbutils.widgets.get("mc_endpoint_name")
 WAREHOUSE_ID     = dbutils.widgets.get("warehouse_id")
 PG_DATABASE      = dbutils.widgets.get("pg_database")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
-SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
-MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
-FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
+SARIMA_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
+MC_MODEL_NAME     = f"{CATALOG}.{MODELS_SCHEMA}.bootstrap_reserve_simulator"
+FEATURE_TABLE     = f"{CATALOG}.{DATA_SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
 
@@ -136,7 +138,7 @@ _sarima_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
-        "schema_name":       SCHEMA,
+        "schema_name":       MODELS_SCHEMA,
         "table_name_prefix": "frequency_endpoint",
         "enabled":           True,
     },
@@ -206,7 +208,7 @@ _mc_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
-        "schema_name":       SCHEMA,
+        "schema_name":       MODELS_SCHEMA,
         "table_name_prefix": "bootstrap_endpoint",
         "enabled":           True,
     },
@@ -234,7 +236,7 @@ print(f"\nBoth endpoints created/updated. They take ~5 minutes to reach READY st
 
 # COMMAND ----------
 
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.segment_features_online"
+ONLINE_TABLE_NAME = f"{CATALOG}.{MODELS_SCHEMA}.segment_features_online"
 
 online_table_spec = {
     "name": ONLINE_TABLE_NAME,
@@ -446,33 +448,34 @@ _GENIE_DESCRIPTION = (
 )
 
 # Per-table descriptions (shown to Genie as context for each table)
-_GENIE_TABLES = [
-    ("features_segment_monthly",
+# Tuples: (schema_var, table_name, description)
+_GENIE_TABLES_DATA = [
+    (DATA_SCHEMA, "features_segment_monthly",
      ["Feature-engineered table for ML models."]),
-    ("gold_claims_monthly",
+    (DATA_SCHEMA, "gold_claims_monthly",
      ["Historical monthly claims by segment. Key columns: claims_count, "
       "total_incurred, avg_severity, earned_premium."]),
-    ("gold_reserve_triangle",
+    (DATA_SCHEMA, "gold_reserve_triangle",
      ["Reserve development triangle. Rows=accident periods, columns=development months. "
       "Includes incremental_paid and incremental_incurred."]),
-    ("predictions_bootstrap_reserves",
+    (MODELS_SCHEMA, "predictions_bootstrap_reserves",
      ["Bootstrap Chain Ladder reserve distribution. "
       "best_estimate_M = mean IBNR, var_995_M = Reserve Risk Capital at 99.5%."]),
-    ("predictions_frequency_forecast",
+    (MODELS_SCHEMA, "predictions_frequency_forecast",
      ["SARIMAX+GARCH frequency forecasts. Filter record_type='forecast' for future. "
       "Has forecast_mean, forecast_lo95, forecast_hi95, cond_volatility."]),
-    ("predictions_ldf_volatility",
+    (MODELS_SCHEMA, "predictions_ldf_volatility",
      ["Development factor volatility per product line. avg_ldf, std_ldf, n_factors."]),
-    ("predictions_reserve_evolution",
+    (MODELS_SCHEMA, "predictions_reserve_evolution",
      ["12-month reserve adequacy outlook with var_995_vs_baseline = % change."]),
-    ("predictions_reserve_scenarios",
+    (MODELS_SCHEMA, "predictions_reserve_scenarios",
      ["Reserve deterioration scenarios: adverse_development, judicial_inflation, "
       "pandemic_tail, superimposed_inflation. var_995_vs_baseline = % impact."]),
-    ("predictions_runoff_projection",
+    (MODELS_SCHEMA, "predictions_runoff_projection",
      ["Multi-period run-off surplus trajectory with ruin probability."]),
-    ("silver_reserves",
+    (DATA_SCHEMA, "silver_reserves",
      ["Reserve development with SCD2 change tracking."]),
-    ("silver_rolling_features",
+    (DATA_SCHEMA, "silver_rolling_features",
      ["Rolling statistical features (12/24-month windows)."]),
 ]
 
@@ -494,8 +497,8 @@ def _build_serialized_space():
         "version": 2,
         "data_sources": {
             "tables": [
-                {"identifier": f"{CATALOG}.{SCHEMA}.{name}", "description": desc}
-                for name, desc in _GENIE_TABLES
+                {"identifier": f"{CATALOG}.{schema}.{name}", "description": desc}
+                for schema, name, desc in _GENIE_TABLES_DATA
             ]
         },
         "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
@@ -539,7 +542,7 @@ if WAREHOUSE_ID and not _genie_space_id:
         )
         _genie_space_id = _space.space_id
         print(f"Genie Space created: {_genie_space_id}")
-        print(f"  Tables: {len(_GENIE_TABLES)}")
+        print(f"  Tables: {len(_GENIE_TABLES_DATA)}")
 
         # Grant app SP access to the Genie space
         if APP_SP_CLIENT_ID:

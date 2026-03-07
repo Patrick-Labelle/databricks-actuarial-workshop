@@ -13,7 +13,7 @@ import pandas as pd
 
 from auth import get_workspace_client
 from config import (
-    CATALOG, SCHEMA, WAREHOUSE_ID,
+    CATALOG, DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA, WAREHOUSE_ID,
     ENDPOINT_NAME, MC_ENDPOINT_NAME,
     GENIE_SPACE_ID,
 )
@@ -21,14 +21,8 @@ from config import (
 
 # ── Data query tool (SQL via warehouse) ──────────────────────────────────────
 
-AVAILABLE_TABLES = {
-    "predictions_frequency_forecast": "Monthly SARIMAX+GARCH frequency forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
-    "predictions_bootstrap_reserves": "Portfolio-level Bootstrap Chain Ladder reserve distribution. Columns: best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, max_ibnr_M.",
-    "predictions_reserve_scenarios": "Pre-computed reserve deterioration scenarios. Columns: scenario_label, best_estimate_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
-    "predictions_reserve_evolution": "12-month reserve adequacy evolution. Columns: forecast_month, month_idx, best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, var_995_vs_baseline.",
-    "predictions_runoff_projection": "Multi-period run-off surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
-    "predictions_ldf_volatility": "Development factor volatility per product line. Columns: product_line, avg_ldf, std_ldf, n_factors.",
-    "predictions_reserve_validation": "Reserve adequacy validation. Columns: segment_id, accident_month, reserve_adequacy_ratio.",
+# Tables organized by schema — the chatbot can query across all schemas
+_DATA_TABLES = {
     "gold_claims_monthly": "Historical monthly claims aggregated by segment. Columns: segment_id, product_line, region, month, claims_count, total_incurred, avg_severity, earned_premium.",
     "gold_reserve_triangle": "Loss development triangle. Columns: segment_id, product_line, region, accident_month, dev_lag, cumulative_paid, cumulative_incurred, case_reserve, incremental_paid, incremental_incurred.",
     "silver_reserves": "SCD Type 2 reserve development. Columns: reserve_id, segment_id, accident_month, dev_lag, paid_cumulative, incurred_cumulative, case_reserve, effective_date, end_date, is_current.",
@@ -36,24 +30,36 @@ AVAILABLE_TABLES = {
     "features_segment_monthly": "Feature Store table with macro features. Columns: segment_id, month, claims_count, plus rolling and macro-economic features.",
 }
 
+_MODELS_TABLES = {
+    "predictions_frequency_forecast": "Monthly SARIMAX+GARCH frequency forecasts per segment. Columns: segment_id, month, record_type (actual/forecast), claims_count, forecast_mean, forecast_lo95, forecast_hi95, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta.",
+    "predictions_bootstrap_reserves": "Portfolio-level Bootstrap Chain Ladder reserve distribution. Columns: best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, max_ibnr_M.",
+    "predictions_reserve_scenarios": "Pre-computed reserve deterioration scenarios. Columns: scenario_label, best_estimate_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
+    "predictions_reserve_evolution": "12-month reserve adequacy evolution. Columns: forecast_month, month_idx, best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, var_995_vs_baseline.",
+    "predictions_runoff_projection": "Multi-period run-off surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
+    "predictions_ldf_volatility": "Development factor volatility per product line. Columns: product_line, avg_ldf, std_ldf, n_factors.",
+    "predictions_reserve_validation": "Reserve adequacy validation. Columns: segment_id, accident_month, reserve_adequacy_ratio.",
+}
+
+# Build fully-qualified table map for the chatbot
+AVAILABLE_TABLES = {}
+for name, desc in _DATA_TABLES.items():
+    AVAILABLE_TABLES[f"{CATALOG}.{DATA_SCHEMA}.{name}"] = desc
+for name, desc in _MODELS_TABLES.items():
+    AVAILABLE_TABLES[f"{CATALOG}.{MODELS_SCHEMA}.{name}"] = desc
+
 
 def query_data(sql_query: str) -> str:
     """FALLBACK ONLY: Execute a read-only SQL query. Use ask_genie first for any data question — only call this if ask_genie fails or returns no results.
 
     Args:
-        sql_query: A SELECT query against the actuarial workshop tables.
-            Available tables (all in {catalog}.{schema}):
-            - predictions_frequency_forecast: Monthly SARIMAX+GARCH forecasts per segment
-            - predictions_bootstrap_reserves: Bootstrap Chain Ladder reserve distribution
-            - predictions_reserve_scenarios: Pre-computed reserve deterioration scenarios
-            - predictions_reserve_evolution: 12-month reserve adequacy evolution
-            - predictions_runoff_projection: Run-off surplus trajectory
-            - predictions_ldf_volatility: Development factor volatility
-            - gold_claims_monthly: Historical monthly claims by segment
-            - gold_reserve_triangle: Loss development triangle
-            - silver_reserves: SCD2 reserve development
-            - silver_rolling_features: Rolling stats per segment
-            - features_segment_monthly: Feature Store with macro features
+        sql_query: A SELECT query using fully qualified table names.
+            Data tables (in {catalog}.{data_schema}):
+            - gold_claims_monthly, gold_reserve_triangle, silver_reserves,
+              silver_rolling_features, features_segment_monthly
+            Model output tables (in {catalog}.{models_schema}):
+            - predictions_frequency_forecast, predictions_bootstrap_reserves,
+              predictions_reserve_scenarios, predictions_reserve_evolution,
+              predictions_runoff_projection, predictions_ldf_volatility
 
     Returns:
         Query results as a formatted string table, or an error message.

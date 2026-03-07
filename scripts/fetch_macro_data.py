@@ -15,7 +15,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "my_catalog",        "UC Catalog")
-dbutils.widgets.text("schema",  "actuarial_workshop", "UC Schema")
+dbutils.widgets.text("schema",  "actuarial_data", "UC Schema")
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA  = dbutils.widgets.get("schema")
 

@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 
 from auth import get_workspace_client, get_auth_init_error
-from config import WAREHOUSE_ID, CATALOG, SCHEMA
+from config import WAREHOUSE_ID, CATALOG, DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA
 
 
 def execute_sql(statement: str) -> pd.DataFrame:
@@ -41,7 +41,7 @@ def execute_sql(statement: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_segments():
-    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{SCHEMA}.predictions_frequency_forecast ORDER BY 1")
+    df = execute_sql(f"SELECT DISTINCT segment_id FROM {CATALOG}.{APP_SCHEMA}.predictions_frequency_forecast ORDER BY 1")
     if not df.empty:
         return df["segment_id"].tolist()
     return []
@@ -51,7 +51,7 @@ def load_segments():
 def load_forecasts(segment_id: str):
     return execute_sql(f"""
         SELECT month, record_type, claims_count, forecast_mean, forecast_lo95, forecast_hi95
-        FROM {CATALOG}.{SCHEMA}.predictions_frequency_forecast
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_frequency_forecast
         WHERE segment_id = '{segment_id}'
         ORDER BY month
     """)
@@ -68,7 +68,7 @@ def load_bootstrap_summary():
             AVG(cvar_99_M)              AS cvar_99,
             AVG(reserve_risk_capital_M) AS reserve_risk_capital,
             MAX(max_ibnr_M)             AS max_ibnr
-        FROM {CATALOG}.{SCHEMA}.predictions_bootstrap_reserves
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_bootstrap_reserves
     """)
     if not df.empty:
         for col in df.columns:
@@ -92,7 +92,7 @@ def load_segment_stats(segment_id: str):
             ROUND(STDDEV(claims_count), 1)      AS stddev_claims,
             MIN(claims_count)                   AS min_claims,
             MAX(claims_count)                   AS max_claims
-        FROM {CATALOG}.{SCHEMA}.gold_claims_monthly
+        FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
         WHERE segment_id = '{segment_id}'
     """)
 
@@ -102,7 +102,7 @@ def load_reserve_scenarios():
     """Load pre-computed reserve deterioration scenarios."""
     df = execute_sql(f"""
         SELECT scenario_label, best_estimate_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline
-        FROM {CATALOG}.{SCHEMA}.predictions_reserve_scenarios
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_reserve_scenarios
         ORDER BY var_995_M DESC
     """)
     if not df.empty:
@@ -118,7 +118,7 @@ def load_reserve_evolution():
     df = execute_sql(f"""
         SELECT forecast_month, month_idx, best_estimate_M, var_99_M, var_995_M,
                cvar_99_M, reserve_risk_capital_M, var_995_vs_baseline
-        FROM {CATALOG}.{SCHEMA}.predictions_reserve_evolution
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_reserve_evolution
         ORDER BY month_idx
     """)
     if not df.empty:
@@ -133,7 +133,7 @@ def load_garch_volatility(segment_id: str):
     """Load GARCH conditional volatility from frequency forecast residuals."""
     df = execute_sql(f"""
         SELECT month, record_type, cond_volatility, arch_lm_pvalue, garch_alpha, garch_beta
-        FROM {CATALOG}.{SCHEMA}.predictions_frequency_forecast
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_frequency_forecast
         WHERE segment_id = '{segment_id}'
           AND cond_volatility IS NOT NULL
         ORDER BY month
@@ -150,7 +150,7 @@ def load_reserve_triangle():
     df = execute_sql(f"""
         SELECT segment_id, product_line, region, accident_month, dev_lag,
                cumulative_paid, cumulative_incurred, case_reserve
-        FROM {CATALOG}.{SCHEMA}.gold_reserve_triangle
+        FROM {CATALOG}.{APP_SCHEMA}.gold_reserve_triangle
         ORDER BY segment_id, accident_month, dev_lag
     """)
     if not df.empty:
@@ -165,7 +165,7 @@ def load_runoff_projection():
     """Load run-off surplus trajectory."""
     df = execute_sql(f"""
         SELECT month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability
-        FROM {CATALOG}.{SCHEMA}.predictions_runoff_projection
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_runoff_projection
         ORDER BY month
     """)
     if not df.empty:
@@ -184,7 +184,7 @@ def load_mct_components():
                        PARTITION BY product_line, accident_month
                        ORDER BY dev_lag DESC
                    ) AS rn
-            FROM {CATALOG}.{SCHEMA}.gold_reserve_triangle
+            FROM {CATALOG}.{APP_SCHEMA}.gold_reserve_triangle
         )
         SELECT
             product_line,
@@ -204,9 +204,9 @@ def load_mct_components():
             AVG(monthly_premium) * 12 AS annual_earned_premium
         FROM (
             SELECT product_line, month, SUM(earned_premium) AS monthly_premium
-            FROM {CATALOG}.{SCHEMA}.gold_claims_monthly
+            FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
             WHERE month >= ADD_MONTHS(
-                (SELECT MAX(month) FROM {CATALOG}.{SCHEMA}.gold_claims_monthly), -11
+                (SELECT MAX(month) FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly), -11
             )
             GROUP BY product_line, month
         )
@@ -225,7 +225,7 @@ def load_ldf_volatility():
     """Load development factor volatility per product line."""
     df = execute_sql(f"""
         SELECT product_line, avg_ldf, std_ldf, n_factors
-        FROM {CATALOG}.{SCHEMA}.predictions_ldf_volatility
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_ldf_volatility
     """)
     if not df.empty:
         for col in ['avg_ldf', 'std_ldf', 'n_factors']:

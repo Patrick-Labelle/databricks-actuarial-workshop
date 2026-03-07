@@ -9,16 +9,22 @@
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
-dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
+dbutils.widgets.text("data_schema",     "actuarial_data",                       "Data Schema")
+dbutils.widgets.text("models_schema",   "actuarial_models",                     "Models Schema")
+dbutils.widgets.text("app_schema",      "actuarial_app",                        "App Schema")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP client ID")
 dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster endpoint")
 dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves endpoint")
 
 CATALOG          = dbutils.widgets.get("catalog")
-SCHEMA           = dbutils.widgets.get("schema")
+DATA_SCHEMA      = dbutils.widgets.get("data_schema")
+MODELS_SCHEMA    = dbutils.widgets.get("models_schema")
+APP_SCHEMA       = dbutils.widgets.get("app_schema")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 ENDPOINT_NAME    = dbutils.widgets.get("endpoint_name")
 MC_ENDPOINT_NAME = dbutils.widgets.get("mc_endpoint_name")
+
+ALL_SCHEMAS = [DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA]
 
 WORKSPACE_URL = spark.conf.get("spark.databricks.workspaceUrl")
 import os, requests
@@ -38,7 +44,10 @@ if not TOKEN:
 CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
 print(f"Workspace:          {WORKSPACE_URL}")
-print(f"Catalog/Schema:     {CATALOG}.{SCHEMA}")
+print(f"Catalog:            {CATALOG}")
+print(f"  Data schema:      {DATA_SCHEMA}")
+print(f"  Models schema:    {MODELS_SCHEMA}")
+print(f"  App schema:       {APP_SCHEMA}")
 print(f"Frequency endpoint: {ENDPOINT_NAME}")
 print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
 print(f"App SP client ID:   {APP_SP_CLIENT_ID or '(not provided)'}")
@@ -57,20 +66,27 @@ print(f"Granting UC permissions to SP: {APP_SP_CLIENT_ID}")
 spark.sql(f"GRANT USE CATALOG ON CATALOG {CATALOG} TO `{APP_SP_CLIENT_ID}`")
 print(f"[OK] GRANT USE CATALOG ON {CATALOG}")
 
-spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{SCHEMA} TO `{APP_SP_CLIENT_ID}`")
-print(f"[OK] GRANT USE SCHEMA ON {CATALOG}.{SCHEMA}")
+for _schema in ALL_SCHEMAS:
+    # Create schema if it doesn't exist (app_schema is created here before synced tables)
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{_schema}")
 
-tables = [
-    row["tableName"]
-    for row in spark.sql(f"SHOW TABLES IN {CATALOG}.{SCHEMA}").collect()
-]
-print(f"Granting SELECT on {len(tables)} tables...")
-for t in tables:
-    try:
-        spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{SCHEMA}.{t} TO `{APP_SP_CLIENT_ID}`")
-        print(f"  [OK] {t}")
-    except Exception as e:
-        print(f"  [WARN] {t}: {e}")
+    spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{_schema} TO `{APP_SP_CLIENT_ID}`")
+    print(f"[OK] GRANT USE SCHEMA ON {CATALOG}.{_schema}")
+
+    tables = [
+        row["tableName"]
+        for row in spark.sql(f"SHOW TABLES IN {CATALOG}.{_schema}").collect()
+    ]
+    if tables:
+        print(f"Granting SELECT on {len(tables)} tables in {_schema}...")
+        for t in tables:
+            try:
+                spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{_schema}.{t} TO `{APP_SP_CLIENT_ID}`")
+                print(f"  [OK] {t}")
+            except Exception as e:
+                print(f"  [WARN] {t}: {e}")
+    else:
+        print(f"  No tables in {_schema} yet (synced tables will be added later)")
 
 print("\nUC grants complete.")
 
