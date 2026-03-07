@@ -118,12 +118,10 @@ api_delete "Online Table" "/api/2.0/online-tables/${CATALOG}.${SCHEMA}.segment_f
 # 2c. Serving endpoints
 api_delete "Endpoint ${ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${ENDPOINT_NAME}"
 api_delete "Endpoint ${MC_ENDPOINT_NAME}" "/api/2.0/serving-endpoints/${MC_ENDPOINT_NAME}"
-api_delete "Endpoint actuarial-workshop-chatbot-agent" "/api/2.0/serving-endpoints/actuarial-workshop-chatbot-agent"
 
 # 2d. UC models
-api_delete "Model sarima_claims_forecaster" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.sarima_claims_forecaster"
-api_delete "Model monte_carlo_portfolio" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.monte_carlo_portfolio"
-api_delete "Model actuarial_chatbot_agent" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.actuarial_chatbot_agent"
+api_delete "Model frequency_forecaster" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.frequency_forecaster"
+api_delete "Model bootstrap_reserve_simulator" "/api/2.1/unity-catalog/models/${CATALOG}.${SCHEMA}.bootstrap_reserve_simulator"
 
 # 2e. Genie space
 if [ -n "$GENIE_SPACE_ID" ]; then
@@ -166,10 +164,9 @@ def req(method, path, body=None):
     try:
         with urllib.request.urlopen(r) as resp: return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read() or b'{}')
-for name in [f"/Users/{user}/actuarial_workshop_sarima_claims_forecaster",
-             f"/Users/{user}/actuarial_workshop_claims_sarima",
-             f"/Users/{user}/actuarial_workshop_monte_carlo_portfolio",
-             f"/Users/{user}/actuarial_workshop_chatbot_agent"]:
+for name in [f"/Users/{user}/actuarial_workshop_frequency_forecaster",
+             f"/Users/{user}/actuarial_workshop_bootstrap_reserve_simulator",
+             "/Shared/actuarial-workshop-app-traces"]:
     status, data = req("GET", f"/api/2.0/mlflow/experiments/get-by-name?experiment_name={urllib.parse.quote(name)}")
     if status == 404 or "experiment" not in data:
         print(f"    [SKIP] {name.split('/')[-1]}"); continue

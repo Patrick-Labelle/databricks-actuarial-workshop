@@ -17,8 +17,8 @@ resources:
       name: "Actuarial Workshop — Full Setup"
       description: >-
         One-time setup: generates synthetic data, runs the declarative pipeline,
-        builds the Feature Store, fits SARIMA/GARCH models, registers both
-        models to UC, and creates the serving endpoints with AI Gateway.
+        builds the Feature Store, fits SARIMAX/GARCH + Bootstrap Chain Ladder models,
+        registers both models to UC, and creates the serving endpoints with AI Gateway.
 
       job_clusters:
         - job_cluster_key: ray_ml_cluster
@@ -82,9 +82,9 @@ resources:
               schema: "${var.schema}"
               warehouse_id: "${var.warehouse_id}"
 
-        # Task 4 — Fit SARIMAX / GARCH / Monte Carlo + register models (Module 4)
+        # Task 4 — Fit SARIMAX / GARCH / Bootstrap Chain Ladder + register models (Module 4)
         - task_key: fit_statistical_models
-          description: "SARIMAX/GARCH/Monte Carlo + register both models (SARIMA + MC) to UC"
+          description: "SARIMAX/GARCH/Bootstrap Chain Ladder + register both models (Frequency + Bootstrap) to UC"
           depends_on:
             - task_key: build_feature_store
           job_cluster_key: ray_ml_cluster
@@ -94,11 +94,23 @@ resources:
               catalog: "${var.catalog}"
               schema: "${var.schema}"
 
+        # Task 4b — Set UC table & column descriptions for Genie / lineage
+        - task_key: set_table_metadata
+          description: "Add human-readable descriptions to all UC tables and columns (inherited by Genie spaces)"
+          depends_on:
+            - task_key: fit_statistical_models
+          job_cluster_key: ray_ml_cluster
+          notebook_task:
+            notebook_path: ../src/ops/set_table_metadata.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+
         # Task 5 — Prepare all app infrastructure (Module 5)
         - task_key: prepare_app_infrastructure
           description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup, Genie Space"
           depends_on:
-            - task_key: fit_statistical_models
+            - task_key: set_table_metadata
           job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/04_model_serving.py
@@ -128,22 +140,6 @@ resources:
               mc_endpoint_name: "${var.mc_endpoint_name}"
               genie_space_id: "${var.genie_space_id}"
 
-        # Task 7 — Register chatbot as Databricks Agent
-        - task_key: register_chatbot_agent
-          description: "Register actuarial chatbot as Databricks Agent (AI Gateway visibility)"
-          depends_on:
-            - task_key: setup_app_dependencies
-          job_cluster_key: ray_ml_cluster
-          notebook_task:
-            notebook_path: ../src/ops/register_agent.py
-            base_parameters:
-              catalog: "${var.catalog}"
-              schema: "${var.schema}"
-              endpoint_name: "${var.endpoint_name}"
-              mc_endpoint_name: "${var.mc_endpoint_name}"
-              warehouse_id: "${var.warehouse_id}"
-              llm_endpoint_name: "${var.llm_endpoint_name}"
-              genie_space_id: "${var.genie_space_id}"
 
     # ── Monthly Model Refresh Job ──────────────────────────────────────────────
     # Scheduled job: refreshes data via the declarative pipeline then re-fits the SARIMA models.
@@ -151,7 +147,7 @@ resources:
       name: "Actuarial Workshop — Monthly Model Refresh"
       description: >-
         Monthly scheduled job: refreshes Bronze→Silver→Gold via the declarative pipeline,
-        then re-fits SARIMA/GARCH models and logs to MLflow.
+        then re-fits SARIMAX/GARCH + Bootstrap Chain Ladder models and logs to MLflow.
 
       schedule:
         quartz_cron_expression: "0 0 3 1 * ?"
@@ -188,12 +184,23 @@ resources:
             full_refresh: false
 
         - task_key: refit_statistical_models
-          description: "Re-fit SARIMAX/GARCH models on refreshed data with updated macro signals"
+          description: "Re-fit SARIMAX/GARCH + Bootstrap Chain Ladder models on refreshed data"
           depends_on:
             - task_key: refresh_dlt_pipeline
           job_cluster_key: ray_ml_cluster
           notebook_task:
             notebook_path: ../src/03_classical_stats_at_scale.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
+
+        - task_key: set_table_metadata
+          description: "Refresh UC table and column descriptions"
+          depends_on:
+            - task_key: refit_statistical_models
+          job_cluster_key: ray_ml_cluster
+          notebook_task:
+            notebook_path: ../src/ops/set_table_metadata.py
             base_parameters:
               catalog: "${var.catalog}"
               schema: "${var.schema}"

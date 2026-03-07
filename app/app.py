@@ -2,7 +2,7 @@ import streamlit as st
 
 # ─── Page config (must be the first Streamlit call) ──────────────────────────
 st.set_page_config(
-    page_title="Insurance Portfolio Risk Intelligence",
+    page_title="Stochastic Reserve Analytics",
     page_icon="📊",
     layout="wide",
 )
@@ -23,13 +23,14 @@ with st.sidebar:
 
     st.markdown("**Portfolio Data**")
     st.markdown("""
-Insurance claims across **40 segments** (product line × Canadian province):
+Insurance reserves across **40 segments** (product line × Canadian province):
 
 | | |
 |---|---|
 | **Product lines** | Personal Auto, Commercial Auto, Homeowners, Commercial Property |
 | **Provinces** | All 10 Canadian provinces |
 | **Period** | Jan 2019 – Dec 2025 (84 months) |
+| **Triangle** | Loss development with line-specific tail lengths (36–60 months) |
 | **Macro data** | StatCan unemployment, housing price index, housing starts |
 """)
 
@@ -38,9 +39,10 @@ Insurance claims across **40 segments** (product line × Canadian province):
     st.markdown("""
 | Model | Business purpose |
 |---|---|
-| **Claims Forecasting** | Projects monthly claim volumes per segment — used in the Claims Forecast and Quick Forecast tabs |
-| **Volatility Model** | GARCH(1,1) on SARIMA residuals — captures time-varying forecast uncertainty, feeds into Monte Carlo capital calculations |
-| **Monte Carlo Simulation** | Runs millions of loss scenarios to compute capital requirements (Expected Loss, SCR, Tail Risk) — powers the Capital Requirements and Stress Testing tabs |
+| **Frequency Forecasting** | SARIMAX projects future accident period claim counts — the exposure base for new reserves |
+| **Chain Ladder** | Deterministic best estimate IBNR from weighted link ratios and Mack variance |
+| **Bootstrap Chain Ladder** | 40K+ bootstrap replications produce the reserve risk distribution — VaR 99.5%, CVaR, reserve risk capital |
+| **GARCH(1,1)** | Time-varying frequency volatility from SARIMAX residuals |
 """)
 
     st.divider()
@@ -49,14 +51,14 @@ Insurance claims across **40 segments** (product line × Canadian province):
 ```
 Raw CDC events
   → Bronze (Spark Declarative Pipelines)
-  → Silver (SCD Type 2 policies)
-  → Gold (monthly segment stats)
+  → Silver (SCD Type 2 reserves)
+  → Gold (reserve triangle + monthly claims)
   → Feature Store (point-in-time joins)
-  → SARIMA+GARCH per segment
-  → Monte Carlo portfolio simulation
+  → SARIMAX frequency forecasting
+  → Chain Ladder + Bootstrap (Ray)
   → UC Model Registry (@Champion)
-     ├── SARIMA endpoint (Forecasts tab)
-     └── Monte Carlo endpoint (Scenario tab)
+     ├── Frequency Forecaster endpoint
+     └── Bootstrap Reserve endpoint
   → This App
 ```
 All assets are version-controlled and reproducible.
@@ -68,23 +70,23 @@ the Unity Catalog Model Registry.
     st.caption("Powered by Databricks Apps + Streamlit")
 
 # ─── App Header + Tabs ───────────────────────────────────────────────────────
-st.title("📊 Insurance Portfolio Risk Intelligence")
-st.caption("Powered by Databricks | Claims Forecasting · Capital Planning · Catastrophe Analysis")
+st.title("📊 Stochastic Reserve Analytics")
+st.caption("Powered by Databricks | Claims Forecasting · Reserve Adequacy · Scenario Stress Testing")
 
 tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "💬 Risk Assistant",
     "📈 Claims Forecast",
-    "💰 Capital Requirements",
-    "⚡ Quick Forecast",
-    "🎲 Stress Testing",
-    "🌪️ Catastrophe & Reserves",
+    "💰 Reserve Adequacy",
+    "📋 Scenario Analysis",
+    "⚡ On-Demand Forecast",
+    "📖 Glossary",
 ])
 
-from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_quick_forecast, tab_stress_testing, tab_catastrophe
+from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_catastrophe, tab_quick_forecast, tab_glossary
 
 tab_chatbot.render(tab0)
 tab_claims_forecast.render(tab1)
 tab_capital.render(tab2)
-tab_quick_forecast.render(tab3)
-tab_stress_testing.render(tab4)
-tab_catastrophe.render(tab5)
+tab_catastrophe.render(tab3)
+tab_quick_forecast.render(tab4)
+tab_glossary.render(tab5)

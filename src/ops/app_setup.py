@@ -11,8 +11,8 @@
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
 dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP client ID")
-dbutils.widgets.text("endpoint_name",    "actuarial-workshop-sarima-forecaster", "SARIMA endpoint name")
-dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-monte-carlo",       "Monte Carlo endpoint name")
+dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster endpoint")
+dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves endpoint")
 
 CATALOG          = dbutils.widgets.get("catalog")
 SCHEMA           = dbutils.widgets.get("schema")
@@ -39,8 +39,8 @@ CURRENT_USER = spark.sql("SELECT current_user()").collect()[0][0]
 
 print(f"Workspace:          {WORKSPACE_URL}")
 print(f"Catalog/Schema:     {CATALOG}.{SCHEMA}")
-print(f"SARIMA endpoint:    {ENDPOINT_NAME}")
-print(f"MC endpoint:        {MC_ENDPOINT_NAME}")
+print(f"Frequency endpoint: {ENDPOINT_NAME}")
+print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
 print(f"App SP client ID:   {APP_SP_CLIENT_ID or '(not provided)'}")
 print(f"Running as:         {CURRENT_USER}")
 print(f"Token:              {'present' if TOKEN else 'MISSING'}")
@@ -78,9 +78,7 @@ print("\nUC grants complete.")
 
 # ─── 2. Grant CAN_QUERY on serving endpoints to the app SP ────────────────────
 # All endpoints are created by Task 5 (prepare_app_infrastructure) before this task runs.
-# The agent endpoint (if it exists) is created by Task 7 (register_chatbot_agent).
-AGENT_ENDPOINT_NAME = "actuarial-workshop-chatbot-agent"
-_endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME, AGENT_ENDPOINT_NAME] if ep]
+_endpoints_to_grant = [ep for ep in [ENDPOINT_NAME, MC_ENDPOINT_NAME] if ep]
 
 for ep_name in _endpoints_to_grant:
     endpoint_resp = requests.get(

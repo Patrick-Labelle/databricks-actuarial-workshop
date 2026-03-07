@@ -2,8 +2,8 @@
 
 An end-to-end actuarial modeling solution on the Databricks Lakehouse — synthetic
 Canadian insurance portfolio data, a full declarative medallion pipeline, statistical models that
-**forecast claims, model volatility, and simulate portfolio loss** (SARIMAX/GARCH/Monte Carlo),
-a tool-calling **AI chatbot agent** registered with the Databricks Agent Framework,
+**forecast claim frequency, model volatility, and quantify reserve risk** (SARIMAX/GARCH/Bootstrap Chain Ladder),
+a tool-calling **AI chatbot agent** with MLflow tracing,
 and a Streamlit risk dashboard —
 packaged as a single **Databricks Asset Bundle** for one-command deployment.
 
@@ -42,27 +42,20 @@ The synthetic portfolio models a Canadian P&C insurer across **40 segments** (4 
 
 **Output:** Per-segment conditional volatility series, ARCH-LM test p-values, and calibrated CVs bridged to the three Monte Carlo portfolio lines.
 
-### Monte Carlo — Portfolio Loss Simulation
+### Bootstrap Chain Ladder — Reserve Risk Quantification
 
-**Business purpose:** Quantify portfolio-level tail risk (VaR, CVaR/TVaR) for regulatory capital (SCR), internal risk limits, and catastrophe scenario planning.
+**Business purpose:** Quantify reserve uncertainty and compute reserve risk capital (VaR 99.5%) for regulatory compliance (OSFI MCT, Solvency II) and IFRS 17 risk adjustment.
 
-**Method:** Three simulation approaches run as 64 Ray-distributed tasks (~640M total paths):
+**Method:** Bootstrap Chain Ladder resamples scaled Pearson residuals from the fitted chain ladder model, creating thousands of pseudo-triangles. Each pseudo-triangle produces a different IBNR estimate, building the full predictive reserve distribution. Runs as Ray-distributed tasks across 4 workers.
 
-| Approach | What It Does | Business Use |
-|---|---|---|
-| **Aggregate (t-Copula)** | Lognormal marginals with t-copula (df=4) for tail dependence between Property, Auto, Liability | Standard formula capital; quick what-if |
-| **Collective Risk** | Negative Binomial frequency + Lognormal severity per segment; CLT compound approximation | Bottom-up reserving; frequency-severity decomposition |
-| **Multi-Period (Regime-Switching)** | 12-month surplus trajectory with 2-state (Normal/Crisis) Markov regime model | Dynamic Financial Analysis; ruin probability |
-
-**Calibration:** Portfolio means from `gold_claims_monthly`, correlations from empirical log-loss series, CVs from GARCH. No hardcoded assumptions — all parameters are historically calibrated.
+**Output per product line:** best_estimate_M, var_95_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M
 
 **Scenarios:**
-- **Baseline:** Static calibrated means (40M paths)
-- **12-month VaR evolution:** SARIMA-driven means by month (480M paths)
-- **Stress tests** (120M paths each):
-  - `cat_event` — 1-in-250yr catastrophe (Property 3.5x, Poisson jump process)
-  - `stress_corr` — Systemic contagion (correlations spike to 0.65-0.75)
-  - `inflation_shock` — Loss-cost inflation (+30% means, +15% CV)
+- **baseline** — Standard reserve development with calibrated parameters
+- **adverse_development** — LDFs inflated by 20%, CVs x1.3
+- **judicial_inflation** — Social inflation on Auto lines at long development lags
+- **pandemic_tail** — Extended development periods (+6 months), CVs x1.4
+- **superimposed_inflation** — Calendar-year trend (CPI + 3%) across all lines
 
 ---
 
@@ -93,13 +86,12 @@ Macro:         raw_macro_indicators    → bronze_macro_indicators → silver_ma
 | `gold_claims_monthly` | Gold | Monthly aggregates: claims_count, total_incurred, avg_severity, earned_premium, loss_ratio (40 segments x 84 months) |
 | `gold_macro_features` | Gold | Pivoted macro features: unemployment_rate, hpi_index, hpi_growth, housing_starts by region x month |
 | `features_segment_monthly` | Feature Store | Point-in-time correct features with timestamp keys for leakage-free training; Online Table for real-time lookup |
-| `predictions_sarima` | Predictions | Per-segment SARIMA+GARCH forecasts (actuals + 12-month ahead) with confidence intervals and volatility |
-| `predictions_monte_carlo` | Predictions | Portfolio baseline Monte Carlo results: expected loss, VaR 99%, VaR 99.5% (SCR), CVaR 99% |
-| `predictions_risk_timeline` | Predictions | 12-month SARIMA-driven VaR/CVaR evolution |
-| `predictions_stress_scenarios` | Predictions | Pre-computed stress test results (CAT, systemic, inflation) with delta-vs-baseline |
-| `predictions_surplus_evolution` | Predictions | Multi-period surplus trajectory with regime-switching: percentile bands + ruin probability |
-| `predictions_regime_parameters` | Predictions | Regime-switching model parameters (Normal/Crisis state means, CVs, correlations, transition matrix) |
-| `predictions_reserve_validation` | Predictions | Reserve adequacy validation: forecast vs actual development by segment x accident month |
+| `predictions_frequency_forecast` | Predictions | Per-segment SARIMAX+GARCH forecasts (actuals + 12-month ahead) with confidence intervals and volatility |
+| `predictions_bootstrap_reserves` | Predictions | Bootstrap Chain Ladder reserve results: best estimate IBNR, VaR 99%, VaR 99.5%, CVaR 99% |
+| `predictions_reserve_evolution` | Predictions | 12-month reserve adequacy outlook |
+| `predictions_reserve_scenarios` | Predictions | Pre-computed reserve scenarios (adverse development, judicial inflation, pandemic tail, superimposed inflation) |
+| `predictions_runoff_projection` | Predictions | Multi-period surplus trajectory with regime-switching |
+| `predictions_ldf_volatility` | Predictions | Development factor volatility per product line |
 
 ### Statistics Canada Macro Integration
 
@@ -121,28 +113,23 @@ The SARIMAX models use real macroeconomic data as exogenous variables:
 
 | Model | UC Name | Type | Input | Output |
 |---|---|---|---|---|
-| SARIMA Forecaster | `sarima_claims_forecaster` | MLflow PyFunc | `horizon` (1-24 months) | Per-segment forecast_mean, forecast_lo95, forecast_hi95 by month |
-| Monte Carlo Portfolio | `monte_carlo_portfolio` | MLflow PyFunc | Scenario parameters (means, CVs, correlations, model_type, simulation_mode) | mean_loss_M, var_99_M, var_995_M, cvar_99_M, max_loss_M |
-| Chatbot Agent | `actuarial_chatbot_agent` | MLflow ChatModel | Chat messages (role/content) | ChatCompletionResponse with tool calls |
+| Frequency Forecaster | `frequency_forecaster` | MLflow PyFunc | `horizon` (1-24 months) | Per-segment forecast_mean, forecast_lo95, forecast_hi95 by month |
+| Bootstrap Reserve Simulator | `bootstrap_reserve_simulator` | MLflow PyFunc | Scenario parameters (means, CVs, n_replications, scenario) | best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M |
 
 ### Serving Endpoints
 
 | Endpoint | Model | AI Gateway | Purpose |
 |---|---|---|---|
-| `actuarial-workshop-sarima-forecaster` | sarima_claims_forecaster @Champion | Inference table, rate limits, usage tracking | Quick Forecast tab, chatbot tool |
-| `actuarial-workshop-monte-carlo` | monte_carlo_portfolio @Champion | Inference table, rate limits, usage tracking | Stress Testing tab, chatbot tool |
-| `actuarial-workshop-chatbot-agent` | actuarial_chatbot_agent @Champion | Inference table, Review App, MLflow tracing | AI Gateway agents tab, Review App |
+| `actuarial-workshop-frequency-forecaster` | frequency_forecaster @Champion | Inference table, rate limits, usage tracking | On-Demand Forecast tab, chatbot tool |
+| `actuarial-workshop-bootstrap-reserves` | bootstrap_reserve_simulator @Champion | Inference table, rate limits, usage tracking | Scenario Analysis tab, chatbot tool |
 
-The chatbot agent endpoint is deployed via `databricks.agents.deploy()` which automatically provisions:
-- Review App for stakeholder feedback collection
-- Inference tables for request/response logging
-- Real-time MLflow 3 tracing
+The chatbot agent runs **in-process** within the Streamlit app (not on a separate serving endpoint), using DatabricksOpenAI with tool calling. MLflow tracing captures all conversations to the `/Shared/actuarial-workshop-app-traces` experiment.
 
 ---
 
 ## Setup Job Tasks
 
-The full setup job runs 8 tasks in sequence on a single classic ML cluster (Ray-on-Spark):
+The full setup job runs 7 tasks in sequence on a single classic ML cluster (Ray-on-Spark):
 
 | # | Task | Notebook | Depends On | What It Does |
 |---|---|---|---|---|
@@ -150,10 +137,10 @@ The full setup job runs 8 tasks in sequence on a single classic ML cluster (Ray-
 | 1b | `fetch_macro_data` | `scripts/fetch_macro_data.py` | — | Fetch StatCan unemployment, HPI, housing starts (parallel with task 1) |
 | 2 | `run_dlt_pipeline` | SDP pipeline | 1, 1b | Bronze -> Silver (SCD2) -> Gold across all three data streams |
 | 3 | `build_feature_store` | `src/02_feature_store.py` | 2 | UC Feature Store registration with point-in-time keys |
-| 4 | `fit_statistical_models` | `src/03_classical_stats_at_scale.py` | 3 | SARIMAX/GARCH per segment + Ray-distributed Monte Carlo (640M paths) |
-| 5 | `prepare_app_infrastructure` | `src/04_model_serving.py` | 4 | Serving endpoints + AI Gateway, Online Table, Lakebase, Genie Space |
+| 4 | `fit_statistical_models` | `src/03_classical_stats_at_scale.py` | 3 | SARIMAX/GARCH per segment + Ray-distributed Bootstrap Chain Ladder |
+| 4b | `set_table_metadata` | `src/ops/set_table_metadata.py` | 4 | Add UC table and column descriptions for Genie / lineage |
+| 5 | `prepare_app_infrastructure` | `src/04_model_serving.py` | 4b | Serving endpoints + AI Gateway, Online Table, Lakebase, Genie Space |
 | 6 | `setup_app_dependencies` | `src/ops/app_setup.py` | 5 | UC grants + CAN_QUERY on endpoints + Genie space permissions for app SP |
-| 7 | `register_chatbot_agent` | `src/ops/register_agent.py` | 6 | Log ChatModel to MLflow, register to UC, deploy via agents.deploy() |
 
 A **Monthly Model Refresh** job (paused by default) re-runs tasks 1b -> 2 -> 4 on a schedule.
 
@@ -163,12 +150,12 @@ A **Monthly Model Refresh** job (paused by default) re-runs tasks 1b -> 2 -> 4 o
 
 | Tab | Name | Description |
 |---|---|---|
-| 0 | Risk Assistant | Tool-calling chatbot agent (Genie, SQL, SARIMA, Monte Carlo, Lakebase annotations) |
-| 1 | Claims Forecast | Per-segment SARIMA forecast with GARCH volatility bands and analyst annotations (Lakebase) |
-| 2 | Capital Requirements | Monte Carlo VaR/CVaR metrics with fitted lognormal PDF visualization |
-| 3 | Quick Forecast | On-demand SARIMA+GARCH forecast via live serving endpoint (1-24 month horizon) |
-| 4 | Stress Testing | Custom Monte Carlo scenario modeling with parameter sliders and delta-SCR comparison |
-| 5 | Catastrophe & Reserves | Pre-computed CAT/systemic/inflation scenarios, reserve triangle heatmap, surplus evolution |
+| 0 | Risk Assistant | Tool-calling chatbot agent (Genie, SQL, frequency forecaster, bootstrap reserves, Lakebase annotations) |
+| 1 | Claims Forecast | Per-segment SARIMAX forecast with GARCH volatility bands and analyst annotations (Lakebase) |
+| 2 | Reserve Adequacy | Bootstrap Chain Ladder IBNR distribution, VaR/CVaR metrics, MCT ratio |
+| 3 | Scenario Analysis | Reserve scenarios (adverse development, judicial inflation, pandemic tail, superimposed inflation), reserve evolution, run-off projection, reserve triangle |
+| 4 | On-Demand Forecast | Live SARIMAX+GARCH forecast via serving endpoint (1-24 month horizon) |
+| 5 | Glossary | Comprehensive reference for all models, metrics, regulatory frameworks, and scenarios |
 
 ### Chatbot Tools
 
@@ -178,8 +165,8 @@ The Risk Assistant agent uses Llama 3.3 70B with 5 function-calling tools:
 |---|---|---|
 | `ask_genie` | Natural-language data queries (primary data tool) | AI/BI Genie Space |
 | `query_data` | Direct SQL fallback (read-only) | SQL Warehouse |
-| `run_sarima_forecast` | On-demand claims forecast (1-24 months) | SARIMA serving endpoint |
-| `run_monte_carlo` | Custom portfolio loss simulation | Monte Carlo serving endpoint |
+| `run_frequency_forecast` | On-demand claims forecast (1-24 months) | Frequency Forecaster serving endpoint |
+| `run_bootstrap_reserve` | Custom reserve risk simulation | Bootstrap Reserve serving endpoint |
 | `query_annotations` | Retrieve analyst scenario notes | Lakebase PostgreSQL |
 
 ---
@@ -191,16 +178,15 @@ After running `./deploy.sh`, the following resources are created:
 | Resource | Name / Location |
 |---|---|
 | Declarative Pipeline | `actuarial-workshop-medallion` |
-| Setup Job | `Actuarial Workshop -- Full Setup` (8 tasks) |
+| Setup Job | `Actuarial Workshop -- Full Setup` (7 tasks) |
 | Monthly Refresh Job | `Actuarial Workshop -- Monthly Model Refresh` (paused) |
-| SARIMA Serving Endpoint | `actuarial-workshop-sarima-forecaster` |
-| Monte Carlo Serving Endpoint | `actuarial-workshop-monte-carlo` |
-| Agent Serving Endpoint | `actuarial-workshop-chatbot-agent` |
+| Frequency Forecaster Endpoint | `actuarial-workshop-frequency-forecaster` |
+| Bootstrap Reserve Endpoint | `actuarial-workshop-bootstrap-reserves` |
 | Databricks App | `actuarial-workshop` |
 | Lakebase Instance | `actuarial-workshop-lakebase` |
 | Lakebase Database | `actuarial_workshop_db` |
 | AI/BI Genie Space | `Actuarial Workshop -- Risk Assistant` (auto-created) |
-| UC Models (3) | `sarima_claims_forecaster`, `monte_carlo_portfolio`, `actuarial_chatbot_agent` |
+| UC Models (2) | `frequency_forecaster`, `bootstrap_reserve_simulator` |
 | Feature Table | `features_segment_monthly` (+ Online Table) |
 | Delta Tables (19) | See [Tables](#tables) section above |
 
@@ -214,8 +200,8 @@ All configurable values live in `databricks.yml` under `variables:`.
 |---|---|---|
 | `catalog` | UC catalog name (must exist) | `my_catalog` |
 | `schema` | UC schema (created if missing) | `actuarial_workshop` |
-| `endpoint_name` | SARIMA serving endpoint name | `actuarial-workshop-sarima-forecaster` |
-| `mc_endpoint_name` | Monte Carlo serving endpoint name | `actuarial-workshop-monte-carlo` |
+| `endpoint_name` | Frequency forecaster serving endpoint name | `actuarial-workshop-frequency-forecaster` |
+| `mc_endpoint_name` | Bootstrap reserve serving endpoint name | `actuarial-workshop-bootstrap-reserves` |
 | `warehouse_id` | SQL Warehouse ID for Genie Space and app queries | _(required)_ |
 | `pg_database` | Lakebase PostgreSQL database name | `actuarial_workshop_db` |
 | `genie_space_id` | AI/BI Genie space ID (auto-created if empty) | _(empty)_ |
@@ -247,7 +233,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 │   ├── 04_model_serving.py      # Endpoints, Online Table, Lakebase, Genie Space
 │   └── ops/
 │       ├── app_setup.py         # UC grants + endpoint permissions (job task)
-│       ├── register_agent.py    # Agent registration via agents.deploy() (job task)
+│       ├── set_table_metadata.py # UC table and column descriptions for Genie / lineage
 │       └── cleanup.py           # Manual cleanup notebook
 ├── interactive_workshop/        # Interactive versions with visualizations + learning notes
 │   ├── 01_data_pipeline.py      # Data generation + SDP (interactive version)
@@ -262,7 +248,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 │   ├── app.yaml                 # App command + valueFrom resource injections
 │   ├── requirements.txt
 │   ├── tabs/                    # Tab modules (tab_chatbot, tab_claims_forecast, etc.)
-│   └── chatbot/                 # Agent module (agent.py, tools.py, responses_agent.py)
+│   └── chatbot/                 # Agent module (agent.py, tools.py)
 └── README.md
 ```
 
@@ -276,7 +262,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 |---|---|---|---|
 | 1 | `01_data_pipeline.py` | `generate_source_data` | SDP, Medallion, SCD Type 2; 3 data streams (reserves, claims, macro) |
 | 2 | `02_feature_store.py` | `build_feature_store` | UC Feature Store, point-in-time joins, Online Table |
-| 3 | `03_classical_stats_at_scale.py` | `fit_statistical_models` | SARIMAX/GARCH, t-Copula Monte Carlo, Collective Risk, Ray-on-Spark, MLflow |
+| 3 | `03_classical_stats_at_scale.py` | `fit_statistical_models` | SARIMAX/GARCH, Chain Ladder, Bootstrap Chain Ladder, Ray-on-Spark, MLflow |
 | 4 | `04_model_serving.py` | `prepare_app_infrastructure` | Serving endpoints + AI Gateway, Online Table, Lakebase, Genie Space |
 
 ### Interactive Only (`interactive_workshop/`)
@@ -287,7 +273,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 | 6 | `06_dabs_cicd.py` | DABs CI/CD, Azure DevOps |
 | 7 | `07_databricks_apps.py` | Databricks Apps, Lakebase |
 
-Interactive versions of all job pipeline modules (01, 03, 04, 05) are also in `interactive_workshop/` with `display()` calls and learning notes.
+Interactive versions of job pipeline modules (01, 03, 04, 05) are also in `interactive_workshop/` with `display()` calls and learning notes.
 
 ---
 
@@ -306,19 +292,15 @@ The app's runtime configuration is provided through three channels:
 
 ---
 
-## Distributed Monte Carlo (Ray-on-Spark)
+## Distributed Bootstrap (Ray-on-Spark)
 
-All modules run on a **classic DBR 16.4 ML job cluster** with Ray-on-Spark for distributed Monte Carlo simulation.
+All modules run on a **classic DBR 16.4 ML job cluster** with Ray-on-Spark for distributed Bootstrap Chain Ladder simulation.
 
 > **Requirement:** Classic compute (not serverless-only workspaces).
 
-The simulation uses `@ray.remote(num_cpus=1)` tasks dispatched across 4 workers (24 concurrent tasks). All 64 tasks are submitted in a single batch:
+The simulation uses `@ray.remote(num_cpus=1)` tasks dispatched across 4 workers. Bootstrap replications are distributed across workers for parallel execution.
 
-- **Baseline:** 4 tasks x 10M = 40M paths
-- **12-month VaR evolution:** 12 months x 4 tasks x 10M = 480M paths
-- **Stress scenarios:** 3 scenarios x 4 tasks x 10M = 120M paths
-
-CPU-only cluster; ~2-3 minutes wall time for 640M total paths.
+CPU-only cluster; classic ML runtime required for Ray-on-Spark.
 
 ---
 
@@ -378,7 +360,7 @@ databricks bundle validate --target my-workspace
 > 3. Resolves the Lakebase endpoint hostname (async, may take a few minutes)
 > 4. Syncs `_bundle_config.py` to the workspace
 > 5. Starts app compute if needed
-> 6. Runs the full setup job (8 tasks: data gen -> pipeline -> features -> models -> serving -> permissions -> agent)
+> 6. Runs the full setup job (7 tasks: data gen -> pipeline -> features -> models -> metadata -> serving -> permissions)
 > 7. Deploys the app source code after infrastructure is ready
 
 ---
@@ -395,8 +377,8 @@ Removes all deployed resources in the correct order:
 |---|---|
 | UC schema + all tables | Statement Execution API (`DROP SCHEMA ... CASCADE`) |
 | Online Table | REST API |
-| Serving endpoints (SARIMA, MC, Agent) | REST API |
-| UC registered models (3) | REST API |
+| Serving endpoints (Frequency Forecaster, Bootstrap Reserves) | REST API |
+| UC registered models (2) | REST API |
 | Genie Space | REST API |
 | Lakebase instance | Bundle destroy (async delete) |
 | MLflow experiments | REST API |

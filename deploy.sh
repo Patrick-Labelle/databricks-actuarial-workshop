@@ -33,8 +33,8 @@ _ws()  { echo "$VALIDATE_JSON" | python3 -c "import sys,json; print(json.load(sy
 CATALOG=$(_var catalog my_catalog)
 SCHEMA=$(_var schema actuarial_workshop)
 PG_DATABASE=$(_var pg_database actuarial_workshop_db)
-ENDPOINT_NAME=$(_var endpoint_name actuarial-workshop-sarima-forecaster)
-MC_ENDPOINT_NAME=$(_var mc_endpoint_name actuarial-workshop-monte-carlo)
+ENDPOINT_NAME=$(_var endpoint_name actuarial-workshop-frequency-forecaster)
+MC_ENDPOINT_NAME=$(_var mc_endpoint_name actuarial-workshop-bootstrap-reserves)
 GENIE_SPACE_ID=$(_var genie_space_id "")
 LLM_ENDPOINT_NAME=$(_var llm_endpoint_name databricks-meta-llama-3-3-70b-instruct)
 

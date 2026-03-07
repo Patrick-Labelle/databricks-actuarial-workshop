@@ -18,7 +18,7 @@
 # (or via job base_parameters) to clean up any target catalog/schema.
 dbutils.widgets.text("catalog",           "my_catalog",                           "UC Catalog")
 dbutils.widgets.text("schema",            "actuarial_workshop",                   "UC Schema")
-dbutils.widgets.text("endpoint_name",     "actuarial-workshop-sarima-forecaster", "Serving Endpoint")
+dbutils.widgets.text("endpoint_name",     "actuarial-workshop-frequency-forecaster", "Serving Endpoint")
 dbutils.widgets.text("pg_database",       "actuarial_workshop_db",                "Lakebase DB name")
 dbutils.widgets.text("lakebase_instance", "actuarial-workshop-lakebase",          "Lakebase instance name")
 CATALOG           = dbutils.widgets.get("catalog")
@@ -117,7 +117,7 @@ else:
 
 # COMMAND ----------
 
-MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
+MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
 
 mlflow.set_registry_uri("databricks-uc")
 client = mlflow.tracking.MlflowClient()
@@ -136,7 +136,7 @@ except Exception as e:
 # COMMAND ----------
 
 _current_user = spark.sql("SELECT current_user()").collect()[0][0]
-EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial_workshop_sarima_claims_forecaster"
+EXPERIMENT_NAME   = f"/Users/{_current_user}/actuarial_workshop_frequency_forecaster"
 EXPERIMENT_NAME_4 = f"/Users/{_current_user}/actuarial_workshop_claims_sarima"
 
 for exp_name in [EXPERIMENT_NAME, EXPERIMENT_NAME_4]:

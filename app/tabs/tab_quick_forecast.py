@@ -2,20 +2,20 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from endpoints import call_serving_endpoint
+from endpoints import call_frequency_forecast_endpoint
 
 
 def render(tab):
     with tab:
-        st.subheader("Generate a Custom Claims Forecast")
-        st.caption("Get an instant forecast for any time horizon — results update in seconds")
+        st.subheader("On-Demand Frequency Forecast")
+        st.caption("Get an instant claim frequency projection for any time horizon — results update in seconds")
 
         with st.expander("ℹ️ How this works", expanded=False):
             st.markdown("""
-**What this does:** Generates a claims forecast on demand for any horizon up to 24 months, without re-running the full modelling pipeline.
+**What this does:** Generates a claim frequency forecast on demand for any horizon up to 24 months, without re-running the full modelling pipeline.
 
 **When to use it:**
-- Quick "what if I need a 18-month forecast?" checks
+- Quick "what if I need an 18-month forecast?" checks
 - Board or management presentations requiring a specific horizon
 - Validating that the deployed model is live and responding correctly
 
@@ -24,7 +24,7 @@ def render(tab):
 - Upper and lower bounds of the 95% forecast range
 - A note if uncertainty grows significantly at longer horizons (expected — forecasts become less precise the further out you go)
 
-**The model** is the same one trained on all 40 segments — it represents aggregate portfolio behaviour. For segment-specific forecasts with full historical context, use the **Claims Forecast** tab.
+**The model** is the same one trained on all 40 segments — it represents aggregate portfolio behaviour. For segment-specific forecasts with full historical context, use the **Reserve Development Forecast** tab.
 
 _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion alias in Unity Catalog._
 """)
@@ -37,7 +37,7 @@ _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion 
 
         if st.button("Generate Forecast"):
             with st.spinner("Calling Model Serving endpoint..."):
-                _fetched = call_serving_endpoint(horizon)
+                _fetched = call_frequency_forecast_endpoint(horizon)
                 if not _fetched.empty:
                     st.session_state["ondemand_result"] = _fetched
                     st.session_state["ondemand_horizon"] = horizon
@@ -85,7 +85,7 @@ _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion 
                     hoverinfo="skip",
                 ))
                 fig4.update_layout(
-                    title=f"Claims Forecast — Next {_display_horizon} Months",
+                    title=f"Frequency Forecast — Next {_display_horizon} Months",
                     xaxis_title="Month",
                     yaxis_title="Projected Monthly Claims",
                     height=360,
@@ -106,6 +106,6 @@ _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion 
             st.download_button(
                 "Download CSV",
                 result_df.to_csv(index=False),
-                file_name=f"sarima_forecast_{_display_horizon}m.csv",
+                file_name=f"frequency_forecast_{_display_horizon}m.csv",
                 mime="text/csv",
             )

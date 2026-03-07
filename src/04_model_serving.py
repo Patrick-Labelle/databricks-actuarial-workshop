@@ -3,8 +3,8 @@
 # MAGIC # Module 4: App Infrastructure
 # MAGIC ## Serving Endpoints, Online Table, Lakebase, and Genie Space
 # MAGIC
-# MAGIC Creates all services the Streamlit app needs: SARIMA and Monte Carlo serving
-# MAGIC endpoints with AI Gateway, Online Table, Lakebase PostgreSQL, and Genie Space.
+# MAGIC Creates all services the Streamlit app needs: Frequency Forecaster and Bootstrap Reserve
+# MAGIC serving endpoints with AI Gateway, Online Table, Lakebase PostgreSQL, and Genie Space.
 
 # COMMAND ----------
 
@@ -27,8 +27,8 @@ warnings.filterwarnings("ignore")
 # ─── Configuration ────────────────────────────────────────────────────────────
 dbutils.widgets.text("catalog",          "my_catalog",                           "UC Catalog")
 dbutils.widgets.text("schema",           "actuarial_workshop",                   "UC Schema")
-dbutils.widgets.text("endpoint_name",    "actuarial-workshop-sarima-forecaster", "SARIMA Endpoint")
-dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-monte-carlo",       "MC Endpoint Name")
+dbutils.widgets.text("endpoint_name",    "actuarial-workshop-frequency-forecaster", "Frequency Forecaster Endpoint")
+dbutils.widgets.text("mc_endpoint_name", "actuarial-workshop-bootstrap-reserves",  "Bootstrap Reserves Endpoint")
 dbutils.widgets.text("warehouse_id",     "",                                     "SQL Warehouse ID")
 dbutils.widgets.text("pg_database",      "actuarial_workshop_db",                "Lakebase Database")
 dbutils.widgets.text("app_sp_client_id", "",                                     "App SP Client ID")
@@ -42,8 +42,8 @@ WAREHOUSE_ID     = dbutils.widgets.get("warehouse_id")
 PG_DATABASE      = dbutils.widgets.get("pg_database")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
-SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.sarima_claims_forecaster"
-MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.monte_carlo_portfolio"
+SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
+MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
 FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
@@ -59,10 +59,10 @@ _HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/jso
 LAKEBASE_ENDPOINT_PATH = "projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
 
 print(f"Workspace:       {WORKSPACE_URL}")
-print(f"SARIMA model:    {SARIMA_MODEL_NAME}")
-print(f"MC model:        {MC_MODEL_NAME}")
-print(f"SARIMA endpoint: {ENDPOINT_NAME}")
-print(f"MC endpoint:     {MC_ENDPOINT_NAME}")
+print(f"Frequency model:  {SARIMA_MODEL_NAME}")
+print(f"Bootstrap model:  {MC_MODEL_NAME}")
+print(f"Frequency endpoint: {ENDPOINT_NAME}")
+print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
 print(f"Feature table:   {FEATURE_TABLE}")
 print(f"Warehouse ID:    {WAREHOUSE_ID or '(not set)'}")
 print(f"Lakebase DB:     {PG_DATABASE}")
@@ -71,7 +71,7 @@ print(f"App SP:          {APP_SP_CLIENT_ID or '(not set)'}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. SARIMA Serving Endpoint
+# MAGIC ## 1. Frequency Forecaster Serving Endpoint
 # MAGIC
 # MAGIC Create/update endpoint + configure AI Gateway (inference tables, rate limits).
 
@@ -84,11 +84,11 @@ client = MlflowClient()
 # Look up latest model versions
 sarima_versions = client.search_model_versions(f"name='{SARIMA_MODEL_NAME}'")
 sarima_latest_ver = max(int(v.version) for v in sarima_versions)
-print(f"SARIMA model:  {SARIMA_MODEL_NAME}  → version {sarima_latest_ver}")
+print(f"Frequency model:  {SARIMA_MODEL_NAME}  → version {sarima_latest_ver}")
 
 mc_versions = client.search_model_versions(f"name='{MC_MODEL_NAME}'")
 mc_latest_ver = max(int(v.version) for v in mc_versions)
-print(f"MC model:      {MC_MODEL_NAME}  → version {mc_latest_ver}")
+print(f"Bootstrap model:  {MC_MODEL_NAME}  → version {mc_latest_ver}")
 
 # COMMAND ----------
 
@@ -97,7 +97,7 @@ _sarima_endpoint_body = {
     "name": ENDPOINT_NAME,
     "config": {
         "served_models": [{
-            "name":                   "sarima-champion",
+            "name":                   "frequency-champion",
             "model_name":             SARIMA_MODEL_NAME,
             "model_version":          str(sarima_latest_ver),
             "workload_size":          "Small",
@@ -117,14 +117,14 @@ if resp.status_code == 200:
         headers=_HEADERS,
         json=_sarima_endpoint_body["config"],
     )
-    print(f"SARIMA endpoint updated: {resp.status_code}")
+    print(f"Frequency endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
         json=_sarima_endpoint_body,
     )
-    print(f"SARIMA endpoint created: {resp.status_code}")
+    print(f"Frequency endpoint created: {resp.status_code}")
 
 if resp.status_code in (200, 201):
     print(f"  URL: https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations")
@@ -137,7 +137,7 @@ _sarima_ai_gateway = {
     "inference_table_config": {
         "catalog_name":      CATALOG,
         "schema_name":       SCHEMA,
-        "table_name_prefix": "sarima_endpoint",
+        "table_name_prefix": "frequency_endpoint",
         "enabled":           True,
     },
     "rate_limits": [{"calls": 60, "renewal_period": "minute"}],
@@ -156,9 +156,9 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Monte Carlo Serving Endpoint
+# MAGIC ## 2. Bootstrap Reserve Serving Endpoint
 # MAGIC
-# MAGIC CPU endpoint for on-demand scenario analysis (NumPy/SciPy).
+# MAGIC CPU endpoint for on-demand reserve scenario analysis (NumPy).
 
 # COMMAND ----------
 
@@ -167,7 +167,7 @@ _mc_endpoint_body = {
     "name": MC_ENDPOINT_NAME,
     "config": {
         "served_models": [{
-            "name":                  "monte-carlo-champion",
+            "name":                  "bootstrap-reserve-champion",
             "model_name":            MC_MODEL_NAME,
             "model_version":         str(mc_latest_ver),
             "workload_size":         "Small",
@@ -187,14 +187,14 @@ if resp.status_code == 200:
         headers=_HEADERS,
         json=_mc_endpoint_body["config"],
     )
-    print(f"MC endpoint updated: {resp.status_code}")
+    print(f"Bootstrap endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
         json=_mc_endpoint_body,
     )
-    print(f"MC endpoint created: {resp.status_code}")
+    print(f"Bootstrap endpoint created: {resp.status_code}")
 
 if resp.status_code in (200, 201):
     print(f"  URL: https://{WORKSPACE_URL}/serving-endpoints/{MC_ENDPOINT_NAME}/invocations")
@@ -207,7 +207,7 @@ _mc_ai_gateway = {
     "inference_table_config": {
         "catalog_name":      CATALOG,
         "schema_name":       SCHEMA,
-        "table_name_prefix": "monte_carlo_endpoint",
+        "table_name_prefix": "bootstrap_endpoint",
         "enabled":           True,
     },
     "rate_limits": [{"calls": 20, "renewal_period": "minute"}],
@@ -223,7 +223,7 @@ if gw_resp.status_code == 200:
 else:
     print(f"  AI Gateway config: {gw_resp.status_code} — {gw_resp.text[:200]}")
 
-print(f"\nBoth endpoints created. They take ~5 minutes to reach READY state.")
+print(f"\nBoth endpoints created/updated. They take ~5 minutes to reach READY state.")
 
 # COMMAND ----------
 
@@ -434,16 +434,15 @@ except Exception as _lb_err:
 _genie_space_id = dbutils.widgets.get("genie_space_id")
 
 _GENIE_DESCRIPTION = (
-    "Actuarial Risk Analytics for a Canadian P&C Insurance Portfolio.\n\n"
+    "Stochastic Reserve Analytics for a Canadian P&C Insurance Portfolio.\n\n"
     "IMPORTANT RULES:\n"
-    "- SCR (Solvency Capital Requirement) = VaR at the 99.5% confidence level (NOT 99%). "
-    "Always use the var_995_M column for SCR.\n"
+    "- Reserve Risk Capital = VaR at the 99.5% confidence level (var_995_M column). "
+    "This is computed via Bootstrap Chain Ladder (internal model).\n"
     "- All monetary columns ending in _M are in millions of dollars.\n"
-    "- When asked about portfolio totals from predictions_monte_carlo, "
-    "AVERAGE across task_id (there are 4 parallel MC tasks).\n"
+    "- IBNR = Incurred But Not Reported reserves. Best estimate is the mean of the bootstrap distribution.\n"
     "- Insurance segments use the pattern product_line_region (e.g. commercial_auto_ontario).\n"
-    "- Monte Carlo segments: Property = Homeowners + Commercial_Property, "
-    "Auto = Personal_Auto + Commercial_Auto, Liability = proxy blend."
+    "- 4 product lines: Personal_Auto, Commercial_Auto, Homeowners, Commercial_Property.\n"
+    "- 10 Canadian provinces. 40 total segments."
 )
 
 # Per-table descriptions (shown to Genie as context for each table)
@@ -454,20 +453,23 @@ _GENIE_TABLES = [
      ["Historical monthly claims by segment. Key columns: claims_count, "
       "total_incurred, avg_severity, earned_premium."]),
     ("gold_reserve_triangle",
-     ["Reserve development triangle. Rows=accident periods, columns=development months."]),
-    ("predictions_monte_carlo",
-     ["Aggregate portfolio risk (640M MC paths). AVERAGE across task_id for totals. "
-      "var_995_M = SCR at 99.5%."]),
-    ("predictions_risk_timeline",
-     ["Monthly VaR evolution from SARIMA-driven Monte Carlo."]),
-    ("predictions_sarima",
-     ["SARIMA+GARCH forecasts. Filter record_type='forecast' for future. "
-      "Has forecast_mean, ci_lower_95, ci_upper_95."]),
-    ("predictions_stress_scenarios",
-     ["Stress tests: baseline, recession, pandemic, systemic_crisis, cat_event, "
-      "inflation_shock. var_995_vs_baseline = % impact."]),
-    ("predictions_surplus_evolution",
-     ["Multi-period surplus trajectory with ruin probability."]),
+     ["Reserve development triangle. Rows=accident periods, columns=development months. "
+      "Includes incremental_paid and incremental_incurred."]),
+    ("predictions_bootstrap_reserves",
+     ["Bootstrap Chain Ladder reserve distribution. "
+      "best_estimate_M = mean IBNR, var_995_M = Reserve Risk Capital at 99.5%."]),
+    ("predictions_frequency_forecast",
+     ["SARIMAX+GARCH frequency forecasts. Filter record_type='forecast' for future. "
+      "Has forecast_mean, forecast_lo95, forecast_hi95, cond_volatility."]),
+    ("predictions_ldf_volatility",
+     ["Development factor volatility per product line. avg_ldf, std_ldf, n_factors."]),
+    ("predictions_reserve_evolution",
+     ["12-month reserve adequacy outlook with var_995_vs_baseline = % change."]),
+    ("predictions_reserve_scenarios",
+     ["Reserve deterioration scenarios: adverse_development, judicial_inflation, "
+      "pandemic_tail, superimposed_inflation. var_995_vs_baseline = % impact."]),
+    ("predictions_runoff_projection",
+     ["Multi-period run-off surplus trajectory with ruin probability."]),
     ("silver_reserves",
      ["Reserve development with SCD2 change tracking."]),
     ("silver_rolling_features",
@@ -479,11 +481,11 @@ import uuid as _uuid
 _GENIE_SAMPLE_QUESTIONS = [
     {"id": _uuid.uuid4().hex, "question": [q]}
     for q in [
-        "What is the current SCR (Solvency Capital Requirement)?",
-        "Show monthly claims trend for the last 12 months",
-        "Which stress scenario has the highest impact on VaR 99.5%?",
-        "What is the portfolio expected annual loss?",
-        "Compare Property vs Auto segment loss trends",
+        "What is the current best estimate IBNR and Reserve Risk Capital (VaR 99.5%)?",
+        "Show monthly claims frequency trend for the last 12 months",
+        "Which reserve scenario has the highest impact on VaR 99.5%?",
+        "What are the development factor volatilities by product line?",
+        "Compare Personal Auto vs Commercial Auto reserve adequacy",
     ]
 ]
 
@@ -530,7 +532,7 @@ if WAREHOUSE_ID and not _genie_space_id:
         _gw = _GC()
 
         _space = _gw.genie.create_space(
-            title="Actuarial Workshop — Risk Assistant",
+            title="Actuarial Workshop — Reserve Assistant",
             description=_GENIE_DESCRIPTION,
             warehouse_id=WAREHOUSE_ID,
             serialized_space=_build_serialized_space(),
@@ -563,6 +565,9 @@ elif not WAREHOUSE_ID and not _genie_space_id:
 
 # Pass Genie space ID to downstream tasks via task values
 if _genie_space_id:
+    print(f"\n  ⚠️  Genie space instructions must be added manually via the UI.")
+    print(f"  Open the space in AI/BI Genie, click Edit, and paste the contents of")
+    print(f"  resources/genie_space_instructions.txt into the 'General Instructions' box.")
     try:
         dbutils.jobs.taskValues.set(key="genie_space_id", value=_genie_space_id)
         print(f"  Task value set: genie_space_id={_genie_space_id}")
@@ -574,5 +579,5 @@ if _genie_space_id:
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC All app infrastructure created: serving endpoints, AI Gateway, Online Table,
-# MAGIC Lakebase database, and Genie Space.
+# MAGIC All app infrastructure created: Frequency Forecaster + Bootstrap Reserve serving
+# MAGIC endpoints, AI Gateway, Online Table, Lakebase database, and Genie Space.

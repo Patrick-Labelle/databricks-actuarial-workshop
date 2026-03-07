@@ -10,7 +10,7 @@
 # MAGIC
 # MAGIC By the end of Module 6, you have:
 # MAGIC - ✅ Reliable data pipelines (SDP + Medallion)
-# MAGIC - ✅ Scaled statistical models (SARIMA, GARCH, Monte Carlo)
+# MAGIC - ✅ Scaled statistical models (SARIMAX, GARCH, Bootstrap Chain Ladder)
 # MAGIC - ✅ Governed models in UC Registry with REST endpoints
 # MAGIC - ✅ CI/CD with DABs + Azure DevOps
 # MAGIC
@@ -29,8 +29,8 @@
 # MAGIC        ↓
 # MAGIC  Databricks App (Streamlit)   ← SSO via Databricks identity
 # MAGIC        ↓                            ↓
-# MAGIC  UC Tables (gold_segment_*)   Model Serving endpoint (SARIMA)
-# MAGIC  predictions_monte_carlo          segment_features_online (Online Table)
+# MAGIC  UC Tables (gold_*)           Model Serving endpoints (Frequency + Bootstrap)
+# MAGIC  predictions_bootstrap_reserves   segment_features_online (Online Table)
 # MAGIC        ↓
 # MAGIC  Lakebase (Postgres)          ← Scenario annotations, user comments
 # MAGIC ```
@@ -47,7 +47,7 @@
 # MAGIC
 # MAGIC The app provides:
 # MAGIC 1. **Forecast Dashboard**: Select a segment, view SARIMA forecasts with confidence intervals
-# MAGIC 2. **Monte Carlo Risk Summary**: VaR, CVaR, loss distribution from Module 4's simulation
+# MAGIC 2. **Reserve Adequacy**: Bootstrap Chain Ladder IBNR distribution, VaR, CVaR from Module 4
 # MAGIC 3. **On-Demand Forecast**: Call the Module 5 Model Serving endpoint in real time
 # MAGIC 4. **Scenario Annotation**: Save comments/assumptions to Lakebase (Postgres)
 
@@ -81,7 +81,7 @@ st.set_page_config(
 w = sdk.WorkspaceClient()
 TOKEN = w.config.token
 WORKSPACE_HOST = os.environ.get("DATABRICKS_HOST", "")
-ENDPOINT_NAME  = os.environ.get("ENDPOINT_NAME", "actuarial-workshop-sarima-forecaster")
+ENDPOINT_NAME  = os.environ.get("ENDPOINT_NAME", "actuarial-workshop-frequency-forecaster")
 
 # ─── Spark connection via Databricks Connect ─────────────────────────────────
 from databricks.connect import DatabricksSession
@@ -103,21 +103,21 @@ def load_segments():
 def load_forecasts(segment_id: str):
     return spark.sql(f"""
         SELECT month, record_type, claims_count, forecast_mean, forecast_lo95, forecast_hi95
-        FROM {CATALOG}.{SCHEMA}.predictions_sarima
+        FROM {CATALOG}.{SCHEMA}.predictions_frequency_forecast
         WHERE segment_id = \'{segment_id}\'
         ORDER BY month
     """).toPandas()
 
 @st.cache_data(ttl=600)
-def load_monte_carlo_summary():
+def load_bootstrap_summary():
     return spark.sql(f"""
         SELECT
-            AVG(mean_loss_M)  AS expected_loss,
-            AVG(var_99_M)     AS var_99,
-            AVG(var_995_M)    AS var_995,
-            AVG(cvar_99_M)    AS cvar_99,
-            MAX(max_loss_M)   AS max_loss
-        FROM {CATALOG}.{SCHEMA}.predictions_monte_carlo
+            SUM(best_estimate_M) AS best_estimate,
+            SUM(var_99_M)        AS var_99,
+            SUM(var_995_M)       AS var_995,
+            SUM(cvar_99_M)       AS cvar_99
+        FROM {CATALOG}.{SCHEMA}.predictions_bootstrap_reserves
+        WHERE scenario = 'baseline'
     """).toPandas().iloc[0]
 
 def call_serving_endpoint(horizon: int) -> pd.DataFrame:
@@ -163,7 +163,7 @@ def save_scenario_annotation(segment: str, note: str, analyst: str):
 # ─── App Layout ───────────────────────────────────────────────────────────────
 
 st.title("📊 Actuarial Risk Dashboard")
-st.caption("Powered by Databricks | SARIMA Forecasting + Monte Carlo Portfolio Risk")
+st.caption("Powered by Databricks | SARIMAX Forecasting + Bootstrap Chain Ladder Reserve Risk")
 
 tab1, tab2, tab3 = st.tabs(["🔮 Forecasts", "📉 Portfolio Risk", "⚡ On-Demand Forecast"])
 
@@ -213,18 +213,18 @@ with tab1:
 
 # ── Tab 2: Portfolio Risk ─────────────────────────────────────────────────────
 with tab2:
-    st.subheader("Monte Carlo Portfolio Risk Summary")
-    st.caption("100,000 correlated lognormal scenarios | Property + Auto + Liability")
+    st.subheader("Reserve Adequacy — Bootstrap Chain Ladder")
+    st.caption("Bootstrap IBNR distribution across 4 product lines")
 
-    summary = load_monte_carlo_summary()
+    summary = load_bootstrap_summary()
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Expected Annual Loss", f"${summary['expected_loss']:.1f}M")
+    col1.metric("Best Estimate IBNR", f"${summary['best_estimate']:.1f}M")
     col2.metric("VaR (99%)", f"${summary['var_99']:.1f}M")
-    col3.metric("VaR (99.5%)", f"${summary['var_995']:.1f}M", help="Solvency II SCR level")
-    col4.metric("CVaR (99%)", f"${summary['cvar_99']:.1f}M", help="Expected Shortfall")
+    col3.metric("Reserve Risk Capital (VaR 99.5%)", f"${summary['var_995']:.1f}M", help="1-in-200 year reserve level")
+    col4.metric("CVaR (99%)", f"${summary['cvar_99']:.1f}M", help="Tail Risk — average of worst 1%")
 
-    st.info("ℹ️ VaR(99.5%) is the Solvency Capital Requirement (SCR) level under Solvency II standard formula.")
+    st.info("ℹ️ VaR(99.5%) is the Reserve Risk Capital threshold used by Solvency II for reserve risk SCR. In Canada, OSFI uses the MCT framework with prescribed risk factors.")
 
 # ── Tab 3: On-Demand Forecast ─────────────────────────────────────────────────
 with tab3:

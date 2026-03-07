@@ -18,14 +18,16 @@
 
 try:
     import dlt
-    IN_PIPELINE = True
+    # On newer DBRs, `import dlt` succeeds even outside a pipeline context.
+    # Detect actual pipeline execution by checking if pipeline-injected Spark
+    # conf keys exist (these are only set when running inside a DLT pipeline).
+    IN_PIPELINE = spark.conf.get("pipelines.id", None) is not None
 except Exception:
-    # Running as a regular notebook (not inside a declarative pipeline context)
-    # Data generation and Job creation sections still work normally
-    # Catching Exception (not just ImportError) because on some runtimes
-    # importing dlt outside a declarative pipeline raises a Py4J/Java error
     dlt = None
     IN_PIPELINE = False
+
+if not IN_PIPELINE:
+    dlt = None
 
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType
@@ -77,6 +79,8 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
     ]
     ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
+    import math
+
     BASE_ULTIMATE = {
         "Personal_Auto":       185_000_000,
         "Commercial_Auto":     105_000_000,
@@ -89,28 +93,65 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "New_Brunswick": 0.17, "Nova_Scotia": 0.22,
         "Prince_Edward_Island": 0.04, "Newfoundland": 0.11,
     }
-    DEV_PATTERN = {
-        "Personal_Auto":       [0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.82, 0.87, 0.91, 0.94, 0.97, 0.99],
-        "Commercial_Auto":     [0.10, 0.22, 0.35, 0.46, 0.55, 0.63, 0.70, 0.77, 0.83, 0.88, 0.93, 0.97],
-        "Homeowners":          [0.12, 0.28, 0.42, 0.54, 0.64, 0.73, 0.80, 0.86, 0.90, 0.94, 0.97, 0.99],
-        "Commercial_Property": [0.08, 0.18, 0.30, 0.40, 0.50, 0.59, 0.67, 0.74, 0.81, 0.87, 0.92, 0.96],
+
+    # Line-specific maximum development lags (months)
+    MAX_DEV_LAGS = {
+        "Personal_Auto":       60,   # 5-year tail
+        "Commercial_Auto":     60,   # 5-year tail
+        "Homeowners":          36,   # 3-year tail
+        "Commercial_Property": 48,   # 4-year tail
     }
+    MAX_LAG_GLOBAL = max(MAX_DEV_LAGS.values())  # 60
+
+    # Weibull CDF parameters for cumulative development: F(k) = 1 - exp(-(k/lambda)^theta)
+    WEIBULL_PARAMS = {
+        "Personal_Auto":       (15.0, 1.2),   # medium tail
+        "Commercial_Auto":     (20.0, 1.3),   # longer tail
+        "Homeowners":          (10.0, 1.1),   # short tail
+        "Commercial_Property": (15.0, 1.4),   # medium-long tail
+    }
+
+    # Calendar-year superimposed inflation (annual rate, varying by line)
+    CAL_YEAR_INFLATION = {
+        "Personal_Auto":       0.03,   # 3% per year
+        "Commercial_Auto":     0.04,   # 4% per year
+        "Homeowners":          0.025,  # 2.5% per year
+        "Commercial_Property": 0.05,   # 5% per year (construction costs)
+    }
+
+    # Generate parametric development patterns using Weibull CDF
+    # Padded to MAX_LAG_GLOBAL (60) so all product lines use same-length arrays
+    DEV_PATTERN = {}
+    for _prod, (_lam, _theta) in WEIBULL_PARAMS.items():
+        _max_lag = MAX_DEV_LAGS[_prod]
+        _pattern = []
+        for _k in range(1, MAX_LAG_GLOBAL + 1):
+            if _k <= _max_lag:
+                _val = 1.0 - math.exp(-(_k / _lam) ** _theta)
+            else:
+                _val = 1.0  # fully developed beyond line's max lag
+            _pattern.append(round(_val, 6))
+        DEV_PATTERN[_prod] = _pattern
 
     n_months = len(ACCIDENT_MONTHS)
     month_strs = [m.strftime("%Y-%m-%d") for m in ACCIDENT_MONTHS]
 
     # Control table: one row per (segment, month) with pre-drawn ultimate (3,360 rows)
+    # Line-specific max development lags create a realistic staircase pattern
     control_rows = []
     for prod in PRODUCT_LINES:
+        _line_max_lag = MAX_DEV_LAGS[prod]
+        _inflation_rate = CAL_YEAR_INFLATION[prod]
         for region in REGIONS:
             base_ult = BASE_ULTIMATE[prod] * REGION_MULT[region]
             ult_noise = np.random.uniform(0.85, 1.15, size=n_months)
             control_rows.extend(
                 (prod, region, f"{prod}__{region}",
-                 month_strs[mi], min(12, n_months - mi),
-                 float(base_ult * ult_noise[mi] * (1 + 0.003 * mi)))
+                 month_strs[mi], min(_line_max_lag, n_months - mi),
+                 float(base_ult * ult_noise[mi] * (1 + 0.003 * mi)),
+                 float(_inflation_rate))
                 for mi in range(n_months)
-                if min(12, n_months - mi) >= 1
+                if min(_line_max_lag, n_months - mi) >= 1
             )
 
     control_schema = StructType([
@@ -120,10 +161,12 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         StructField("accident_month", StringType(),  False),
         StructField("max_lag",        IntegerType(), False),
         StructField("ultimate",       DoubleType(),  False),
+        StructField("inflation_rate", DoubleType(),  False),
     ])
     control_sdf = spark.createDataFrame(control_rows, schema=control_schema)
 
     # Dev pattern lookup: product_line → array of cumulative paid %
+    # Arrays are padded to MAX_LAG_GLOBAL (60) so all lines use the same structure
     dev_pct_map = F.create_map(*[
         x for prod in PRODUCT_LINES for x in [
             F.lit(prod),
@@ -132,28 +175,39 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
     ])
 
     # Explode to individual lag entries, compute values in Spark
+    # Calendar-year inflation: (1 + rate)^(calendar_year_offset)
+    # ODP-consistent noise: wider range (0.85–1.15) for realistic development variability
     reserve_sdf = (
         control_sdf
         .withColumn("dev_lag", F.explode(F.sequence(F.lit(1), F.col("max_lag"))))
-        .withColumn("development_month",
-            F.date_format(
+        .withColumns({
+            "development_month": F.date_format(
                 F.add_months(F.to_date("accident_month"), F.col("dev_lag")),
-                "yyyy-MM-dd"))
-        .withColumn("cumulative_paid",
-            F.round(F.col("ultimate") * F.least(
+                "yyyy-MM-dd"),
+            "_cal_year_offset": (
+                F.year(F.to_date("accident_month")) + F.col("dev_lag") / F.lit(12.0)
+                - F.lit(2019.0)),
+        })
+        # _inflation_factor depends on _cal_year_offset → separate withColumns
+        .withColumn("_inflation_factor",
+            F.pow(F.lit(1.0) + F.col("inflation_rate"), F.col("_cal_year_offset")))
+        .withColumns({
+            "cumulative_paid": F.round(F.col("ultimate") * F.least(
                 F.element_at(dev_pct_map[F.col("product_line")], F.col("dev_lag"))
-                * (F.lit(0.92) + F.rand(seed=2024) * F.lit(0.16)),
-                F.lit(1.0)), 2))
-        .withColumn("cumulative_incurred",
-            F.round(F.col("ultimate")
-                    * (F.lit(0.95) + F.rand(seed=2025) * F.lit(0.10)), 2))
+                * (F.lit(0.85) + F.rand(seed=2024) * F.lit(0.30))
+                * F.col("_inflation_factor"),
+                F.lit(1.0)), 2),
+            "cumulative_incurred": F.round(F.col("ultimate")
+                * (F.lit(0.95) + F.rand(seed=2025) * F.lit(0.10))
+                * F.col("_inflation_factor"), 2),
+            "op": F.when(F.col("dev_lag") == 1, "INSERT").otherwise("UPDATE"),
+            "event_id": F.monotonically_increasing_id(),
+            "ingested_at": F.current_timestamp().cast("string"),
+        })
+        # case_reserve depends on cumulative_incurred and cumulative_paid
         .withColumn("case_reserve",
             F.round(F.greatest(F.lit(0.0),
                 F.col("cumulative_incurred") - F.col("cumulative_paid")), 2))
-        .withColumn("op",
-            F.when(F.col("dev_lag") == 1, "INSERT").otherwise("UPDATE"))
-        .withColumn("event_id", F.monotonically_increasing_id())
-        .withColumn("ingested_at", F.current_timestamp().cast("string"))
         .select("event_id", "segment_id", "product_line", "region",
                 "accident_month", "development_month", "dev_lag",
                 "cumulative_paid", "cumulative_incurred", "case_reserve",
@@ -273,20 +327,21 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
     claims_sdf = (
         control_sdf
         .withColumn("_seq", F.explode(F.sequence(F.lit(1), F.col("n_claims"))))
-        # Lognormal severity: exp(mu + sigma * Z), Z ~ N(0,1)
-        .withColumn("claim_amount",
-            F.round(F.exp(F.col("mu_ln") + F.col("sigma_ln") * F.randn(seed=42)), 2))
-        # Premium = claim / loss_ratio * U(0.85, 1.15)
-        .withColumn("monthly_prem_exposure",
-            F.round(F.col("claim_amount") / F.col("loss_ratio")
-                    * (F.lit(0.85) + F.rand(seed=43) * F.lit(0.30)), 2))
-        # Random claim type from product-specific list
-        .withColumn("_ctypes", ctype_map[F.col("product_line")])
-        .withColumn("claim_type",
-            F.element_at(F.col("_ctypes"),
-                F.floor(F.rand(seed=44) * F.size(F.col("_ctypes"))).cast("int") + 1))
-        .withColumn("claim_id", F.monotonically_increasing_id())
-        .withColumn("ingested_at", F.current_timestamp().cast("string"))
+        .withColumns({
+            "claim_amount": F.round(
+                F.exp(F.col("mu_ln") + F.col("sigma_ln") * F.randn(seed=42)), 2),
+            "_ctypes": ctype_map[F.col("product_line")],
+        })
+        # monthly_prem_exposure depends on claim_amount; claim_type depends on _ctypes
+        .withColumns({
+            "monthly_prem_exposure": F.round(
+                F.col("claim_amount") / F.col("loss_ratio")
+                * (F.lit(0.85) + F.rand(seed=43) * F.lit(0.30)), 2),
+            "claim_type": F.element_at(F.col("_ctypes"),
+                F.floor(F.rand(seed=44) * F.size(F.col("_ctypes"))).cast("int") + 1),
+            "claim_id": F.monotonically_increasing_id(),
+            "ingested_at": F.current_timestamp().cast("string"),
+        })
         .select("claim_id", "product_line", "region", "loss_date",
                 "claim_amount", "monthly_prem_exposure", "claim_type", "ingested_at")
     )
@@ -407,20 +462,23 @@ if IN_PIPELINE:
 # COMMAND ----------
 
 if IN_PIPELINE:
+    from pyspark.sql import Window as _TriWindow
+
     @dlt.table(
         name="gold_reserve_triangle",
-        comment="Loss development triangle by segment × accident month × development lag. Core actuarial exhibit for reserve adequacy analysis.",
+        comment="Loss development triangle by segment × accident month × development lag. Core actuarial exhibit for reserve adequacy, chain ladder, and bootstrap analysis. Includes incremental values for bootstrap resampling.",
         table_properties={"quality": "gold"},
     )
     def gold_reserve_triangle():
         """
         Gold: Loss development triangle from Silver reserve history.
         Uses current SCD2 versions only (__END_AT IS NULL) to get the latest
-        reserve estimate at each development lag.
+        reserve estimate at each development lag. Adds incremental values
+        (cumulative at lag k minus cumulative at lag k-1) for bootstrap chain ladder.
         """
         silver = dlt.read("silver_reserves")
 
-        return (
+        agg = (
             silver
             .filter(F.col("__END_AT").isNull())  # current SCD2 records only
             .groupBy("segment_id", "product_line", "region", "accident_month", "dev_lag")
@@ -429,6 +487,18 @@ if IN_PIPELINE:
                 F.sum("cumulative_incurred").alias("cumulative_incurred"),
                 F.sum("case_reserve").alias("case_reserve"),
             )
+        )
+
+        # Compute incremental values for bootstrap chain ladder
+        _w = _TriWindow.partitionBy("segment_id", "accident_month").orderBy("dev_lag")
+        return (
+            agg
+            .withColumns({
+                "incremental_paid": F.col("cumulative_paid")
+                    - F.coalesce(F.lag("cumulative_paid", 1).over(_w), F.lit(0.0)),
+                "incremental_incurred": F.col("cumulative_incurred")
+                    - F.coalesce(F.lag("cumulative_incurred", 1).over(_w), F.lit(0.0)),
+            })
             .orderBy("segment_id", "accident_month", "dev_lag")
         )
 
@@ -475,8 +545,10 @@ if IN_PIPELINE:
         """
         return (
             dlt.read("bronze_claims")
-            .withColumn("segment_id", F.concat_ws("__", "product_line", "region"))
-            .withColumn("month", F.date_trunc("month", F.to_date(F.col("loss_date"))))
+            .withColumns({
+                "segment_id": F.concat_ws("__", "product_line", "region"),
+                "month": F.date_trunc("month", F.to_date(F.col("loss_date"))),
+            })
             .groupBy("segment_id", "product_line", "region", "month")
             .agg(
                 F.count("*").alias("claims_count"),
@@ -484,7 +556,6 @@ if IN_PIPELINE:
                 F.avg("claim_amount").alias("avg_severity"),
                 F.sum("monthly_prem_exposure").alias("earned_premium"),
             )
-            # Guard against divide-by-zero (Photon + ANSI mode on Serverless)
             .withColumn("loss_ratio",
                 F.when(F.col("earned_premium") > 0,
                        F.col("total_incurred") / F.col("earned_premium"))
@@ -510,20 +581,23 @@ if IN_PIPELINE:
         lag_w = _RollingWindow.partitionBy("segment_id").orderBy("month")
         return (
             claims
-            .withColumn("rolling_3m_mean",  F.avg("claims_count").over(w3))
-            .withColumn("rolling_6m_mean",  F.avg("claims_count").over(w6))
-            .withColumn("rolling_12m_mean", F.avg("claims_count").over(w12))
-            .withColumn("rolling_3m_std",   F.stddev("claims_count").over(w3))
-            .withColumn("_prev",  F.lag("claims_count", 1).over(lag_w))
-            .withColumn("_prev12", F.lag("claims_count", 12).over(lag_w))
-            .withColumn("mom_change_pct",
-                F.when(F.col("_prev") != 0,
-                       (F.col("claims_count") - F.col("_prev")) / F.col("_prev") * 100)
-                 .otherwise(F.lit(0.0)))
-            .withColumn("yoy_change_pct",
-                F.when(F.col("_prev12") != 0,
-                       (F.col("claims_count") - F.col("_prev12")) / F.col("_prev12") * 100)
-                 .otherwise(F.lit(0.0)))
+            .withColumns({
+                "rolling_3m_mean":  F.avg("claims_count").over(w3),
+                "rolling_6m_mean":  F.avg("claims_count").over(w6),
+                "rolling_12m_mean": F.avg("claims_count").over(w12),
+                "rolling_3m_std":   F.stddev("claims_count").over(w3),
+                "_prev":  F.lag("claims_count", 1).over(lag_w),
+                "_prev12": F.lag("claims_count", 12).over(lag_w),
+            })
+            # mom/yoy depend on _prev/_prev12
+            .withColumns({
+                "mom_change_pct": F.when(F.col("_prev") != 0,
+                    (F.col("claims_count") - F.col("_prev")) / F.col("_prev") * 100)
+                    .otherwise(F.lit(0.0)),
+                "yoy_change_pct": F.when(F.col("_prev12") != 0,
+                    (F.col("claims_count") - F.col("_prev12")) / F.col("_prev12") * 100)
+                    .otherwise(F.lit(0.0)),
+            })
             .drop("_prev", "_prev12")
         )
 
@@ -613,29 +687,24 @@ if IN_PIPELINE:
         )
 
         # Pivot: one row per (province, ref_date), columns = indicator values
+        _prov_pairs = [item for pair in _PROVINCE_MAP.items() for item in pair]
+        _map_expr   = F.create_map(*[F.lit(x) for x in _prov_pairs])
+        w = Window.partitionBy("province").orderBy("month")
+        hpi_lag = F.lag("hpi_index", 1).over(w)
+
         pivoted = (
             current
             .groupBy("province", "ref_date")
             .pivot("indicator_name", ["unemployment_rate", "hpi_index", "housing_starts"])
             .agg(F.first("value"))
-            # Convert "YYYY-MM" ref_date to a proper date column
-            .withColumn("month", F.to_date(F.concat(F.col("ref_date"), F.lit("-01"))))
-        )
-
-        # Map province names to workshop region names using a Spark map literal
-        _prov_pairs = [item for pair in _PROVINCE_MAP.items() for item in pair]
-        _map_expr   = F.create_map(*[F.lit(x) for x in _prov_pairs])
-        pivoted = pivoted.withColumn("region", _map_expr[F.col("province")])
-
-        # hpi_growth = month-over-month HPI % change
-        # ANSI-safe: guard against lag = 0 with F.when
-        w = Window.partitionBy("province").orderBy("month")
-        hpi_lag = F.lag("hpi_index", 1).over(w)
-        pivoted = pivoted.withColumn(
-            "hpi_growth",
-            F.when(hpi_lag > 0,
-                   (F.col("hpi_index") - hpi_lag) / hpi_lag * 100.0)
-             .otherwise(F.lit(None).cast("double"))
+            .withColumns({
+                "month": F.to_date(F.concat(F.col("ref_date"), F.lit("-01"))),
+                "region": _map_expr[F.col("province")],
+            })
+            .withColumn("hpi_growth",
+                F.when(hpi_lag > 0,
+                       (F.col("hpi_index") - hpi_lag) / hpi_lag * 100.0)
+                 .otherwise(F.lit(None).cast("double")))
         )
 
         return (
