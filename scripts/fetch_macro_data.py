@@ -74,7 +74,7 @@ STATCAN_TABLES = {
         "filters": [],   # no further breakdown; each province has one row per month
     },
     # Table 18-10-0004-01: Consumer Price Index (All-items) by province, monthly.
-    # Used for inflation-adjusted severity calibration in Monte Carlo (Module 4).
+    # Used for inflation-adjusted severity calibration in Bootstrap Chain Ladder.
     "18100004": {
         "source_table":   "18-10-0004-01",
         "indicator_name": "cpi_index",
@@ -194,7 +194,7 @@ if not all_rows:
     print("\nWARNING: All StatCan fetches failed.")
     print("  This is expected on workspaces with restricted outbound internet access.")
     print("  The declarative pipeline will process an empty raw_macro_indicators.")
-    print("  Module 4 SARIMAX will fall back to baseline SARIMA (no macro exog).")
+    print("  SARIMAX will fall back to baseline SARIMA (no macro exog).")
     print("  To populate macro data manually: run this notebook on a cluster with")
     print("  outbound HTTPS access to www150.statcan.gc.ca")
 

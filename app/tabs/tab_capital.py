@@ -7,6 +7,7 @@ from math import log, sqrt, pi
 from db import load_bootstrap_summary, load_mct_components, load_ldf_volatility
 from endpoints import call_bootstrap_endpoint
 from constants import fmt_dollars
+from chart_theme import apply_default_layout, COLORS
 
 
 def _fit_lognormal(mean_val, var99_val):
@@ -171,16 +172,13 @@ _Technical: Bootstrap Chain Ladder with process variance (Gamma noise). Residual
                     bgcolor="rgba(255,255,255,0.88)",
                 )
 
-            fig.update_layout(
+            apply_default_layout(
+                fig,
                 title="IBNR Reserve Distribution (Bootstrap Chain Ladder)",
+                height=500,
                 xaxis_title=f"Total IBNR (${_unit})",
                 yaxis_title="Probability Density",
-                height=500,
-                legend=dict(
-                    orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1,
-                ),
-                yaxis=dict(showticklabels=False),
+                yaxis=dict(showticklabels=False, gridcolor="#F0F0F0", zeroline=False),
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -241,11 +239,12 @@ _Technical: Bootstrap Chain Ladder with process variance (Gamma noise). Residual
                     text=[fmt_dollars(v) for v in _mack_vals],
                     textposition="outside",
                 ))
-                _fig_cmp.update_layout(
+                apply_default_layout(
+                    _fig_cmp,
                     title="Bootstrap vs Mack Analytical — Reserve Risk",
+                    height=400,
                     yaxis_title=f"Total IBNR (${_unit})",
-                    barmode="group", height=400,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    barmode="group",
                 )
                 st.plotly_chart(_fig_cmp, use_container_width=True)
 

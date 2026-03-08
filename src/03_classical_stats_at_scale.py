@@ -115,7 +115,7 @@ print(f"Feature Store features joined: {', '.join(_fs_cols[2:])}")
 
 # COMMAND ----------
 
-SARIMA_SCHEMA = StructType([
+FREQ_FORECAST_SCHEMA = StructType([
     StructField("segment_id",      StringType(), False),
     StructField("month",           DateType(),   False),
     StructField("record_type",     StringType(), False),
@@ -312,7 +312,7 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
     sarima_results_df = (
         claims_with_macro
         .groupby("segment_id")
-        .applyInPandas(fit_sarimax_per_segment, schema=SARIMA_SCHEMA)
+        .applyInPandas(fit_sarimax_per_segment, schema=FREQ_FORECAST_SCHEMA)
     )
 
     # Ensure models schema exists before first write
@@ -438,7 +438,7 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
     except Exception as _garch_reg_err:
         print(f"GARCH fit failed for serving model: {_garch_reg_err}")
 
-    _SARIMA_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
+    _FREQ_MODEL_NAME = f"{CATALOG}.{MODELS_SCHEMA}.frequency_forecaster"
     with tempfile.TemporaryDirectory() as _tmpdir:
         _model_pkl_path = os.path.join(_tmpdir, "model.pkl")
         with open(_model_pkl_path, "wb") as _f:
@@ -463,7 +463,7 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
             python_model=SARIMAXForecaster(),
             artifacts={"sarimax_model": _tmpdir},
             signature=_signature,
-            registered_model_name=_SARIMA_MODEL_NAME,
+            registered_model_name=_FREQ_MODEL_NAME,
             pip_requirements=[
                 f"statsmodels=={_statsmodels.__version__}",
                 f"numpy=={np.__version__}",
@@ -473,15 +473,15 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
             ],
         )
 
-    print(f"\nFrequency forecaster registered to: {_SARIMA_MODEL_NAME}")
+    print(f"\nFrequency forecaster registered to: {_FREQ_MODEL_NAME}")
 
     _client = MlflowClient()
-    _sarima_versions = _client.search_model_versions(f"name='{_SARIMA_MODEL_NAME}'")
-    _sarima_latest_ver = max(int(v.version) for v in _sarima_versions)
-    _client.set_registered_model_alias(name=_SARIMA_MODEL_NAME, alias="Champion", version=_sarima_latest_ver)
-    _client.set_model_version_tag(name=_SARIMA_MODEL_NAME, version=str(_sarima_latest_ver),
+    _freq_versions = _client.search_model_versions(f"name='{_FREQ_MODEL_NAME}'")
+    _freq_latest_ver = max(int(v.version) for v in _freq_versions)
+    _client.set_registered_model_alias(name=_FREQ_MODEL_NAME, alias="Champion", version=_freq_latest_ver)
+    _client.set_model_version_tag(name=_FREQ_MODEL_NAME, version=str(_freq_latest_ver),
                                   key="approved_by", value="actuarial-workshop-demo")
-    print(f"Set @Champion → version {_sarima_latest_ver}")
+    print(f"Set @Champion → version {_freq_latest_ver}")
 
 
 # COMMAND ----------

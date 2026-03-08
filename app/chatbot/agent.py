@@ -211,8 +211,12 @@ def _get_tool_schemas():
     return schemas
 
 
-def _execute_tool(fn_name: str, args: dict) -> str:
-    """Execute a single tool call, with MLflow span tracing if available."""
+def _execute_tool(fn_name: str, args: dict, attachments: list) -> str:
+    """Execute a single tool call, with MLflow span tracing if available.
+
+    Tools may return (text, attachment_dict) tuples. The text goes to the LLM;
+    the attachment is collected for rich rendering in the chat UI.
+    """
     fn = TOOL_MAP.get(fn_name)
     if fn is None:
         return f"Unknown tool: {fn_name}"
@@ -220,18 +224,33 @@ def _execute_tool(fn_name: str, args: dict) -> str:
         if _mlflow_ok:
             with mlflow.start_span(name=fn_name, span_type="TOOL") as span:
                 span.set_inputs(args)
-                result = fn(**args)
-                span.set_outputs({"result": result[:500] if len(result) > 500 else result})
-                return result
-        return fn(**args)
+                raw = fn(**args)
+                if isinstance(raw, tuple):
+                    text, attachment = raw
+                    if attachment:
+                        attachments.append(attachment)
+                else:
+                    text = raw
+                span.set_outputs({"result": text[:500] if len(text) > 500 else text})
+                return text
+        raw = fn(**args)
+        if isinstance(raw, tuple):
+            text, attachment = raw
+            if attachment:
+                attachments.append(attachment)
+            return text
+        return raw
     except Exception as e:
         return f"Tool error: {e}"
 
 
-def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None, None]:
+def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
     """Run the agent loop: LLM -> tool calls -> LLM -> ... -> final response.
 
-    Yields partial text as it becomes available (for streaming in Streamlit).
+    Yields:
+      - str: partial text chunks (for streaming in Streamlit)
+      - dict: {"type": "attachments", "data": [...]} after the final response,
+              containing structured tool results for rich rendering.
     """
     client = _get_openai_client()
     if client is None:
@@ -244,6 +263,7 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None,
 
     tool_schemas = _get_tool_schemas()
     full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    attachments = []
 
     for _ in range(max_tool_rounds):
         try:
@@ -267,9 +287,11 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None,
             content = assistant_msg.content or ""
             if content:
                 yield content
+            if attachments:
+                yield {"type": "attachments", "data": attachments}
             return
 
-        # Append assistant message with tool calls — strip fields the
+        # Append assistant message with tool calls -- strip fields the
         # Databricks Foundation Model API doesn't accept (e.g. annotations).
         assistant_dict = {
             "role": "assistant",
@@ -296,7 +318,7 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None,
                 args = {}
 
             yield f"_Calling {fn_name}..._\n\n"
-            result = _execute_tool(fn_name, args)
+            result = _execute_tool(fn_name, args, attachments)
 
             full_messages.append({
                 "role": "tool",
@@ -305,3 +327,5 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None,
             })
 
     yield "Reached maximum tool call rounds. Please simplify your question."
+    if attachments:
+        yield {"type": "attachments", "data": attachments}

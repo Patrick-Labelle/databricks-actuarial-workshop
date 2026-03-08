@@ -221,6 +221,50 @@ def load_mct_components():
 
 
 @st.cache_data(ttl=600)
+def load_regional_summary():
+    """Load claims summary aggregated by region."""
+    df = execute_sql(f"""
+        SELECT region,
+               SUM(claims_count)              AS total_claims,
+               ROUND(AVG(claims_count), 1)    AS avg_monthly_claims,
+               ROUND(SUM(total_incurred), 2)  AS total_incurred,
+               ROUND(AVG(avg_severity), 2)    AS avg_severity,
+               ROUND(SUM(earned_premium), 2)  AS total_premium
+        FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
+        GROUP BY region
+        ORDER BY total_claims DESC
+    """)
+    if not df.empty:
+        for col in ['total_claims', 'avg_monthly_claims', 'total_incurred',
+                     'avg_severity', 'total_premium']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+
+@st.cache_data(ttl=600)
+def load_regional_product_breakdown():
+    """Load claims breakdown by region and product line."""
+    df = execute_sql(f"""
+        SELECT region, product_line,
+               SUM(claims_count)              AS total_claims,
+               ROUND(AVG(claims_count), 1)    AS avg_monthly_claims,
+               ROUND(SUM(total_incurred), 2)  AS total_incurred,
+               ROUND(AVG(avg_severity), 2)    AS avg_severity,
+               ROUND(SUM(earned_premium), 2)  AS total_premium
+        FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
+        GROUP BY region, product_line
+        ORDER BY region, product_line
+    """)
+    if not df.empty:
+        for col in ['total_claims', 'avg_monthly_claims', 'total_incurred',
+                     'avg_severity', 'total_premium']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+
+@st.cache_data(ttl=600)
 def load_ldf_volatility():
     """Load development factor volatility per product line."""
     df = execute_sql(f"""

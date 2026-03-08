@@ -8,6 +8,7 @@ from endpoints import call_bootstrap_endpoint
 from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
 from constants import RESERVE_SCENARIO_PRESETS, SEVERITY_LEVELS, CANADIAN_PROVINCES, fmt_dollars
+from chart_theme import apply_default_layout, COLORS
 
 
 def render(tab):
@@ -71,12 +72,13 @@ def render(tab):
                 text=[fmt_dollars(v) for v in _all_cvar99], textposition="outside",
                 hovertemplate=f"%{{x}}<br>CVaR(99%): $%{{y:.1f}}{_un}<extra></extra>",
             ))
-            _fig_scenario.update_layout(
+            apply_default_layout(
+                _fig_scenario,
                 title="Reserve Risk by Scenario — VaR(99.5%) and CVaR(99%)",
+                height=400,
                 yaxis_title=f"Total IBNR (${_un})",
-                barmode="group", height=400, showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                yaxis=dict(range=[0, max(_all_var995 + _all_cvar99) / _dv * 1.25]),
+                barmode="group",
+                yaxis=dict(range=[0, max(_all_var995 + _all_cvar99) / _dv * 1.25], gridcolor="#F0F0F0", zeroline=False),
             )
             st.plotly_chart(_fig_scenario, use_container_width=True)
         else:
@@ -114,11 +116,12 @@ def render(tab):
                     annotation_text=f"Current VaR(99.5%): {fmt_dollars(_b_v995)}",
                     annotation_position="bottom right",
                 )
-            _fig_tl.update_layout(
+            apply_default_layout(
+                _fig_tl,
                 title="How Reserve Risk Is Projected to Change Over the Next 12 Months",
-                xaxis_title="Month", yaxis_title=f"Reserve Requirement (${_tl_un})",
                 height=380,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis_title="Month",
+                yaxis_title=f"Reserve Requirement (${_tl_un})",
             )
             st.plotly_chart(_fig_tl, use_container_width=True)
         else:
@@ -324,10 +327,12 @@ def render(tab):
                                    annotation_text="Ruin threshold",
                                    annotation_position="bottom right")
 
-            _fig_runoff.update_layout(
+            apply_default_layout(
+                _fig_runoff,
                 title="Run-Off Surplus Trajectory with Regime-Switching (50,000 scenarios)",
-                xaxis_title="Month", yaxis_title=f"Surplus (${_s_un})", height=420,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                height=420,
+                xaxis_title="Month",
+                yaxis_title=f"Surplus (${_s_un})",
             )
             st.plotly_chart(_fig_runoff, use_container_width=True)
 

@@ -70,8 +70,8 @@ WAREHOUSE_ID     = dbutils.widgets.get("warehouse_id")
 PG_DATABASE      = dbutils.widgets.get("pg_database")
 APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
-SARIMA_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
-MC_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
+FREQ_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
+BOOT_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
 FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
@@ -87,10 +87,10 @@ _HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/jso
 LAKEBASE_ENDPOINT_PATH = "projects/actuarial-workshop-lakebase/branches/main/endpoints/primary"
 
 print(f"Workspace:       {WORKSPACE_URL}")
-print(f"SARIMA model:    {SARIMA_MODEL_NAME}")
-print(f"MC model:        {MC_MODEL_NAME}")
-print(f"SARIMA endpoint: {ENDPOINT_NAME}")
-print(f"MC endpoint:     {MC_ENDPOINT_NAME}")
+print(f"Frequency model:  {FREQ_MODEL_NAME}")
+print(f"Bootstrap model:  {BOOT_MODEL_NAME}")
+print(f"Frequency endpoint: {ENDPOINT_NAME}")
+print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
 print(f"Feature table:   {FEATURE_TABLE}")
 print(f"Warehouse ID:    {WAREHOUSE_ID or '(not set)'}")
 print(f"Lakebase DB:     {PG_DATABASE}")
@@ -99,9 +99,9 @@ print(f"App SP:          {APP_SP_CLIENT_ID or '(not set)'}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. SARIMA Serving Endpoint
+# MAGIC ## 1. Frequency Forecaster Serving Endpoint
 # MAGIC
-# MAGIC Create (or update) the SARIMA forecasting endpoint, then configure AI Gateway
+# MAGIC Create (or update) the Frequency Forecaster endpoint, then configure AI Gateway
 # MAGIC as a **separate API call**. The `PUT /serving-endpoints/{name}/config` API only
 # MAGIC accepts `served_models` — AI Gateway requires `PUT /serving-endpoints/{name}/ai-gateway`.
 
@@ -112,24 +112,24 @@ from mlflow.tracking import MlflowClient
 client = MlflowClient()
 
 # Look up latest model versions
-sarima_versions = client.search_model_versions(f"name='{SARIMA_MODEL_NAME}'")
-sarima_latest_ver = max(int(v.version) for v in sarima_versions)
-print(f"SARIMA model:  {SARIMA_MODEL_NAME}  → version {sarima_latest_ver}")
+freq_versions = client.search_model_versions(f"name='{FREQ_MODEL_NAME}'")
+freq_latest_ver = max(int(v.version) for v in freq_versions)
+print(f"Frequency model:  {FREQ_MODEL_NAME}  → version {freq_latest_ver}")
 
-mc_versions = client.search_model_versions(f"name='{MC_MODEL_NAME}'")
-mc_latest_ver = max(int(v.version) for v in mc_versions)
-print(f"MC model:      {MC_MODEL_NAME}  → version {mc_latest_ver}")
+boot_versions = client.search_model_versions(f"name='{BOOT_MODEL_NAME}'")
+boot_latest_ver = max(int(v.version) for v in boot_versions)
+print(f"Bootstrap model:  {BOOT_MODEL_NAME}  → version {boot_latest_ver}")
 
 # COMMAND ----------
 
 # ── Step 1: Create/update endpoint (served_models only) ─────────────────────
-_sarima_endpoint_body = {
+_freq_endpoint_body = {
     "name": ENDPOINT_NAME,
     "config": {
         "served_models": [{
-            "name":                   "sarima-champion",
-            "model_name":             SARIMA_MODEL_NAME,
-            "model_version":          str(sarima_latest_ver),
+            "name":                   "frequency-champion",
+            "model_name":             FREQ_MODEL_NAME,
+            "model_version":          str(freq_latest_ver),
             "workload_size":          "Small",
             "scale_to_zero_enabled":  True,
         }],
@@ -145,16 +145,16 @@ if resp.status_code == 200:
     resp = requests.put(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}/config",
         headers=_HEADERS,
-        json=_sarima_endpoint_body["config"],
+        json=_freq_endpoint_body["config"],
     )
-    print(f"SARIMA endpoint updated: {resp.status_code}")
+    print(f"Frequency endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
-        json=_sarima_endpoint_body,
+        json=_freq_endpoint_body,
     )
-    print(f"SARIMA endpoint created: {resp.status_code}")
+    print(f"Frequency endpoint created: {resp.status_code}")
 
 if resp.status_code in (200, 201):
     print(f"  URL: https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations")
@@ -162,12 +162,12 @@ else:
     print(f"  Error: {resp.text}")
 
 # ── Step 2: Configure AI Gateway (separate API call) ────────────────────────
-_sarima_ai_gateway = {
+_freq_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
         "schema_name":       SCHEMA,
-        "table_name_prefix": "sarima_endpoint",
+        "table_name_prefix": "frequency_endpoint",
         "enabled":           True,
     },
     "rate_limits": [{"calls": 60, "renewal_period": "minute"}],
@@ -176,7 +176,7 @@ _sarima_ai_gateway = {
 gw_resp = requests.put(
     f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{ENDPOINT_NAME}/ai-gateway",
     headers=_HEADERS,
-    json=_sarima_ai_gateway,
+    json=_freq_ai_gateway,
 )
 if gw_resp.status_code == 200:
     print(f"  AI Gateway configured: inference tables + rate limits")
@@ -194,13 +194,13 @@ else:
 # COMMAND ----------
 
 # ── Step 1: Create/update endpoint ──────────────────────────────────────────
-_mc_endpoint_body = {
+_boot_endpoint_body = {
     "name": MC_ENDPOINT_NAME,
     "config": {
         "served_models": [{
-            "name":                  "monte-carlo-champion",
-            "model_name":            MC_MODEL_NAME,
-            "model_version":         str(mc_latest_ver),
+            "name":                  "bootstrap-reserve-champion",
+            "model_name":            BOOT_MODEL_NAME,
+            "model_version":         str(boot_latest_ver),
             "workload_size":         "Small",
             "scale_to_zero_enabled": True,
         }],
@@ -216,16 +216,16 @@ if resp.status_code == 200:
     resp = requests.put(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{MC_ENDPOINT_NAME}/config",
         headers=_HEADERS,
-        json=_mc_endpoint_body["config"],
+        json=_boot_endpoint_body["config"],
     )
-    print(f"MC endpoint updated: {resp.status_code}")
+    print(f"Bootstrap endpoint updated: {resp.status_code}")
 else:
     resp = requests.post(
         f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints",
         headers=_HEADERS,
-        json=_mc_endpoint_body,
+        json=_boot_endpoint_body,
     )
-    print(f"MC endpoint created: {resp.status_code}")
+    print(f"Bootstrap endpoint created: {resp.status_code}")
 
 if resp.status_code in (200, 201):
     print(f"  URL: https://{WORKSPACE_URL}/serving-endpoints/{MC_ENDPOINT_NAME}/invocations")
@@ -233,7 +233,7 @@ else:
     print(f"  Error: {resp.text}")
 
 # ── Step 2: Configure AI Gateway ────────────────────────────────────────────
-_mc_ai_gateway = {
+_boot_ai_gateway = {
     "usage_tracking_config": {"enabled": True},
     "inference_table_config": {
         "catalog_name":      CATALOG,
@@ -247,7 +247,7 @@ _mc_ai_gateway = {
 gw_resp = requests.put(
     f"https://{WORKSPACE_URL}/api/2.0/serving-endpoints/{MC_ENDPOINT_NAME}/ai-gateway",
     headers=_HEADERS,
-    json=_mc_ai_gateway,
+    json=_boot_ai_gateway,
 )
 if gw_resp.status_code == 200:
     print(f"  AI Gateway configured: inference tables + rate limits")
@@ -608,12 +608,12 @@ elif not WAREHOUSE_ID and not _genie_space_id:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 6a. SARIMA Forecast (Model Serving)
+# MAGIC ### 6a. Frequency Forecast (Model Serving)
 
 # COMMAND ----------
 
-def call_sarima_endpoint(horizon: int) -> dict:
-    """Call the SARIMA forecasting endpoint. Returns error dict on failure."""
+def call_frequency_endpoint(horizon: int) -> dict:
+    """Call the Frequency Forecaster endpoint. Returns error dict on failure."""
     try:
         resp = requests.post(
             f"https://{WORKSPACE_URL}/serving-endpoints/{ENDPOINT_NAME}/invocations",
@@ -629,9 +629,9 @@ def call_sarima_endpoint(horizon: int) -> dict:
     except Exception as exc:
         return {"error": str(exc)}
 
-print("Requesting 6-month forecast from SARIMA endpoint...\n")
-sarima_result = call_sarima_endpoint(horizon=6)
-print(json.dumps(sarima_result, indent=2))
+print("Requesting 6-month forecast from Frequency Forecaster endpoint...\n")
+freq_result = call_frequency_endpoint(horizon=6)
+print(json.dumps(freq_result, indent=2))
 
 # COMMAND ----------
 
@@ -640,7 +640,7 @@ print(json.dumps(sarima_result, indent=2))
 
 # COMMAND ----------
 
-def call_mc_endpoint(scenario_params: dict) -> dict:
+def call_bootstrap_endpoint(scenario_params: dict) -> dict:
     """Call the Bootstrap Reserve endpoint. Returns result dict or error."""
     try:
         resp = requests.post(
@@ -670,9 +670,9 @@ _adverse_params = {
 }
 
 print("Calling Bootstrap Reserve endpoint — baseline scenario...")
-_b = call_mc_endpoint(_baseline_params)
+_b = call_bootstrap_endpoint(_baseline_params)
 print("Calling Bootstrap Reserve endpoint — adverse development scenario...")
-_s = call_mc_endpoint(_adverse_params)
+_s = call_bootstrap_endpoint(_adverse_params)
 
 for label, result in [("Baseline", _b), ("Adverse Development (LDFs +20%)", _s)]:
     print(f"\n{label}:")

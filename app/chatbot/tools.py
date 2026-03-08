@@ -3,10 +3,15 @@
 Each tool is a plain function with type hints and a docstring.
 The agent calls these via OpenAI-style tool calling.
 
+Tools may return either:
+  - A plain string (text for the LLM + displayed as markdown)
+  - A tuple (text_for_llm, display_attachment) where display_attachment
+    is a dict with rendering instructions for the chat UI.
+
 Adding a new tool:
   1. Define a function with type hints and a Google-style docstring.
   2. Append it to the TOOLS list at the bottom of this file.
-  That's it — the agent auto-discovers tools from that list.
+  That's it -- the agent auto-discovers tools from that list.
 """
 
 import pandas as pd
@@ -21,7 +26,7 @@ from config import (
 
 # ── Data query tool (SQL via warehouse) ──────────────────────────────────────
 
-# Tables organized by schema — the chatbot can query across all schemas
+# Tables organized by schema -- the chatbot can query across all schemas
 _DATA_TABLES = {
     "gold_claims_monthly": "Historical monthly claims aggregated by segment. Columns: segment_id, product_line, region, month, claims_count, total_incurred, avg_severity, earned_premium.",
     "gold_reserve_triangle": "Loss development triangle. Columns: segment_id, product_line, region, accident_month, dev_lag, cumulative_paid, cumulative_incurred, case_reserve, incremental_paid, incremental_incurred.",
@@ -49,7 +54,7 @@ for name, desc in _MODELS_TABLES.items():
 
 
 def query_data(sql_query: str) -> str:
-    """FALLBACK ONLY: Execute a read-only SQL query. Use ask_genie first for any data question — only call this if ask_genie fails or returns no results.
+    """FALLBACK ONLY: Execute a read-only SQL query. Use ask_genie first for any data question -- only call this if ask_genie fails or returns no results.
 
     Args:
         sql_query: A SELECT query using fully qualified table names.
@@ -97,10 +102,12 @@ def query_data(sql_query: str) -> str:
             return "Query returned no results."
 
         df = pd.DataFrame(rows, columns=columns)
-        # Limit output size
+        text = df.head(50).to_markdown(index=False)
         if len(df) > 50:
-            return f"Showing first 50 of {len(df)} rows:\n\n{df.head(50).to_markdown(index=False)}"
-        return df.to_markdown(index=False)
+            text = f"Showing first 50 of {len(df)} rows:\n\n{text}"
+
+        # Return structured attachment for rich rendering
+        return (text, {"type": "dataframe", "df": df.head(50)})
     except Exception as e:
         return f"SQL execution error: {e}"
 
@@ -129,7 +136,12 @@ def run_frequency_forecast(horizon: int) -> str:
         )
         if response.predictions:
             df = pd.DataFrame(response.predictions)
-            return f"Frequency Forecast ({horizon} months):\n\n{df.to_markdown(index=False)}"
+            text = f"Frequency Forecast ({horizon} months):\n\n{df.to_markdown(index=False)}"
+            return (text, {"type": "dataframe", "df": df, "chart": {
+                "x": "month", "y": "forecast_mean",
+                "lo": "forecast_lo95", "hi": "forecast_hi95",
+                "title": f"{horizon}-Month Frequency Forecast",
+            }})
         return "Endpoint returned no predictions."
     except Exception as e:
         return f"Frequency forecast endpoint error: {e}"
@@ -155,14 +167,14 @@ def run_bootstrap_reserve(
 
     Supports scenarios:
     - "baseline" (default): Standard reserve development
-    - "adverse_development": LDFs inflated — reserves develop worse than expected
+    - "adverse_development": LDFs inflated -- reserves develop worse than expected
     - "judicial_inflation": Social inflation / nuclear verdicts on Auto lines
     - "pandemic_tail": Extended development periods due to delayed settlements
     - "superimposed_inflation": Calendar-year trend (CPI + X%) across all lines
 
     Args:
         scenario: Reserve scenario type (default: baseline).
-        ldf_multiplier: LDF multiplier — values above 1.0 inflate development factors (default: 1.0).
+        ldf_multiplier: LDF multiplier -- values above 1.0 inflate development factors (default: 1.0).
         inflation_adj: Calendar-year superimposed inflation rate (default: 0.0).
         cv_personal_auto: Reserve volatility for Personal Auto (default: 0.15).
         cv_commercial_auto: Reserve volatility for Commercial Auto (default: 0.18).
@@ -201,12 +213,17 @@ def run_bootstrap_reserve(
         if response.predictions:
             p = response.predictions[0] if isinstance(response.predictions, list) else response.predictions
             lines = ["Bootstrap Reserve Simulation Results:", ""]
+            metrics = []
             for k, v in p.items():
                 if isinstance(v, (int, float)):
-                    lines.append(f"- **{k}**: {'${:.1f}B'.format(v/1000) if abs(v) >= 1000 else '${:.2f}M'.format(v)}")
+                    formatted = '${:.1f}B'.format(v / 1000) if abs(v) >= 1000 else '${:.2f}M'.format(v)
+                    lines.append(f"- **{k}**: {formatted}")
+                    metrics.append({"label": k, "value": v})
                 else:
                     lines.append(f"- **{k}**: {v}")
-            return "\n".join(lines)
+
+            text = "\n".join(lines)
+            return (text, {"type": "metrics", "items": metrics, "scenario": scenario})
         return "Endpoint returned no predictions."
     except Exception as e:
         return f"Bootstrap reserve endpoint error: {e}"
@@ -252,18 +269,19 @@ def query_annotations(segment_id: str = "") -> str:
             rows,
             columns=["Segment", "Analyst", "Type", "Adj %", "Status", "Note", "Created"],
         )
-        return df.to_markdown(index=False)
+        text = df.to_markdown(index=False)
+        return (text, {"type": "dataframe", "df": df})
     except Exception as e:
         return f"Lakebase query error: {e}"
 
 
-# ── Genie space tool (natural language → SQL) ────────────────────────────────
+# ── Genie space tool (natural language -> SQL) ────────────────────────────────
 
 def ask_genie(question: str) -> str:
     """Ask a natural-language question about the insurance portfolio data using the AI/BI Genie space.
 
     This queries the AI/BI Genie space which understands all workshop tables
-    and can generate SQL automatically. Use this for data exploration questions —
+    and can generate SQL automatically. Use this for data exploration questions --
     trend analysis, comparisons, aggregations, or "show me" questions.
 
     Args:
@@ -288,6 +306,7 @@ def ask_genie(question: str) -> str:
         )
 
         parts = []
+        attachment_df = None
 
         # Extract text reply
         reply = getattr(msg, "reply", None)
@@ -326,6 +345,7 @@ def ask_genie(question: str) -> str:
                             data = getattr(result, "data_array", None) or []
                             if columns and data:
                                 df = pd.DataFrame(data, columns=columns)
+                                attachment_df = df.head(50)
                                 if len(df) > 30:
                                     parts.append(f"\nShowing first 30 of {len(df)} rows:\n\n{df.head(30).to_markdown(index=False)}")
                                 else:
@@ -335,7 +355,11 @@ def ask_genie(question: str) -> str:
 
         if not parts:
             return "Genie processed the question but returned no content. Try rephrasing or use query_data as a fallback."
-        return "\n".join(parts)
+
+        text = "\n".join(parts)
+        if attachment_df is not None:
+            return (text, {"type": "dataframe", "df": attachment_df})
+        return text
     except Exception as e:
         return f"Genie query error: {e}. You can try query_data as a fallback."
 

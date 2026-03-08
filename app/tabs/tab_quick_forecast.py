@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from endpoints import call_frequency_forecast_endpoint
+from chart_theme import apply_default_layout
 
 
 def render(tab):
@@ -84,12 +85,12 @@ _Technical: SARIMA REST endpoint served via Databricks Model Serving, @Champion 
                     name="Forecast range",
                     hoverinfo="skip",
                 ))
-                fig4.update_layout(
+                apply_default_layout(
+                    fig4,
                     title=f"Frequency Forecast — Next {_display_horizon} Months",
+                    height=360,
                     xaxis_title="Month",
                     yaxis_title="Projected Monthly Claims",
-                    height=360,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 st.plotly_chart(fig4, use_container_width=True)
 

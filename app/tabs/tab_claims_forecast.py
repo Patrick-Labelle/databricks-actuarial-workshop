@@ -7,6 +7,7 @@ from db import load_segments, load_forecasts, load_segment_stats, load_garch_vol
 from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
 from constants import SCENARIO_TYPES, APPROVAL_STATUSES
+from chart_theme import apply_default_layout, COLORS
 
 
 def render(tab):
@@ -134,11 +135,10 @@ _Technical details: SARIMA(1,1,1)(1,1,1)₁₂ fitted per segment using statsmod
                             yanchor="bottom", font=dict(color="grey", size=11),
                         )
 
-                    fig.update_layout(
+                    apply_default_layout(
+                        fig,
                         title=f"{selected} — Claims Forecast with GARCH Volatility",
                         height=460,
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        hovermode="x unified",
                     )
                     fig.update_xaxes(title_text="Month")
                     fig.update_yaxes(title_text="Monthly Claims", secondary_y=False)
