@@ -454,14 +454,15 @@ _GENIE_SAMPLE_QUESTIONS = [
 ]
 
 def _build_serialized_space():
+    # Tables MUST be sorted by identifier — the Genie API rejects unsorted lists
+    tables = sorted(
+        [{"identifier": f"{CATALOG}.{schema}.{name}", "description": desc}
+         for schema, name, desc in _GENIE_TABLES_DATA],
+        key=lambda t: t["identifier"],
+    )
     return json.dumps({
         "version": 2,
-        "data_sources": {
-            "tables": [
-                {"identifier": f"{CATALOG}.{schema}.{name}", "description": desc}
-                for schema, name, desc in _GENIE_TABLES_DATA
-            ]
-        },
+        "data_sources": {"tables": tables},
         "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
     })
 
@@ -492,32 +493,39 @@ if _genie_space_id and WAREHOUSE_ID:
 
 if WAREHOUSE_ID and not _genie_space_id:
     try:
-        from databricks.sdk import WorkspaceClient as _GC
-        _gw = _GC()
-
-        _space = _gw.genie.create_space(
-            title="Actuarial Workshop — Reserve Assistant",
-            description=_GENIE_DESCRIPTION,
-            warehouse_id=WAREHOUSE_ID,
-            serialized_space=_build_serialized_space(),
+        # Use raw API — the SDK's genie.create_space() doesn't reliably pass
+        # serialized_space, and the API requires tables sorted by identifier.
+        _create_resp = requests.post(
+            f"https://{WORKSPACE_URL}/api/2.0/genie/spaces",
+            headers=_HEADERS,
+            json={
+                "title": "Actuarial Workshop — Reserve Assistant",
+                "description": _GENIE_DESCRIPTION,
+                "warehouse_id": WAREHOUSE_ID,
+                "serialized_space": _build_serialized_space(),
+            },
         )
-        _genie_space_id = _space.space_id
-        print(f"Genie Space created: {_genie_space_id}")
-        print(f"  Tables: {len(_GENIE_TABLES_DATA)}")
+        if _create_resp.status_code in (200, 201):
+            _genie_space_id = _create_resp.json().get("space_id", "")
+            print(f"Genie Space created: {_genie_space_id}")
+            print(f"  Tables: {len(_GENIE_TABLES_DATA)}")
+        else:
+            print(f"Genie space creation failed ({_create_resp.status_code}): {_create_resp.text[:300]}")
 
         # Grant app SP access to the Genie space
-        if APP_SP_CLIENT_ID:
-            try:
-                _gw.genie.update_space_permissions(
-                    space_id=_genie_space_id,
-                    access_control_list=[{
-                        "service_principal_name": APP_SP_CLIENT_ID,
-                        "permission_level": "CAN_RUN",
-                    }],
-                )
+        if _genie_space_id and APP_SP_CLIENT_ID:
+            _perm_resp = requests.patch(
+                f"https://{WORKSPACE_URL}/api/2.0/permissions/genie/{_genie_space_id}",
+                headers=_HEADERS,
+                json={"access_control_list": [{
+                    "service_principal_name": APP_SP_CLIENT_ID,
+                    "permission_level": "CAN_RUN",
+                }]},
+            )
+            if _perm_resp.status_code == 200:
                 print(f"  Granted CAN_RUN to SP: {APP_SP_CLIENT_ID}")
-            except Exception as _perm_err:
-                print(f"  Genie permission grant skipped: {_perm_err}")
+            else:
+                print(f"  Genie permission grant: {_perm_resp.status_code} — {_perm_resp.text[:200]}")
 
     except Exception as _genie_err:
         import traceback

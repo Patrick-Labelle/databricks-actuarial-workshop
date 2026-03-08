@@ -485,14 +485,15 @@ _GENIE_SAMPLE_QUESTIONS = [
 ]
 
 def _build_serialized_space():
+    # Tables MUST be sorted by identifier — the Genie API rejects unsorted lists
+    tables = sorted(
+        [{"identifier": f"{CATALOG}.{SCHEMA}.{name}", "description": desc}
+         for name, desc in _GENIE_TABLES],
+        key=lambda t: t["identifier"],
+    )
     return json.dumps({
         "version": 2,
-        "data_sources": {
-            "tables": [
-                {"identifier": f"{CATALOG}.{SCHEMA}.{name}", "description": desc}
-                for name, desc in _GENIE_TABLES
-            ]
-        },
+        "data_sources": {"tables": tables},
         "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
     })
 
