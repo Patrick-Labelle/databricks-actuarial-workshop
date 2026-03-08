@@ -7,6 +7,46 @@ st.set_page_config(
     layout="wide",
 )
 
+# ─── Global CSS for polished metric cards and layout ─────────────────────────
+st.markdown("""
+<style>
+/* Metric card polish */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #F8FAFC 0%, #F1F5F9 100%);
+    border: 1px solid #E2E8F0;
+    border-radius: 10px;
+    padding: 16px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    transition: box-shadow 0.2s ease;
+}
+[data-testid="stMetric"]:hover {
+    box-shadow: 0 4px 12px rgba(0,0,0,0.10);
+}
+[data-testid="stMetricLabel"] {
+    font-size: 0.82rem !important;
+    color: #64748B !important;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+[data-testid="stMetricValue"] {
+    font-weight: 700 !important;
+    color: #1B3A5C !important;
+}
+/* Tab styling */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 8px 20px;
+    font-weight: 500;
+}
+/* Divider subtlety */
+hr {
+    border-color: #E8ECF0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ─── Eagerly probe auth so the warning appears early ─────────────────────────
 from auth import get_workspace_client, get_auth_init_error
 
@@ -19,11 +59,18 @@ if get_auth_init_error() is not None:
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("About")
+    st.markdown(
+        '<div style="text-align:center;padding:8px 0 16px 0">'
+        '<span style="font-size:2.2em">📊</span><br>'
+        '<span style="font-size:1.1em;font-weight:700;color:#1B3A5C">'
+        'Stochastic Reserve Analytics</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown("**Portfolio Data**")
     st.markdown("""
-Insurance reserves across **40 segments** (product line × Canadian province):
+Insurance reserves across **40 segments** (product line x Canadian province):
 
 | | |
 |---|---|

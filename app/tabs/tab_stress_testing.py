@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from db import load_bootstrap_summary
 from endpoints import call_bootstrap_endpoint
 from constants import fmt_dollars
+from chart_theme import apply_default_layout
 
 
 def render(tab):
@@ -176,12 +177,12 @@ _Technical: Bootstrap Chain Ladder endpoint with scenario-adjusted parameters._
                 textposition="outside",
                 hovertemplate=f"%{{x}}<br>Scenario: $%{{y:.1f}}{_st_un}<extra></extra>",
             ))
-            _fig_cmp.update_layout(
+            apply_default_layout(
+                _fig_cmp,
                 title="Capital Requirement Change vs. Baseline",
+                height=380,
                 yaxis_title=f"Annual Portfolio Loss (${_st_un})",
                 barmode="group",
-                height=380,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(_fig_cmp, use_container_width=True)
 

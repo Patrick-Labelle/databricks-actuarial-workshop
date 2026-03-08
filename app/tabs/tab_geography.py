@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import pandas as pd
 
 from db import load_regional_summary, load_regional_product_breakdown
+from chart_theme import apply_default_layout
 
 # Province centroids (lat, lon) for the bubble map
 _COORDS = {
@@ -105,10 +106,15 @@ def render(tab):
             bgcolor="white",
         )
         fig.update_layout(
-            margin=dict(l=0, r=0, t=30, b=0),
+            margin=dict(l=0, r=0, t=40, b=0),
             height=500,
-            title=f"{metric_label} by Province"
-            + (f" — {selected_product}" if selected_product != "All" else ""),
+            title=dict(
+                text=f"{metric_label} by Province"
+                + (f" — {selected_product}" if selected_product != "All" else ""),
+                font=dict(size=16, color="#1E1E1E"),
+            ),
+            paper_bgcolor="white",
+            font=dict(family="Inter, system-ui, sans-serif", size=12, color="#444"),
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -125,12 +131,13 @@ def render(tab):
             text=pd.to_numeric(sorted_df[metric_col], errors="coerce").apply(lambda v: f"{v:,.0f}"),
             textposition="outside",
         ))
-        bar_fig.update_layout(
+        apply_default_layout(
+            bar_fig,
+            height=400,
             xaxis_title=metric_label,
             yaxis_title="",
-            height=400,
-            margin=dict(l=0, r=40, t=10, b=40),
             showlegend=False,
+            margin=dict(l=0, r=40, t=10, b=40),
         )
         st.plotly_chart(bar_fig, use_container_width=True)
 
@@ -151,7 +158,8 @@ def render(tab):
                 texttemplate="%{z:,.0f}",
                 hovertemplate="%{y} / %{x}<br>%{z:,.0f}<extra></extra>",
             ))
-            heat_fig.update_layout(
+            apply_default_layout(
+                heat_fig,
                 height=400,
                 margin=dict(l=0, r=0, t=10, b=40),
             )

@@ -61,8 +61,12 @@ def _render_metrics(attachment: dict):
         val = m["value"]
         with cols[i % len(cols)]:
             st.markdown(
-                f'<div style="text-align:center;padding:8px 0">'
-                f'<div style="font-size:0.85em;color:#888">{label}</div>'
+                f'<div style="text-align:center;padding:12px 8px;'
+                f'background:linear-gradient(135deg,#F8FAFC,#F1F5F9);'
+                f'border-radius:10px;border:1px solid #E2E8F0;'
+                f'box-shadow:0 1px 3px rgba(0,0,0,0.06)">'
+                f'<div style="font-size:0.78em;color:#64748B;text-transform:uppercase;'
+                f'letter-spacing:0.04em;margin-bottom:4px">{label}</div>'
                 f'<div style="font-size:2em;font-weight:700;color:{color}">'
                 f'{_fmt_metric_value(val)}</div></div>',
                 unsafe_allow_html=True,
@@ -129,13 +133,15 @@ def _render_chart(df: pd.DataFrame, spec: dict):
         y=pd.to_numeric(df[y], errors="coerce"),
         mode="lines+markers",
         name=y.replace("_", " ").title(),
-        line=dict(color="#2196F3", width=2),
+        line=dict(color="#1B3A5C", width=2),
     ))
 
     fig.update_layout(
         title=title, height=300,
         margin=dict(l=0, r=0, t=40, b=30),
         xaxis_title="", yaxis_title="",
+        plot_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -174,18 +180,17 @@ def render(tab):
         if "chat_messages" not in st.session_state:
             st.session_state.chat_messages = []
 
-        # Example questions (collapsed once there's a conversation)
-        with st.expander("Example questions", expanded=not st.session_state.chat_messages):
-            cols = st.columns(2)
-            for i, q in enumerate(EXAMPLE_QUESTIONS):
-                if cols[i % 2].button(q, key=f"example_{i}", use_container_width=True):
-                    st.session_state.chat_messages.append({"role": "user", "content": q})
-                    st.rerun()
-
         # Use a container for all chat messages so they render above the input
         chat_container = st.container()
 
-        # Chat input -- always at the bottom of the page
+        # ── Example questions as a popover above the input ───────────────
+        with st.popover("Example questions", use_container_width=True):
+            for i, q in enumerate(EXAMPLE_QUESTIONS):
+                if st.button(q, key=f"example_{i}", use_container_width=True):
+                    st.session_state.chat_messages.append({"role": "user", "content": q})
+                    st.rerun()
+
+        # Chat input -- always at the bottom
         prompt = st.chat_input("Ask about reserves, IBNR, forecasts, or risk...")
         if prompt:
             st.session_state.chat_messages.append({"role": "user", "content": prompt})
