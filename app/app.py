@@ -73,20 +73,22 @@ the Unity Catalog Model Registry.
 st.title("📊 Stochastic Reserve Analytics")
 st.caption("Powered by Databricks | Claims Forecasting · Reserve Adequacy · Scenario Stress Testing")
 
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "💬 Risk Assistant",
     "📈 Claims Forecast",
     "💰 Reserve Adequacy",
     "📋 Scenario Analysis",
     "⚡ On-Demand Forecast",
+    "🗺️ Geography",
     "📖 Glossary",
 ])
 
-from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_catastrophe, tab_quick_forecast, tab_glossary
+from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_catastrophe, tab_quick_forecast, tab_geography, tab_glossary
 
 tab_chatbot.render(tab0)
 tab_claims_forecast.render(tab1)
 tab_capital.render(tab2)
 tab_catastrophe.render(tab3)
 tab_quick_forecast.render(tab4)
-tab_glossary.render(tab5)
+tab_geography.render(tab5)
+tab_glossary.render(tab6)
