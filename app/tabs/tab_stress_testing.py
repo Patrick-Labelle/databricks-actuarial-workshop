@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from db import load_bootstrap_summary
+from db import load_bootstrap_summary, load_chain_ladder_params
 from endpoints import call_bootstrap_endpoint
 from constants import fmt_dollars
 from chart_theme import apply_default_layout
@@ -34,6 +34,15 @@ _Technical: Bootstrap Chain Ladder endpoint with scenario-adjusted parameters._
         # ── Parameter inputs ──────────────────────────────────────────────────────
         st.markdown("#### Reserve Assumptions")
 
+        _cl = load_chain_ladder_params()
+        # Round to nearest 0.05 to match slider step, clamp to slider range
+        def _snap(v, step=0.05):
+            return max(0.05, min(1.0, round(round(v / step) * step, 2)))
+        _cv_pa = _snap(_cl.get('cv_personal_auto', 0.15))
+        _cv_ca = _snap(_cl.get('cv_commercial_auto', 0.18))
+        _cv_ho = _snap(_cl.get('cv_homeowners', 0.12))
+        _cv_cp = _snap(_cl.get('cv_commercial_property', 0.20))
+
         col_ldf, col_cv, col_infl = st.columns(3)
 
         with col_ldf:
@@ -43,14 +52,14 @@ _Technical: Bootstrap Chain Ladder endpoint with scenario-adjusted parameters._
 
         with col_cv:
             st.markdown("**Reserve Volatility**")
-            cv_pers_auto = st.slider("Personal Auto CV", 0.05, 1.0, 0.15, 0.05, key="st_cv_pa",
-                                      help="Baseline: 0.15. Higher = more uncertainty in reserve estimates.")
-            cv_comm_auto = st.slider("Commercial Auto CV", 0.05, 1.0, 0.18, 0.05, key="st_cv_ca",
-                                      help="Baseline: 0.18.")
-            cv_home = st.slider("Homeowners CV", 0.05, 1.0, 0.12, 0.05, key="st_cv_ho",
-                                 help="Baseline: 0.12.")
-            cv_comm_prop = st.slider("Commercial Property CV", 0.05, 1.0, 0.20, 0.05, key="st_cv_cp",
-                                      help="Baseline: 0.20.")
+            cv_pers_auto = st.slider("Personal Auto CV", 0.05, 1.0, _cv_pa, 0.05, key="st_cv_pa",
+                                      help=f"Baseline: {_cv_pa}. Higher = more uncertainty in reserve estimates.")
+            cv_comm_auto = st.slider("Commercial Auto CV", 0.05, 1.0, _cv_ca, 0.05, key="st_cv_ca",
+                                      help=f"Baseline: {_cv_ca}.")
+            cv_home = st.slider("Homeowners CV", 0.05, 1.0, _cv_ho, 0.05, key="st_cv_ho",
+                                 help=f"Baseline: {_cv_ho}.")
+            cv_comm_prop = st.slider("Commercial Property CV", 0.05, 1.0, _cv_cp, 0.05, key="st_cv_cp",
+                                      help=f"Baseline: {_cv_cp}.")
 
         with col_infl:
             st.markdown("**Calendar-Year Inflation**")

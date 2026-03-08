@@ -276,3 +276,34 @@ def load_ldf_volatility():
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
+
+
+@st.cache_data(ttl=600)
+def load_chain_ladder_params() -> dict:
+    """Load per-line IBNR and CV from the LDF volatility table (chain ladder output).
+
+    Returns a dict with keys like 'mean_ibnr_personal_auto_M', 'cv_personal_auto', etc.
+    """
+    df = execute_sql(f"""
+        SELECT product_line, ibnr_M, cv
+        FROM {CATALOG}.{APP_SCHEMA}.predictions_ldf_volatility
+    """)
+    if df.empty:
+        return {}
+    for col in ['ibnr_M', 'cv']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Map product_line names to the endpoint parameter names
+    _pl_map = {
+        'Personal_Auto': 'personal_auto',
+        'Commercial_Auto': 'commercial_auto',
+        'Homeowners': 'homeowners',
+        'Commercial_Property': 'commercial_property',
+    }
+    params = {}
+    for _, row in df.iterrows():
+        key = _pl_map.get(row['product_line'])
+        if key:
+            params[f'mean_ibnr_{key}_M'] = float(row['ibnr_M'])
+            params[f'cv_{key}'] = float(row['cv'])
+    return params

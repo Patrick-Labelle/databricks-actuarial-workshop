@@ -676,10 +676,13 @@ for _pl, _cl in _cl_results.items():
         _resid_vals = [r['residual'] for r in _cl['residuals']]
         _avg_ldf = float(np.mean(list(_cl['ldfs'].values())))
         _std_ldf = float(np.std(list(_cl['ldfs'].values())))
+        _cv = _std_ldf / _avg_ldf if _avg_ldf > 0 else 0.15
         _ldf_vol_rows.append({
             'product_line': _pl,
             'avg_ldf': round(_avg_ldf, 4),
             'std_ldf': round(_std_ldf, 4),
+            'cv': round(_cv, 4),
+            'ibnr_M': round(_cl['total_ibnr'] / 1e6, 4),
             'n_factors': len(_cl['ldfs']),
             'mean_residual': round(float(np.mean(_resid_vals)), 4),
             'std_residual': round(float(np.std(_resid_vals)), 4),
@@ -817,15 +820,17 @@ class BootstrapReservePyFunc(mlflow.pyfunc.PythonModel):
 
 
 # Validate the PyFunc locally
+# Build baseline input from chain ladder results — no hardcoded values
+_ldf_vol_lookup = {r['product_line']: r for r in _ldf_vol_rows}
 _boot_baseline_input = pd.DataFrame([{
     "mean_ibnr_personal_auto_M": round(_cl_results['Personal_Auto']['total_ibnr'] / 1e6, 2),
     "mean_ibnr_commercial_auto_M": round(_cl_results['Commercial_Auto']['total_ibnr'] / 1e6, 2),
     "mean_ibnr_homeowners_M": round(_cl_results['Homeowners']['total_ibnr'] / 1e6, 2),
     "mean_ibnr_commercial_property_M": round(_cl_results['Commercial_Property']['total_ibnr'] / 1e6, 2),
-    "cv_personal_auto": 0.15,
-    "cv_commercial_auto": 0.18,
-    "cv_homeowners": 0.12,
-    "cv_commercial_property": 0.20,
+    "cv_personal_auto": _ldf_vol_lookup['Personal_Auto']['cv'],
+    "cv_commercial_auto": _ldf_vol_lookup['Commercial_Auto']['cv'],
+    "cv_homeowners": _ldf_vol_lookup['Homeowners']['cv'],
+    "cv_commercial_property": _ldf_vol_lookup['Commercial_Property']['cv'],
     "n_replications": 50_000,
     "scenario": "baseline",
     "ldf_multiplier": 1.0,

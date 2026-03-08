@@ -426,7 +426,7 @@ _GENIE_TABLES_DATA = [
      ["SARIMAX+GARCH frequency forecasts. Filter record_type='forecast' for future. "
       "Has forecast_mean, forecast_lo95, forecast_hi95, cond_volatility."]),
     (MODELS_SCHEMA, "predictions_ldf_volatility",
-     ["Development factor volatility per product line. avg_ldf, std_ldf, n_factors."]),
+     ["Development factor volatility and chain ladder IBNR per product line. avg_ldf, std_ldf, cv, ibnr_M, n_factors."]),
     (MODELS_SCHEMA, "predictions_reserve_evolution",
      ["12-month reserve adequacy outlook with var_995_vs_baseline = % change."]),
     (MODELS_SCHEMA, "predictions_reserve_scenarios",

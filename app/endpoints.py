@@ -3,6 +3,7 @@ import pandas as pd
 
 from auth import get_workspace_client, get_auth_init_error
 from config import ENDPOINT_NAME, MC_ENDPOINT_NAME
+from db import load_chain_ladder_params
 
 
 def call_frequency_forecast_endpoint(horizon: int) -> pd.DataFrame:
@@ -39,16 +40,12 @@ def call_bootstrap_endpoint(scenario: dict) -> dict | None:
     scenario.setdefault("n_replications", 50_000)
     scenario.setdefault("ldf_multiplier", 1.0)
     scenario.setdefault("inflation_adj", 0.0)
-    # Per-line IBNR best estimates (calibrated from chain ladder output)
-    scenario.setdefault("mean_ibnr_personal_auto_M", 7200.0)
-    scenario.setdefault("mean_ibnr_commercial_auto_M", 4000.0)
-    scenario.setdefault("mean_ibnr_homeowners_M", 5900.0)
-    scenario.setdefault("mean_ibnr_commercial_property_M", 2700.0)
-    # Reserve volatility (CV of development factors)
-    scenario.setdefault("cv_personal_auto", 0.15)
-    scenario.setdefault("cv_commercial_auto", 0.18)
-    scenario.setdefault("cv_homeowners", 0.12)
-    scenario.setdefault("cv_commercial_property", 0.20)
+    # Per-line IBNR and CV from chain ladder (read from predictions_ldf_volatility)
+    cl_params = load_chain_ladder_params()
+    for key, value in cl_params.items():
+        scenario.setdefault(key, value)
+    if not cl_params:
+        st.warning("Chain ladder parameters not available — run Module 3 to populate predictions_ldf_volatility.")
     try:
         response = w.serving_endpoints.query(
             name=MC_ENDPOINT_NAME,

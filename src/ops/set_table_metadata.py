@@ -129,11 +129,13 @@ TABLE_METADATA = [
     ),
     (
         "predictions_ldf_volatility",
-        "Development factor volatility per product line from the reserve triangle. Used for reserve risk capital calculation alongside bootstrap reserve distribution.",
+        "Development factor volatility and chain ladder IBNR per product line from the reserve triangle. Used for reserve risk capital calculation and as input parameters for the bootstrap reserve simulator endpoint.",
         {
             "product_line": "Insurance product line (Personal_Auto, Commercial_Auto, Homeowners, Commercial_Property)",
             "avg_ldf": "Average link ratio (loss development factor) across all accident months and lag transitions",
             "std_ldf": "Standard deviation of link ratios — measures reserve development volatility",
+            "cv": "Coefficient of variation of development factors (std_ldf / avg_ldf) — used as reserve volatility parameter",
+            "ibnr_M": "Chain ladder best estimate IBNR for this product line in millions of dollars",
             "n_factors": "Number of development factor observations used in the calculation",
         },
     ),
