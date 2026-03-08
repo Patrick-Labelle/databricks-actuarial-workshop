@@ -188,13 +188,11 @@ def render(tab):
             for i, q in enumerate(EXAMPLE_QUESTIONS):
                 if st.button(q, key=f"example_{i}", use_container_width=True):
                     st.session_state.chat_messages.append({"role": "user", "content": q})
-                    st.rerun()
 
         # Chat input -- always at the bottom
         prompt = st.chat_input("Ask about reserves, IBNR, forecasts, or risk...")
         if prompt:
             st.session_state.chat_messages.append({"role": "user", "content": prompt})
-            st.rerun()
 
         # Render chat history inside the container (above the input)
         with chat_container:
