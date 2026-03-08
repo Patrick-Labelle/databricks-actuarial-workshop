@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Module 5: App Infrastructure
-# MAGIC ## Serving Endpoints, Online Table, Lakebase, and AI Gateway
+# MAGIC ## Serving Endpoints, Lakebase, and AI Gateway
 # MAGIC
 # MAGIC **Workshop: Statistical Modeling at Scale on Databricks**
 # MAGIC
@@ -12,10 +12,9 @@
 # MAGIC
 # MAGIC 1. **Model Serving Endpoints** — Deploy Frequency Forecaster and Bootstrap Reserve Simulator as REST APIs
 # MAGIC 2. **AI Gateway** — Inference tables, usage tracking, rate limits
-# MAGIC 3. **Online Table** — Low-latency feature lookup from the Feature Store
-# MAGIC 4. **Lakebase (Managed PostgreSQL)** — Database, table, and SP grants for analyst annotations
-# MAGIC 5. **Genie Space** — AI/BI Genie for natural-language data queries (chatbot)
-# MAGIC 6. **Demo Calls** — Exercise every service the app will hit
+# MAGIC 3. **Lakebase (Managed PostgreSQL)** — Database, table, and SP grants for analyst annotations
+# MAGIC 4. **Genie Space** — AI/BI Genie for natural-language data queries (chatbot)
+# MAGIC 5. **Demo Calls** — Exercise every service the app will hit
 # MAGIC
 # MAGIC ---
 # MAGIC ### The App's Integration Points
@@ -72,7 +71,6 @@ APP_SP_CLIENT_ID = dbutils.widgets.get("app_sp_client_id")
 
 FREQ_MODEL_NAME = f"{CATALOG}.{SCHEMA}.frequency_forecaster"
 BOOT_MODEL_NAME     = f"{CATALOG}.{SCHEMA}.bootstrap_reserve_simulator"
-FEATURE_TABLE     = f"{CATALOG}.{SCHEMA}.features_segment_monthly"
 
 mlflow.set_registry_uri("databricks-uc")
 
@@ -91,7 +89,6 @@ print(f"Frequency model:  {FREQ_MODEL_NAME}")
 print(f"Bootstrap model:  {BOOT_MODEL_NAME}")
 print(f"Frequency endpoint: {ENDPOINT_NAME}")
 print(f"Bootstrap endpoint: {MC_ENDPOINT_NAME}")
-print(f"Feature table:   {FEATURE_TABLE}")
 print(f"Warehouse ID:    {WAREHOUSE_ID or '(not set)'}")
 print(f"Lakebase DB:     {PG_DATABASE}")
 print(f"App SP:          {APP_SP_CLIENT_ID or '(not set)'}")
@@ -259,47 +256,7 @@ print(f"\nBoth endpoints created. They take ~5 minutes to reach READY state.")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Online Table — Low-Latency Feature Serving
-# MAGIC
-# MAGIC The Online Table syncs from the Feature Store Delta table (`features_segment_monthly`,
-# MAGIC created in Module 3) to provide **sub-millisecond feature lookups** at inference time.
-# MAGIC
-# MAGIC The app's sidebar uses this to show the latest rolling features for the selected segment.
-
-# COMMAND ----------
-
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.segment_features_online"
-
-online_table_spec = {
-    "name": ONLINE_TABLE_NAME,
-    "spec": {
-        "source_table_full_name": FEATURE_TABLE,
-        "primary_key_columns":    [{"name": "segment_id"}, {"name": "month"}],
-        "run_triggered": {
-            "triggered_update_spec": {}
-        },
-    },
-}
-
-resp = requests.post(
-    f"https://{WORKSPACE_URL}/api/2.0/online-tables",
-    headers=_HEADERS,
-    json=online_table_spec,
-)
-
-if resp.status_code in (200, 201):
-    print(f"Online Table created: {ONLINE_TABLE_NAME}")
-    print(f"Syncing from: {FEATURE_TABLE}")
-    print(f"Note: initial sync takes ~2-5 minutes")
-elif resp.status_code == 409:
-    print(f"Online Table already exists: {ONLINE_TABLE_NAME}")
-else:
-    print(f"Online Table creation response ({resp.status_code}): {resp.text[:300]}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Lakebase — Managed PostgreSQL for Analyst Annotations
+# MAGIC ## 3. Lakebase — Managed PostgreSQL for Analyst Annotations
 # MAGIC
 # MAGIC The Streamlit app persists analyst annotations (scenario notes, assumption overrides,
 # MAGIC approval status) to a Lakebase PostgreSQL table. This section creates the database,
@@ -457,7 +414,7 @@ except Exception as _lb_err:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Genie Space — Natural Language Data Queries
+# MAGIC ## 4. Genie Space — Natural Language Data Queries
 # MAGIC
 # MAGIC The chatbot's `ask_genie` tool routes natural-language questions to an AI/BI
 # MAGIC Genie space that understands all workshop tables. This section creates the space
@@ -601,7 +558,7 @@ elif not WAREHOUSE_ID and not _genie_space_id:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Demo — Exercise Every App Service
+# MAGIC ## 5. Demo — Exercise Every App Service
 # MAGIC
 # MAGIC The Streamlit app hits five services. Let's verify each one works.
 
@@ -750,7 +707,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Monitoring — Endpoint Request Logs
+# MAGIC ## 6. Monitoring — Endpoint Request Logs
 # MAGIC
 # MAGIC AI Gateway enables inference tables that capture every request/response for audit:
 # MAGIC

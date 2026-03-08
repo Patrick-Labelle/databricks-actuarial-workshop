@@ -109,7 +109,7 @@ resources:
 
         # Task 5 — Prepare all app infrastructure (Module 4)
         - task_key: prepare_app_infrastructure
-          description: "Serving endpoints + AI Gateway, Online Table, Lakebase DB setup, Genie Space"
+          description: "Serving endpoints + AI Gateway, Lakebase DB setup, Genie Space"
           depends_on:
             - task_key: set_table_metadata
           job_cluster_key: ray_ml_cluster
