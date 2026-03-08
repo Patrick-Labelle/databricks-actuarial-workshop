@@ -41,7 +41,7 @@ _MODELS_TABLES = {
     "predictions_reserve_scenarios": "Pre-computed reserve deterioration scenarios. Columns: scenario_label, best_estimate_M, var_99_M, var_995_M, cvar_99_M, var_995_vs_baseline.",
     "predictions_reserve_evolution": "12-month reserve adequacy evolution. Columns: forecast_month, month_idx, best_estimate_M, var_99_M, var_995_M, cvar_99_M, reserve_risk_capital_M, var_995_vs_baseline.",
     "predictions_runoff_projection": "Multi-period run-off surplus trajectory with regime-switching. Columns: month, surplus_p05, surplus_p25, surplus_p50, surplus_p75, surplus_p95, ruin_probability.",
-    "predictions_ldf_volatility": "Development factor volatility per product line. Columns: product_line, avg_ldf, std_ldf, n_factors.",
+    "predictions_ldf_volatility": "Development factor volatility and chain ladder IBNR per product line. Columns: product_line, avg_ldf, std_ldf, cv, ibnr_M, n_factors.",
     "predictions_reserve_validation": "Reserve adequacy validation. Columns: segment_id, accident_month, reserve_adequacy_ratio.",
 }
 
@@ -199,11 +199,12 @@ def run_bootstrap_reserve(
         "cv_homeowners": cv_homeowners,
         "cv_commercial_property": cv_commercial_property,
         "n_replications": n_replications,
-        "mean_ibnr_personal_auto_M": 7200.0,
-        "mean_ibnr_commercial_auto_M": 4000.0,
-        "mean_ibnr_homeowners_M": 5900.0,
-        "mean_ibnr_commercial_property_M": 2700.0,
     }
+    # Merge per-line IBNR and CV from chain ladder — no hardcoded values
+    from db import load_chain_ladder_params
+    cl_params = load_chain_ladder_params()
+    for key, value in cl_params.items():
+        params.setdefault(key, value)
 
     try:
         response = w.serving_endpoints.query(

@@ -73,20 +73,10 @@ for _schema in ALL_SCHEMAS:
     spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{_schema} TO `{APP_SP_CLIENT_ID}`")
     print(f"[OK] GRANT USE SCHEMA ON {CATALOG}.{_schema}")
 
-    tables = [
-        row["tableName"]
-        for row in spark.sql(f"SHOW TABLES IN {CATALOG}.{_schema}").collect()
-    ]
-    if tables:
-        print(f"Granting SELECT on {len(tables)} tables in {_schema}...")
-        for t in tables:
-            try:
-                spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{_schema}.{t} TO `{APP_SP_CLIENT_ID}`")
-                print(f"  [OK] {t}")
-            except Exception as e:
-                print(f"  [WARN] {t}: {e}")
-    else:
-        print(f"  No tables in {_schema} yet (synced tables will be added later)")
+    # Schema-level SELECT covers all current and future tables — needed for
+    # Genie space queries which run as the app SP via the SQL warehouse.
+    spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{_schema} TO `{APP_SP_CLIENT_ID}`")
+    print(f"[OK] GRANT SELECT ON SCHEMA {CATALOG}.{_schema}")
 
 print("\nUC grants complete.")
 
