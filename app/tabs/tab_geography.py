@@ -1,3 +1,6 @@
+import json
+import os
+
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
@@ -5,18 +8,28 @@ import pandas as pd
 from db import load_regional_summary, load_regional_product_breakdown
 from chart_theme import apply_default_layout
 
-# Province centroids (lat, lon) for the bubble map
-_COORDS = {
-    "Ontario":              (50.0, -85.0),
-    "Quebec":               (52.0, -72.0),
-    "British_Columbia":     (53.7, -127.6),
-    "Alberta":              (53.9, -116.6),
-    "Manitoba":             (55.0, -98.8),
-    "Saskatchewan":         (54.0, -106.0),
-    "New_Brunswick":        (46.5, -66.2),
-    "Nova_Scotia":          (44.7, -63.0),
-    "Prince_Edward_Island": (46.2, -63.0),
-    "Newfoundland":         (53.1, -57.7),
+# ── GeoJSON for Canadian province choropleth ─────────────────────────────────
+_GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "..", "canada_provinces.geojson")
+
+
+@st.cache_resource
+def _load_geojson():
+    with open(_GEOJSON_PATH) as f:
+        return json.load(f)
+
+
+# Map app region names (underscored) → GeoJSON "name" property values
+_REGION_TO_GEOJSON = {
+    "Ontario":              "Ontario",
+    "Quebec":               "Quebec",
+    "British_Columbia":     "British Columbia",
+    "Alberta":              "Alberta",
+    "Manitoba":             "Manitoba",
+    "Saskatchewan":         "Saskatchewan",
+    "New_Brunswick":        "New Brunswick",
+    "Nova_Scotia":          "Nova Scotia",
+    "Prince_Edward_Island": "Prince Edward Island",
+    "Newfoundland":         "Newfoundland and Labrador",
 }
 
 _METRIC_OPTIONS = {
@@ -67,50 +80,40 @@ def render(tab):
         else:
             filtered = summary.copy()
 
-        # ── Bubble map ────────────────────────────────────────────────────
+        # ── Choropleth map ───────────────────────────────────────────────
+        geojson = _load_geojson()
         map_data = filtered.copy()
-        map_data["lat"] = map_data["region"].map(lambda r: _COORDS.get(r, (0, 0))[0])
-        map_data["lon"] = map_data["region"].map(lambda r: _COORDS.get(r, (0, 0))[1])
+        map_data["geojson_name"] = map_data["region"].map(_REGION_TO_GEOJSON)
         map_data["display_name"] = map_data["region"].map(_display_label)
-
         vals = pd.to_numeric(map_data[metric_col], errors="coerce").fillna(0)
-        max_val = vals.max() if vals.max() > 0 else 1
 
-        fig = go.Figure()
-        fig.add_trace(go.Scattergeo(
-            lat=map_data["lat"],
-            lon=map_data["lon"],
-            text=map_data.apply(
-                lambda r: f"<b>{_display_label(r['region'])}</b><br>{metric_label}: {r[metric_col]:,.0f}",
-                axis=1,
-            ),
-            hoverinfo="text",
-            marker=dict(
-                size=10 + (vals / max_val) * 40,
-                color=vals,
-                colorscale="YlOrRd",
-                showscale=True,
-                colorbar=dict(title=metric_label, thickness=15),
-                line=dict(width=1, color="white"),
-                opacity=0.85,
-            ),
+        fig = go.Figure(go.Choroplethmapbox(
+            geojson=geojson,
+            locations=map_data["geojson_name"],
+            z=vals,
+            featureidkey="properties.name",
+            colorscale="YlOrRd",
+            marker_opacity=0.75,
+            marker_line_width=1,
+            marker_line_color="white",
+            showscale=True,
+            colorbar=dict(title=metric_label, thickness=15),
+            text=map_data["display_name"],
+            customdata=vals,
+            hovertemplate="<b>%{text}</b><br>" + metric_label + ": %{customdata:,.0f}<extra></extra>",
         ))
-        fig.update_geos(
-            scope="north america",
-            showland=True, landcolor="#f0f0f0",
-            showlakes=True, lakecolor="white",
-            showcountries=True, countrycolor="#cccccc",
-            showsubunits=True, subunitcolor="#cccccc",
-            lonaxis=dict(range=[-142, -50]),
-            lataxis=dict(range=[41, 62]),
-            bgcolor="white",
-        )
+
         fig.update_layout(
+            mapbox=dict(
+                style="carto-positron",
+                center=dict(lat=56, lon=-96),
+                zoom=2.8,
+            ),
             margin=dict(l=0, r=0, t=40, b=0),
-            height=500,
+            height=550,
             title=dict(
                 text=f"{metric_label} by Province"
-                + (f" — {selected_product}" if selected_product != "All" else ""),
+                + (f" — {_display_label(selected_product)}" if selected_product != "All" else ""),
                 font=dict(size=16, color="#1E1E1E"),
             ),
             paper_bgcolor="white",

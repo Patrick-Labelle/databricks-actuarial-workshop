@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from db import load_bootstrap_summary, load_reserve_scenarios, load_reserve_evolution, load_reserve_triangle, load_runoff_projection
+from db import load_bootstrap_summary, load_reserve_scenarios, load_reserve_evolution, load_reserve_triangle, load_runoff_projection, load_chain_ladder_params
 from endpoints import call_bootstrap_endpoint
 from auth import email_from_token
 from lakebase import save_scenario_annotation, load_annotations
@@ -178,19 +178,24 @@ def render(tab):
                                            0.005, key="sc_infl", format="%.3f")
 
             st.markdown("**Per-Line Reserve Volatility (CV)**")
+            _cl = load_chain_ladder_params()
+            _base_cv_pa = _cl.get('cv_personal_auto', 0.15)
+            _base_cv_ca = _cl.get('cv_commercial_auto', 0.18)
+            _base_cv_ho = _cl.get('cv_homeowners', 0.12)
+            _base_cv_cp = _cl.get('cv_commercial_property', 0.20)
             _cv1, _cv2, _cv3, _cv4 = st.columns(4)
             with _cv1:
                 _sc_cv_pa = st.slider("Personal Auto", 0.05, 1.0,
-                                       min(0.15 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_pa")
+                                       min(round(_base_cv_pa * _sc_cv_mult, 2), 1.0), 0.05, key="sc_cv_pa")
             with _cv2:
                 _sc_cv_ca = st.slider("Commercial Auto", 0.05, 1.0,
-                                       min(0.18 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_ca")
+                                       min(round(_base_cv_ca * _sc_cv_mult, 2), 1.0), 0.05, key="sc_cv_ca")
             with _cv3:
                 _sc_cv_ho = st.slider("Homeowners", 0.05, 1.0,
-                                       min(0.12 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_ho")
+                                       min(round(_base_cv_ho * _sc_cv_mult, 2), 1.0), 0.05, key="sc_cv_ho")
             with _cv4:
                 _sc_cv_cp = st.slider("Commercial Prop", 0.05, 1.0,
-                                       min(0.20 * _sc_cv_mult, 1.0), 0.05, key="sc_cv_cp")
+                                       min(round(_base_cv_cp * _sc_cv_mult, 2), 1.0), 0.05, key="sc_cv_cp")
 
         _sc_n_rep = st.select_slider(
             "Bootstrap replications:",

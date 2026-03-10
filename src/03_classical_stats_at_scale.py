@@ -762,16 +762,16 @@ class BootstrapReservePyFunc(mlflow.pyfunc.PythonModel):
         cvs = np.array([cv_personal_auto, cv_commercial_auto,
                         cv_homeowners, cv_commercial_property])
 
-        # Apply scenario adjustments
+        # Apply scenario adjustments (consistent with Ray bootstrap_chain_ladder)
         if scenario == 'adverse_development':
             means *= ldf_multiplier if ldf_multiplier > 1.0 else 1.2
-            cvs *= 1.3
+            cvs *= 1.15
         elif scenario == 'judicial_inflation':
-            means[:2] *= 1.3  # Auto lines
-            cvs[:2] *= 1.2
+            means[:2] *= 1.3   # 30% IBNR uplift on Auto lines (matches Ray tail uplift)
+            cvs[:2] *= 1.1
         elif scenario == 'pandemic_tail':
             means *= 1.1
-            cvs *= 1.4
+            cvs *= 1.2
         elif scenario == 'superimposed_inflation':
             infl = inflation_adj if inflation_adj > 0 else 0.03
             means *= (1.0 + infl)
@@ -916,10 +916,10 @@ def bootstrap_chain_ladder(params_ref, n_replications: int, seed: int,
 
     Scenarios modify the bootstrap parameters:
       - baseline: standard bootstrap
-      - adverse_development: inflate LDFs at late lags by ldf_multiplier
-      - judicial_inflation: 1.3x on bodily injury lines at lags 24+
-      - pandemic_tail: extend development by dev_extension months
-      - superimposed_inflation: apply calendar-year inflation trend
+      - adverse_development: cumulative ldf_multiplier uplift on late-half LDFs
+      - judicial_inflation: 30% cumulative tail uplift on Auto lines (lags 24+)
+      - pandemic_tail: 10% cumulative uplift on all LDFs (delayed settlements)
+      - superimposed_inflation: calendar-year inflation (quarterly compounding)
 
     Returns dict with reserve distribution metrics.
     """
@@ -954,16 +954,35 @@ def bootstrap_chain_ladder(params_ref, n_replications: int, seed: int,
         base_ldf_arr = np.array([ldfs[k] for k in sorted_ldf_keys])
 
         # Apply scenario adjustments to base LDFs (deterministic)
+        # Multipliers target the CUMULATIVE tail effect, spread across individual
+        # LDFs so the product = target (avoids exponential compounding).
         adj_ldf_arr = base_ldf_arr.copy()
         if scenario == 'adverse_development':
             late_mask = np.array([k >= max(sorted_ldf_keys) * 0.5 for k in sorted_ldf_keys])
-            adj_ldf_arr[late_mask] *= ldf_multiplier
+            n_late = int(late_mask.sum())
+            if n_late > 0:
+                per_ldf_mult = ldf_multiplier ** (1.0 / n_late)
+                adj_ldf_arr[late_mask] *= per_ldf_mult
         elif scenario == 'judicial_inflation':
             if pl in ['Personal_Auto', 'Commercial_Auto']:
                 late_mask = np.array([k >= 24 for k in sorted_ldf_keys])
-                adj_ldf_arr[late_mask] *= 1.3
+                n_late = int(late_mask.sum())
+                if n_late > 0:
+                    # Target: 30% total tail uplift, spread across late LDFs
+                    # so the cumulative effect = 1.30, not 1.30^n
+                    per_ldf_mult = 1.30 ** (1.0 / n_late)
+                    adj_ldf_arr[late_mask] *= per_ldf_mult
+        elif scenario == 'pandemic_tail':
+            # Delayed settlements: cumulative 10% uplift spread across all LDFs
+            n_all = len(adj_ldf_arr)
+            if n_all > 0:
+                per_ldf_mult = ldf_multiplier ** (1.0 / n_all)
+                adj_ldf_arr *= per_ldf_mult
         elif scenario == 'superimposed_inflation':
-            adj_ldf_arr *= (1.0 + inflation_adj)
+            # Apply calendar-year inflation: each LDF spans ~3 months,
+            # so per-period rate = (1 + annual_rate)^(3/12)
+            per_period_rate = (1.0 + inflation_adj) ** (3.0 / 12.0)
+            adj_ldf_arr *= per_period_rate
 
         # LDF standard errors from Mack's formula: se(f_k) = σ_k / √(Σ C(i,k))
         se_arr = np.array([
@@ -1211,10 +1230,10 @@ with mlflow.start_run(run_name='bootstrap_chain_ladder_ray') as run:
     # ── Save scenario comparison → predictions_reserve_scenarios ───────────
     _SCENARIO_LABELS = {
         'baseline':               'Baseline',
-        'adverse_development':    'Adverse Development (+20% late LDFs)',
-        'judicial_inflation':     'Judicial Inflation (1.3× Auto lags 24+)',
-        'pandemic_tail':          'Pandemic Tail (+6 months dev)',
-        'superimposed_inflation': 'Superimposed Inflation (CPI+3%)',
+        'adverse_development':    'Adverse Development (+20% tail uplift)',
+        'judicial_inflation':     'Judicial Inflation (+30% Auto tail)',
+        'pandemic_tail':          'Pandemic Tail (+10% all lines)',
+        'superimposed_inflation': 'Superimposed Inflation (CPI+3%/yr)',
     }
 
     scenario_rows = [{
