@@ -15,22 +15,17 @@ import inspect
 import re
 from typing import Generator
 
-from config import CATALOG, DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA, LLM_ENDPOINT_NAME
+from config import CATALOG, SCHEMA, LLM_ENDPOINT_NAME
 from chatbot.tools import TOOL_MAP, AVAILABLE_TABLES
 
 # ── MLflow tracing (best-effort) ───────────────────────────────────────
 _mlflow_ok = False
 try:
     import mlflow
-    import logging as _logging
-    mlflow.set_tracking_uri("databricks")
     mlflow.openai.autolog()
     mlflow.set_experiment("/Shared/actuarial-workshop-app-traces")
     _mlflow_ok = True
-    _logging.info("MLflow tracing enabled — experiment: /Shared/actuarial-workshop-app-traces")
-except Exception as _mlflow_err:
-    import logging as _logging
-    _logging.warning(f"MLflow tracing init failed: {_mlflow_err}")
+except Exception:
     mlflow = None  # tracing is optional
 
 SYSTEM_PROMPT = f"""You are a reserve risk analyst assistant for a Canadian P&C insurance portfolio.
@@ -38,18 +33,12 @@ You help users understand reserve adequacy, IBNR distributions, frequency foreca
 
 ## Your capabilities
 1. **Ask Genie** — For ANY data question about the portfolio (trends, comparisons, "show me", "top N", "which segments", aggregations), ALWAYS use ask_genie first. It connects to the AI/BI Genie space which understands all workshop tables and generates SQL automatically. This is the primary data exploration tool.
-2. **Query data** — Only use this as a fallback if ask_genie fails or returns no results. Use fully qualified table names (see schema layout below).
+2. **Query data** — Only use this as a fallback if ask_genie fails or returns no results. Use query_data with the fully qualified table name: `{CATALOG}.{SCHEMA}.<table>`.
 3. **Frequency forecasting** — Generate on-demand claim frequency forecasts for 1-24 months ahead using the deployed SARIMAX+GARCH model.
 4. **Bootstrap reserve simulation** — Run Bootstrap Chain Ladder reserve simulations with custom parameters to compute reserve risk metrics (Best Estimate IBNR, VaR, CVaR, Reserve Risk Capital).
 5. **Analyst annotations** — Query scenario annotations that analysts have recorded in the Lakebase database.
 
-## Schema layout
-Tables are organized across three Unity Catalog schemas:
-- **{CATALOG}.{DATA_SCHEMA}** — Data pipeline (gold tables, features)
-- **{CATALOG}.{MODELS_SCHEMA}** — Model outputs (predictions, forecasts)
-- **{CATALOG}.{APP_SCHEMA}** — App consumption (synced tables for low-latency reads)
-
-## Available tables
+## Available tables in {CATALOG}.{SCHEMA}
 {chr(10).join(f'- **{name}**: {desc}' for name, desc in AVAILABLE_TABLES.items())}
 
 ## Domain knowledge
@@ -211,47 +200,21 @@ def _get_tool_schemas():
     return schemas
 
 
-def _execute_tool(fn_name: str, args: dict, attachments: list) -> str:
-    """Execute a single tool call, with MLflow span tracing if available.
-
-    Tools may return (text, attachment_dict) tuples. The text goes to the LLM;
-    the attachment is collected for rich rendering in the chat UI.
-    """
-    fn = TOOL_MAP.get(fn_name)
-    if fn is None:
-        return f"Unknown tool: {fn_name}"
-    try:
-        if _mlflow_ok:
-            with mlflow.start_span(name=fn_name, span_type="TOOL") as span:
-                span.set_inputs(args)
-                raw = fn(**args)
-                if isinstance(raw, tuple):
-                    text, attachment = raw
-                    if attachment:
-                        attachments.append(attachment)
-                else:
-                    text = raw
-                span.set_outputs({"result": text[:500] if len(text) > 500 else text})
-                return text
-        raw = fn(**args)
-        if isinstance(raw, tuple):
-            text, attachment = raw
-            if attachment:
-                attachments.append(attachment)
-            return text
-        return raw
-    except Exception as e:
-        return f"Tool error: {e}"
-
-
-def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
+def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator[str, None, None]:
     """Run the agent loop: LLM -> tool calls -> LLM -> ... -> final response.
 
-    Yields:
-      - str: partial text chunks (for streaming in Streamlit)
-      - dict: {"type": "attachments", "data": [...]} after the final response,
-              containing structured tool results for rich rendering.
+    Yields partial text as it becomes available (for streaming in Streamlit).
     """
+    # Start an MLflow trace for the full agent conversation
+    _trace_ctx = None
+    if _mlflow_ok:
+        try:
+            _trace_ctx = mlflow.start_span(name="agent_chat", span_type="AGENT")
+            _trace_ctx.__enter__()
+            _trace_ctx.set_inputs({"messages": messages, "max_tool_rounds": max_tool_rounds})
+        except Exception:
+            _trace_ctx = None
+
     client = _get_openai_client()
     if client is None:
         yield (
@@ -263,7 +226,6 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
 
     tool_schemas = _get_tool_schemas()
     full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-    attachments = []
 
     for _ in range(max_tool_rounds):
         try:
@@ -276,6 +238,11 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
                 max_tokens=4096,
             )
         except Exception as e:
+            if _trace_ctx:
+                try:
+                    _trace_ctx.__exit__(type(e), e, e.__traceback__)
+                except Exception:
+                    pass
             yield f"Error calling LLM endpoint: {e}"
             return
 
@@ -285,13 +252,17 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
 
         if not tool_calls:
             content = assistant_msg.content or ""
+            if _trace_ctx:
+                try:
+                    _trace_ctx.set_outputs({"response": content[:1000] if len(content) > 1000 else content})
+                    _trace_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
             if content:
                 yield content
-            if attachments:
-                yield {"type": "attachments", "data": attachments}
             return
 
-        # Append assistant message with tool calls -- strip fields the
+        # Append assistant message with tool calls — strip fields the
         # Databricks Foundation Model API doesn't accept (e.g. annotations).
         assistant_dict = {
             "role": "assistant",
@@ -317,8 +288,21 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
             except json.JSONDecodeError:
                 args = {}
 
-            yield f"_Calling {fn_name}..._\n\n"
-            result = _execute_tool(fn_name, args, attachments)
+            fn = TOOL_MAP.get(fn_name)
+            if fn is None:
+                result = f"Unknown tool: {fn_name}"
+            else:
+                yield f"_Calling {fn_name}..._\n\n"
+                try:
+                    if _mlflow_ok:
+                        with mlflow.start_span(name=fn_name, span_type="TOOL") as tool_span:
+                            tool_span.set_inputs(args)
+                            result = fn(**args)
+                            tool_span.set_outputs({"result": result[:500] if len(result) > 500 else result})
+                    else:
+                        result = fn(**args)
+                except Exception as e:
+                    result = f"Tool error: {e}"
 
             full_messages.append({
                 "role": "tool",
@@ -326,6 +310,10 @@ def chat(messages: list[dict], max_tool_rounds: int = 5) -> Generator:
                 "content": str(result),
             })
 
+    if _trace_ctx:
+        try:
+            _trace_ctx.set_outputs({"response": "max_tool_rounds_exceeded"})
+            _trace_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
     yield "Reached maximum tool call rounds. Please simplify your question."
-    if attachments:
-        yield {"type": "attachments", "data": attachments}
