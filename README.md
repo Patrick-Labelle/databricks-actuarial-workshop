@@ -295,7 +295,7 @@ A **Monthly Model Refresh** job (paused by default) re-runs tasks 1b -> 2 -> 4 o
 
 ---
 
-## Streamlit App (6 Tabs)
+## Streamlit App (7 Tabs)
 
 | Tab | Name | Description |
 |---|---|---|
@@ -304,7 +304,8 @@ A **Monthly Model Refresh** job (paused by default) re-runs tasks 1b -> 2 -> 4 o
 | 2 | Reserve Adequacy | Bootstrap Chain Ladder IBNR distribution, VaR/CVaR metrics, MCT ratio |
 | 3 | Scenario Analysis | Reserve scenarios (adverse development, judicial inflation, pandemic tail, superimposed inflation), reserve evolution, run-off projection, reserve triangle |
 | 4 | On-Demand Forecast | Live SARIMAX+GARCH forecast via serving endpoint (1-24 month horizon) |
-| 5 | Glossary | Comprehensive reference for all models, metrics, regulatory frameworks, and scenarios |
+| 5 | Geography | Choropleth map of claims by Canadian province with regional drill-down |
+| 6 | Glossary | Comprehensive reference for all models, metrics, regulatory frameworks, and scenarios |
 
 The app reads from `app_schema` (synced tables) for low-latency dashboard queries. The chatbot tools query `data_schema` and `models_schema` directly via SQL Warehouse and Genie Space.
 
@@ -399,7 +400,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 │   ├── 06_dabs_cicd.py          # DABs CI/CD concepts (interactive-only)
 │   └── 07_databricks_apps.py    # Databricks Apps + Lakebase (interactive-only)
 ├── app/
-│   ├── app.py                   # Streamlit application (6 tabs)
+│   ├── app.py                   # Streamlit application (7 tabs)
 │   ├── app.yaml                 # App command + valueFrom resource injections
 │   ├── requirements.txt
 │   ├── config.py                # Reads DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA
