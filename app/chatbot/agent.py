@@ -15,7 +15,7 @@ import inspect
 import re
 from typing import Generator
 
-from config import CATALOG, SCHEMA, LLM_ENDPOINT_NAME
+from config import CATALOG, DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA, LLM_ENDPOINT_NAME
 from chatbot.tools import TOOL_MAP, AVAILABLE_TABLES
 
 # ── MLflow tracing (best-effort) ───────────────────────────────────────
@@ -33,12 +33,18 @@ You help users understand reserve adequacy, IBNR distributions, frequency foreca
 
 ## Your capabilities
 1. **Ask Genie** — For ANY data question about the portfolio (trends, comparisons, "show me", "top N", "which segments", aggregations), ALWAYS use ask_genie first. It connects to the AI/BI Genie space which understands all workshop tables and generates SQL automatically. This is the primary data exploration tool.
-2. **Query data** — Only use this as a fallback if ask_genie fails or returns no results. Use query_data with the fully qualified table name: `{CATALOG}.{SCHEMA}.<table>`.
+2. **Query data** — Only use this as a fallback if ask_genie fails or returns no results. Use fully qualified table names (see schema layout below).
 3. **Frequency forecasting** — Generate on-demand claim frequency forecasts for 1-24 months ahead using the deployed SARIMAX+GARCH model.
 4. **Bootstrap reserve simulation** — Run Bootstrap Chain Ladder reserve simulations with custom parameters to compute reserve risk metrics (Best Estimate IBNR, VaR, CVaR, Reserve Risk Capital).
 5. **Analyst annotations** — Query scenario annotations that analysts have recorded in the Lakebase database.
 
-## Available tables in {CATALOG}.{SCHEMA}
+## Schema layout
+Tables are organized across three Unity Catalog schemas:
+- **{CATALOG}.{DATA_SCHEMA}** — Data pipeline (gold tables, features)
+- **{CATALOG}.{MODELS_SCHEMA}** — Model outputs (predictions, forecasts)
+- **{CATALOG}.{APP_SCHEMA}** — App consumption (synced tables for low-latency reads)
+
+## Available tables
 {chr(10).join(f'- **{name}**: {desc}' for name, desc in AVAILABLE_TABLES.items())}
 
 ## Domain knowledge
