@@ -55,21 +55,9 @@ databricks bundle validate --target my-workspace
 
 ### 5. Manual Post-Deploy Steps
 
-After `deploy.sh` completes, two resources require manual configuration in the Databricks UI:
+After `deploy.sh` completes, one resource requires manual configuration in the Databricks UI:
 
-#### 5a. Add Genie Space Instructions
-
-The Genie space is auto-created by the deploy, but its **general instructions** must be added manually (the API doesn't support setting instruction text):
-
-1. Navigate to **AI/BI Genie Spaces** in your workspace
-2. Open the **"Actuarial Workshop — Reserve Assistant"** space
-3. Click the gear icon → **General Instructions**
-4. Paste the contents of [`resources/genie_space_instructions.txt`](resources/genie_space_instructions.txt)
-5. Save
-
-This gives Genie context about monetary units, segment naming conventions, and table semantics.
-
-#### 5b. Create Lakebase Synced Tables
+#### 5a. Create Lakebase Synced Tables
 
 The app reads from the `actuarial_app` schema for low-latency dashboard queries. Synced tables must be created manually in the Lakebase UI:
 
@@ -378,7 +366,7 @@ All configurable values live in `databricks.yml` under `variables:`.
 │   ├── jobs.yml                 # Orchestration jobs (setup + monthly refresh)
 │   ├── app.yml                  # Databricks App resource + SP authorizations
 │   ├── lakebase.yml             # Lakebase (managed PostgreSQL) project + branch + endpoint
-│   └── genie_space_instructions.txt  # Paste into Genie Space general instructions
+│   └── genie_space_instructions.txt  # Auto-loaded into Genie Space via serialized_space API
 ├── scripts/
 │   ├── fetch_macro_data.py      # Fetch StatCan macro data -> raw_macro_indicators
 │   └── lakebase_setup.py        # Standalone Lakebase setup utility
