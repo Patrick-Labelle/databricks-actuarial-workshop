@@ -82,10 +82,10 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
     import math
 
     BASE_ULTIMATE = {
-        "Personal_Auto":       185_000_000,
-        "Commercial_Auto":     105_000_000,
-        "Homeowners":          155_000_000,
-        "Commercial_Property":  73_000_000,
+        "Personal_Auto":        58_000_000,
+        "Commercial_Auto":      33_000_000,
+        "Homeowners":           48_000_000,
+        "Commercial_Property":  23_000_000,
     }
     REGION_MULT = {
         "Ontario": 3.19, "Quebec": 1.85, "British_Columbia": 1.15,
@@ -230,8 +230,8 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
     Generate individual claim incident records for Jan 2019 – Dec 2025.
 
     Volume calibrated to Alberta Open Data 2013 loss ratios with population-weighted
-    provincial multipliers (~500K claims/month, ~42M total). Uses Spark-native
-    generation: a small control table (3,360 rows) is exploded to ~42M claim rows
+    provincial multipliers (~155K claims/month, ~13M total). Uses Spark-native
+    generation: a small control table (3,360 rows) is exploded to ~13M claim rows
     with random values computed via Spark SQL functions — single Delta write.
     """
     import numpy as np
@@ -248,10 +248,10 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
     MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
     BASE_CLAIMS = {
-        "Personal_Auto":       26_000,
-        "Commercial_Auto":     10_500,
-        "Homeowners":          18_500,
-        "Commercial_Property":  5_200,
+        "Personal_Auto":        8_100,
+        "Commercial_Auto":      3_300,
+        "Homeowners":           5_800,
+        "Commercial_Property":  1_600,
     }
     LOSS_RATIO_TARGET = {
         "Personal_Auto":       0.70,

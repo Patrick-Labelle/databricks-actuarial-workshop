@@ -59,9 +59,19 @@ if get_auth_init_error() is not None:
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
+    import base64, pathlib
+    _logo_path = pathlib.Path(__file__).parent / "logo.svg"
+    try:
+        _logo_b64 = base64.b64encode(_logo_path.read_bytes()).decode()
+        _logo_html = (
+            f'<img src="data:image/svg+xml;base64,{_logo_b64}" '
+            'style="width:120px;margin-bottom:8px" alt="Logo">'
+        )
+    except FileNotFoundError:
+        _logo_html = '<span style="font-size:2.2em">📊</span>'
     st.markdown(
         '<div style="text-align:center;padding:8px 0 16px 0">'
-        '<span style="font-size:2.2em">📊</span><br>'
+        f'{_logo_html}<br>'
         '<span style="font-size:1.1em;font-weight:700;color:#1B3A5C">'
         'Stochastic Reserve Analytics</span>'
         '</div>',
@@ -117,20 +127,26 @@ the Unity Catalog Model Registry.
     st.caption("Powered by Databricks Apps + Streamlit")
 
 # ─── App Header + Tabs ───────────────────────────────────────────────────────
-st.title("📊 Stochastic Reserve Analytics")
+st.markdown(
+    '<h1 style="display:flex;align-items:center;gap:12px">'
+    f'<img src="data:image/svg+xml;base64,{_logo_b64}" style="height:1.1em" alt="">'
+    'Stochastic Reserve Analytics</h1>',
+    unsafe_allow_html=True,
+)
 st.caption("Powered by Databricks | Claims Forecasting · Reserve Adequacy · Scenario Stress Testing")
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "💬 Risk Assistant",
     "📈 Claims Forecast",
     "💰 Reserve Adequacy",
     "📋 Scenario Analysis",
     "⚡ On-Demand Forecast",
     "🗺️ Geography",
+    "🏗️ Architecture",
     "📖 Glossary",
 ])
 
-from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_catastrophe, tab_quick_forecast, tab_geography, tab_glossary
+from tabs import tab_chatbot, tab_claims_forecast, tab_capital, tab_catastrophe, tab_quick_forecast, tab_geography, tab_architecture, tab_glossary
 
 tab_chatbot.render(tab0)
 tab_claims_forecast.render(tab1)
@@ -138,4 +154,5 @@ tab_capital.render(tab2)
 tab_catastrophe.render(tab3)
 tab_quick_forecast.render(tab4)
 tab_geography.render(tab5)
-tab_glossary.render(tab6)
+tab_architecture.render(tab6)
+tab_glossary.render(tab7)
