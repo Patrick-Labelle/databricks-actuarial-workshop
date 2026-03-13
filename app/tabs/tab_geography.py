@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import date
 
 import streamlit as st
 import plotly.graph_objects as go
@@ -50,20 +51,37 @@ def render(tab):
         st.subheader("Geographical Breakdown")
         st.caption("Claims and reserve metrics across Canadian provinces")
 
-        summary = load_regional_summary()
+        # ── Date range filter ─────────────────────────────────────────
+        col_start, col_end, _ = st.columns([1, 1, 2])
+        with col_start:
+            start_dt = st.date_input(
+                "Start month", value=date(2025, 1, 1),
+                min_value=date(2019, 1, 1), max_value=date(2025, 12, 1),
+                key="geo_start",
+            )
+        with col_end:
+            end_dt = st.date_input(
+                "End month", value=date(2025, 12, 31),
+                min_value=date(2019, 1, 1), max_value=date(2025, 12, 31),
+                key="geo_end",
+            )
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = end_dt.strftime("%Y-%m-%d")
+
+        summary = load_regional_summary(start_str, end_str)
         if summary.empty:
-            st.warning("No regional data available. Ensure gold_claims_monthly is populated.")
+            st.warning("No regional data available for the selected period.")
             return
 
         # ── Controls ──────────────────────────────────────────────────────
         col_metric, col_product = st.columns([1, 1])
         with col_metric:
             metric_label = st.selectbox(
-                "Colour by metric", list(_METRIC_OPTIONS.keys()), index=0
+                "Metric", list(_METRIC_OPTIONS.keys()), index=2
             )
         metric_col = _METRIC_OPTIONS[metric_label]
 
-        breakdown = load_regional_product_breakdown()
+        breakdown = load_regional_product_breakdown(start_str, end_str)
         product_lines = sorted(breakdown["product_line"].unique()) if not breakdown.empty else []
         with col_product:
             selected_product = st.selectbox(

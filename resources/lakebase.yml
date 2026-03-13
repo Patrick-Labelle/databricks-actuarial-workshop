@@ -25,10 +25,7 @@ resources:
       branch_id: main
       no_expiry: true
 
-  postgres_endpoints:
-    actuarial_workshop_endpoint:
-      parent: ${resources.postgres_branches.actuarial_workshop_branch.id}
-      endpoint_id: primary
-      endpoint_type: ENDPOINT_TYPE_READ_WRITE
-      autoscaling_limit_min_cu: 0.5
-      autoscaling_limit_max_cu: 2
+  # NOTE: postgres_endpoints omitted — Lakebase auto-creates a primary
+  # read-write endpoint when the project is provisioned. The terraform provider's
+  # CREATE fails with "read_write endpoint already exists" on fresh deploys.
+  # The auto-created endpoint is functionally equivalent.

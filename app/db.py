@@ -270,8 +270,11 @@ def load_mct_components():
 
 
 @st.cache_data(ttl=600)
-def load_regional_summary():
-    """Load claims summary aggregated by region."""
+def load_regional_summary(start_date: str = None, end_date: str = None):
+    """Load claims summary aggregated by region, optionally filtered by date."""
+    where = ""
+    if start_date and end_date:
+        where = f"WHERE month >= '{start_date}' AND month <= '{end_date}'"
     df = _safe_sql(f"""
         SELECT region,
                SUM(claims_count)              AS total_claims,
@@ -280,6 +283,7 @@ def load_regional_summary():
                ROUND(AVG(avg_severity), 2)    AS avg_severity,
                ROUND(SUM(earned_premium), 2)  AS total_premium
         FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
+        {where}
         GROUP BY region
         ORDER BY total_claims DESC
     """)
@@ -294,8 +298,11 @@ def load_regional_summary():
 
 
 @st.cache_data(ttl=600)
-def load_regional_product_breakdown():
-    """Load claims breakdown by region and product line."""
+def load_regional_product_breakdown(start_date: str = None, end_date: str = None):
+    """Load claims breakdown by region and product line, optionally filtered by date."""
+    where = ""
+    if start_date and end_date:
+        where = f"WHERE month >= '{start_date}' AND month <= '{end_date}'"
     df = _safe_sql(f"""
         SELECT region, product_line,
                SUM(claims_count)              AS total_claims,
@@ -304,6 +311,7 @@ def load_regional_product_breakdown():
                ROUND(AVG(avg_severity), 2)    AS avg_severity,
                ROUND(SUM(earned_premium), 2)  AS total_premium
         FROM {CATALOG}.{APP_SCHEMA}.gold_claims_monthly
+        {where}
         GROUP BY region, product_line
         ORDER BY region, product_line
     """)
