@@ -19,6 +19,7 @@
 # COMMAND ----------
 
 import mlflow
+import os
 import requests
 import json
 import warnings
@@ -460,11 +461,25 @@ def _build_serialized_space():
          for schema, name, desc in _GENIE_TABLES_DATA],
         key=lambda t: t["identifier"],
     )
-    return json.dumps({
+    # Load Genie instructions from the resources file
+    _instructions_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "resources", "genie_space_instructions.txt",
+    )
+    _instructions_text = ""
+    try:
+        with open(_instructions_path) as _f:
+            _instructions_text = _f.read().strip()
+    except FileNotFoundError:
+        print(f"  Warning: {_instructions_path} not found — Genie instructions skipped.")
+    space = {
         "version": 2,
         "data_sources": {"tables": tables},
         "config": {"sample_questions": _GENIE_SAMPLE_QUESTIONS},
-    })
+    }
+    if _instructions_text:
+        space["instructions"] = {"text_instructions": _instructions_text}
+    return json.dumps(space)
 
 # If a Genie space ID was provided, verify it still exists and update config
 if _genie_space_id and WAREHOUSE_ID:
@@ -484,7 +499,7 @@ if _genie_space_id and WAREHOUSE_ID:
                     "serialized_space": _build_serialized_space(),
                 },
             )
-            print("  Description + table descriptions + sample questions updated.")
+            print("  Description + table descriptions + sample questions + instructions updated.")
         except Exception as _e:
             print(f"  Could not update Genie space config: {_e}")
     except Exception:
@@ -537,9 +552,6 @@ elif not WAREHOUSE_ID and not _genie_space_id:
 
 # Pass Genie space ID to downstream tasks via task values
 if _genie_space_id:
-    print(f"\n  ⚠️  Genie space instructions must be added manually via the UI.")
-    print(f"  Open the space in AI/BI Genie, click Edit, and paste the contents of")
-    print(f"  resources/genie_space_instructions.txt into the 'General Instructions' box.")
     try:
         dbutils.jobs.taskValues.set(key="genie_space_id", value=_genie_space_id)
         print(f"  Task value set: genie_space_id={_genie_space_id}")
