@@ -284,7 +284,7 @@ spark.sql(f"""
 # MAGIC
 # MAGIC | Step | What Happened |
 # MAGIC |---|---|
-# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 40 segments |
+# MAGIC | Feature computation | Rolling means, volatility, seasonality, momentum features for all 52 segments |
 # MAGIC | UC registration | Feature table with timestamp key — enables point-in-time joins |
 # MAGIC | Training set assembly | Point-in-time join guarantees no future leakage |
 # MAGIC | Lineage | UC tracks which models consume this feature table |
@@ -294,5 +294,5 @@ spark.sql(f"""
 # MAGIC for unbiased actuarial models and regulatory compliance.
 # MAGIC
 # MAGIC **Next:** Module 4 — with reliable data and leakage-free features, we're ready to fit
-# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 40 segments. Module 4 reads
+# MAGIC SARIMA, GARCH, and Monte Carlo models at scale across all 52 segments. Module 4 reads
 # MAGIC `features_segment_monthly` to provide exogenous variables for SARIMAX forecasting.

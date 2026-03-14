@@ -406,7 +406,7 @@ _GENIE_DESCRIPTION = (
     "- IBNR = Incurred But Not Reported reserves. Best estimate is the mean of the bootstrap distribution.\n"
     "- Insurance segments use the pattern product_line_region (e.g. commercial_auto_ontario).\n"
     "- 4 product lines: Personal_Auto, Commercial_Auto, Homeowners, Commercial_Property.\n"
-    "- 10 Canadian provinces. 40 total segments."
+    "- 13 Canadian provinces and territories. 52 total segments."
 )
 
 # Per-table descriptions (shown to Genie as context for each table)

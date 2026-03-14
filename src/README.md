@@ -65,7 +65,7 @@ Notebooks that cross schemas (`03`, `04`, `ops/set_table_metadata.py`) receive `
 | `silver_macro_indicators` | SDP | SCD Type 2 macro data |
 | `silver_rolling_features` | SDP | Rolling means, volatility features per segment |
 | `gold_reserve_triangle` | SDP | Loss development triangle (accident month × dev lag) |
-| `gold_claims_monthly` | SDP | Segment × month claims aggregate (40 segments × 84 months) |
+| `gold_claims_monthly` | SDP | Segment × month claims aggregate (52 segments × 84 months) |
 | `gold_macro_features` | SDP | Pivoted macro features by region × month |
 | `features_segment_monthly` | Module 2 | UC Feature Table (SARIMAX exog vars) |
 
@@ -100,7 +100,7 @@ Notebooks that cross schemas (`03`, `04`, `ops/set_table_metadata.py`) receive `
 
 | Experiment | Contents |
 |---|---|
-| `actuarial_workshop_frequency_forecast` | Bulk SARIMAX+GARCH (40 segments) + Frequency Forecaster PyFunc registration |
+| `actuarial_workshop_frequency_forecast` | Bulk SARIMAX+GARCH (52 segments) + Frequency Forecaster PyFunc registration |
 | `actuarial_workshop_bootstrap_reserves` | Bootstrap Chain Ladder + scenarios + evolution + Bootstrap Reserve Simulator PyFunc registration |
 
 ---

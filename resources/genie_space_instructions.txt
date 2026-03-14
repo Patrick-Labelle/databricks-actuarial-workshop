@@ -6,9 +6,9 @@ reserve distribution. best_estimate_M is the mean IBNR (actuarial central
 estimate). var_995_M is the Reserve Risk Capital at the 99.5% confidence level.
 
 Insurance segments follow the naming pattern product_line_region (e.g.
-personal_auto_ontario, commercial_property_quebec). There are 40 segments total:
+personal_auto_ontario, commercial_property_quebec). There are 52 segments total:
 4 product lines (Personal Auto, Commercial Auto, Homeowners, Commercial Property)
-across 10 Canadian provinces.
+across 13 Canadian provinces and territories.
 
 When users ask about "reserve risk", "economic capital", or "IBNR", always
 use var_995_M from predictions_bootstrap_reserves (the 1-in-200 year reserve

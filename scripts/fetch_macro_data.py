@@ -97,6 +97,9 @@ PROVINCE_MAP = {
     "Nova Scotia":               "Nova_Scotia",
     "Prince Edward Island":      "Prince_Edward_Island",
     "Newfoundland and Labrador": "Newfoundland",
+    "Yukon":                     "Yukon",
+    "Northwest Territories":     "Northwest_Territories",
+    "Nunavut":                   "Nunavut",
 }
 
 # COMMAND ----------
@@ -127,7 +130,7 @@ def parse_statcan_table(raw_df: pd.DataFrame, table_config: dict, batch_id: str)
     Filter a StatCan raw DataFrame to the target provinces and indicator breakdown.
     Returns rows in the raw_macro_indicators schema.
     """
-    # 1. Filter to the 10 provinces we care about (drop Canada total, CMAs, territories)
+    # 1. Filter to the 13 provinces/territories we care about (drop Canada total, CMAs)
     if "GEO" not in raw_df.columns:
         raise ValueError(f"No GEO column. Available: {raw_df.columns.tolist()}")
     df = raw_df[raw_df["GEO"].isin(PROVINCE_MAP.keys())].copy()

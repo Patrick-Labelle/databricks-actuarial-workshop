@@ -151,12 +151,14 @@ def save_scenario_annotation(
         )
         conn.commit()
         conn.close()
+        load_annotations.clear()
         return True
     except Exception as e:
         st.warning(f"Could not save annotation: {e}")
         return False
 
 
+@st.cache_data(ttl=120)
 def load_annotations(segment_id: str):
     try:
         _ensure_annotations_table()

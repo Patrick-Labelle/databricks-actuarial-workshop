@@ -76,6 +76,7 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "Ontario", "Quebec", "British_Columbia", "Alberta",
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
+        "Yukon", "Northwest_Territories", "Nunavut",
     ]
     ACCIDENT_MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
@@ -92,6 +93,7 @@ def generate_reserve_development_data(spark, catalog: str, schema: str):
         "Alberta": 1.00, "Manitoba": 0.30, "Saskatchewan": 0.25,
         "New_Brunswick": 0.17, "Nova_Scotia": 0.22,
         "Prince_Edward_Island": 0.04, "Newfoundland": 0.11,
+        "Yukon": 0.01, "Northwest_Territories": 0.01, "Nunavut": 0.009,
     }
 
     # Line-specific maximum development lags (months)
@@ -244,6 +246,7 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Ontario", "Quebec", "British_Columbia", "Alberta",
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
+        "Yukon", "Northwest_Territories", "Nunavut",
     ]
     MONTHS = pd.date_range("2019-01-01", periods=84, freq="MS")
 
@@ -276,6 +279,9 @@ def generate_claims_events_data(spark, catalog: str, schema: str):
         "Nova_Scotia":          0.22,
         "Prince_Edward_Island": 0.04,
         "Newfoundland":         0.11,
+        "Yukon":                0.01,
+        "Northwest_Territories": 0.01,
+        "Nunavut":              0.009,
     }
     CLAIM_TYPES = {
         "Personal_Auto":       ["Collision", "Comprehensive", "Bodily_Injury"],
@@ -662,6 +668,9 @@ _PROVINCE_MAP = {
     "Nova Scotia":               "Nova_Scotia",
     "Prince Edward Island":      "Prince_Edward_Island",
     "Newfoundland and Labrador": "Newfoundland",
+    "Yukon":                     "Yukon",
+    "Northwest Territories":     "Northwest_Territories",
+    "Nunavut":                   "Nunavut",
 }
 
 if IN_PIPELINE:

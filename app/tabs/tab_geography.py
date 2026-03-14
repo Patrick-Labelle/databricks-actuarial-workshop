@@ -31,6 +31,9 @@ _REGION_TO_GEOJSON = {
     "Nova_Scotia":          "Nova Scotia",
     "Prince_Edward_Island": "Prince Edward Island",
     "Newfoundland":         "Newfoundland and Labrador",
+    "Yukon":                "Yukon Territory",
+    "Northwest_Territories": "Northwest Territories",
+    "Nunavut":              "Nunavut",
 }
 
 _METRIC_OPTIONS = {
