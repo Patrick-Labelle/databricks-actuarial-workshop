@@ -24,7 +24,7 @@
 # MAGIC %md
 # MAGIC ## 1. Load Data from SDP Gold Layer
 # MAGIC
-# MAGIC Reads `gold_claims_monthly` (40 segments x 84 months), `gold_reserve_triangle`,
+# MAGIC Reads `gold_claims_monthly` (52 segments x 84 months), `gold_reserve_triangle`,
 # MAGIC and `gold_macro_features` from the Module 1 declarative pipeline.
 
 # COMMAND ----------
@@ -50,6 +50,7 @@ REGIONS       = [
     "Ontario", "Quebec", "British_Columbia", "Alberta",
     "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
     "Prince_Edward_Island", "Newfoundland",
+    "Yukon", "Northwest_Territories", "Nunavut",
 ]
 MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")
 
@@ -354,7 +355,7 @@ with mlflow.start_run(run_name="sarimax_frequency_all_segments") as run:
 
     print(f"Frequency forecasting complete → {CATALOG}.{MODELS_SCHEMA}.predictions_frequency_forecast")
     print(f"  MAPE: baseline={avg_mape_baseline:.1f}%, SARIMAX={avg_mape_sarimax:.1f}%, improvement={avg_mape_improve:+.1f}%")
-    print(f"  GARCH(1,1) fitted: {_metrics['garch_seg_count']}/40 segments")
+    print(f"  GARCH(1,1) fitted: {_metrics['garch_seg_count']}/52 segments")
     print(f"MLflow run: {run.info.run_id}")
 
     # ── Register Frequency Forecaster PyFunc to UC ────────────────────────
@@ -1547,8 +1548,8 @@ print(f"Reserve validation saved → {CATALOG}.{MODELS_SCHEMA}.predictions_reser
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
-# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 84 months | Frequency forecast for future accident periods |
-# MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 40 segments | Time-varying frequency volatility |
+# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments × 84 months | Frequency forecast for future accident periods |
+# MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 52 segments | Time-varying frequency volatility |
 # MAGIC | Chain Ladder (deterministic) | pandas | 4 product lines | Best estimate IBNR + Mack variance |
 # MAGIC | Bootstrap Chain Ladder | Ray + NumPy CPU | 40K replications × 5 scenarios | Reserve risk distribution (VaR 99.5%, CVaR) |
 # MAGIC | Reserve evolution | Ray + NumPy CPU | 12 months × 40K replications | Forward reserve adequacy projection |

@@ -8,7 +8,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC ### What We'll Cover
-# MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the declarative pipeline (40 segments × 84 months)
+# MAGIC 1. **Data Setup** — Read `gold_claims_monthly` from the declarative pipeline (52 segments × 84 months)
 # MAGIC 2. **Macro Integration** — Join real StatCan macro data; visualize claims vs unemployment
 # MAGIC 3. **SARIMAX + GARCH at Scale** — Per-segment SARIMA + SARIMAX fit with GARCH(1,1) on residuals for time-varying CIs
 # MAGIC 4. **ARCH-LM Diagnostic** — Engle's test results; why GARCH on residuals is correct
@@ -19,7 +19,7 @@
 # MAGIC ---
 # MAGIC ### Why `applyInPandas`?
 # MAGIC
-# MAGIC We have **40 segments** (4 product lines × 10 provinces), each needing its own SARIMAX fit + GARCH(1,1) on residuals.
+# MAGIC We have **52 segments** (4 product lines × 13 regions), each needing its own SARIMAX fit + GARCH(1,1) on residuals.
 # MAGIC These are **independent** per-group operations. `applyInPandas` lets Spark distribute this work:
 # MAGIC each executor receives a pandas DataFrame for one segment, runs standard Python/statsmodels code,
 # MAGIC and returns results. No Spark ML required — just familiar Python libraries.
@@ -58,7 +58,7 @@
 # MAGIC
 # MAGIC Data flows directly from the declarative pipeline (Module 1) — no synthetic generation needed.
 # MAGIC The `gold_claims_monthly` table provides **real** claim counts, loss ratios, and premium
-# MAGIC exposures for **40 segments** (4 product lines × 10 provinces) × **84 months** (Jan 2019 – Dec 2025).
+# MAGIC exposures for **52 segments** (4 product lines × 13 regions) × **84 months** (Jan 2019 – Dec 2025).
 # MAGIC
 # MAGIC ```
 # MAGIC SDP Pipeline (Module 1)
@@ -88,6 +88,7 @@ REGIONS       = [
     "Ontario", "Quebec", "British_Columbia", "Alberta",
     "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
     "Prince_Edward_Island", "Newfoundland",
+    "Yukon", "Northwest_Territories", "Nunavut",
 ]
 MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")  # Jan 2019 – Dec 2025
 
@@ -101,7 +102,7 @@ BASE_CLAIMS = {
 
 # ─── Read from SDP gold layer ─────────────────────────────────────────────────
 # gold_claims_monthly is produced by the declarative pipeline (task: run_sdp_pipeline in jobs.yml).
-# Expected: 40 segments × 84 months = 3,360 rows with claims_count, loss_ratio, earned_premium.
+# Expected: 52 segments × 84 months = 3,360 rows with claims_count, loss_ratio, earned_premium.
 claims_df = (
     spark.table(f"{CATALOG}.{SCHEMA}.gold_claims_monthly")
     .filter(F.col("month").between("2019-01-01", "2025-12-01"))
@@ -110,7 +111,7 @@ claims_df.createOrReplaceTempView("claims_ts")
 
 n_segments = claims_df.select("segment_id").distinct().count()
 n_rows     = claims_df.count()
-print(f"Segments: {n_segments} (expected 40 = 4 product lines × 10 provinces)")
+print(f"Segments: {n_segments} (expected 40 = 4 product lines × 13 regions)")
 print(f"Rows:     {n_rows} (expected 3,360 = 40 × 84 months)")
 display(claims_df.orderBy("segment_id", "month").limit(30))
 
@@ -485,7 +486,7 @@ with mlflow.start_run(run_name="sarimax_all_segments") as run:
     print(f"  Baseline SARIMA MAPE:  {avg_mape_baseline:.1f}%")
     print(f"  SARIMAX MAPE:          {avg_mape_sarimax:.1f}%")
     print(f"  Improvement:           {avg_mape_improve:+.1f}%  ({'↓ better' if avg_mape_improve > 0 else '↑ worse or unchanged'})")
-    print(f"  GARCH(1,1) fitted:     {_metrics['garch_seg_count']}/40 segments (ARCH-LM p < 0.10)")
+    print(f"  GARCH(1,1) fitted:     {_metrics['garch_seg_count']}/52 segments (ARCH-LM p < 0.10)")
     print(f"Saved to {CATALOG}.{SCHEMA}.predictions_sarima")
     print(f"MLflow run: {run.info.run_id}")
 
@@ -519,7 +520,7 @@ display(sarima_results_df.filter(F.col("record_type") == "forecast").orderBy("se
 
 # COMMAND ----------
 
-# Summarize ARCH-LM results across all 40 segments
+# Summarize ARCH-LM results across all 52 segments
 _arch_summary = (
     sarima_results_df
     .filter(F.col("record_type") == "forecast")
@@ -2138,9 +2139,9 @@ print(f"Set @Champion → version {_mc_latest_ver}")
 # MAGIC
 # MAGIC | Technique | Framework | Scale | Use Case |
 # MAGIC |---|---|---|---|
-# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments × 84 months | Baseline claim volume forecast |
-# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 40 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
-# MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 40 segments | Time-varying CIs + MC CVs (σ/μ) |
+# MAGIC | SARIMA(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments × 84 months | Baseline claim volume forecast |
+# MAGIC | SARIMAX(1,0,1)(1,1,0,12) | statsmodels + applyInPandas | 52 segments + macro + FS exog | Forecast with StatCan + Feature Store signals |
+# MAGIC | GARCH(1,1) on residuals | arch (inside SARIMAX fit) | 52 segments | Time-varying CIs + MC CVs (σ/μ) |
 # MAGIC | Monte Carlo — baseline | Ray + NumPy CPU | 40M paths (4 tasks × 10M) | VaR(99.5%), CVaR, Economic Capital — GARCH-calibrated |
 # MAGIC | Monte Carlo — VaR evolution | Ray + NumPy CPU (SARIMAX-driven) | 480M paths (12 months × 4 × 10M) | Forward VaR, regional breakdown |
 # MAGIC | Monte Carlo — stress tests | Ray + NumPy CPU (3 scenarios) | 120M paths (3 × 4 × 10M) | CAT event, systemic risk, inflation shock |

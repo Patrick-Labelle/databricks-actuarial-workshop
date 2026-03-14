@@ -80,12 +80,12 @@ with st.sidebar:
 
     st.markdown("**Portfolio Data**")
     st.markdown("""
-Insurance reserves across **40 segments** (product line x Canadian province):
+Insurance reserves across **52 segments** (product line x Canadian province/territory):
 
 | | |
 |---|---|
 | **Product lines** | Personal Auto, Commercial Auto, Homeowners, Commercial Property |
-| **Provinces** | All 10 Canadian provinces |
+| **Regions** | All 10 provinces + 3 territories |
 | **Period** | Jan 2019 – Dec 2025 (84 months) |
 | **Triangle** | Loss development with line-specific tail lengths (36–60 months) |
 | **Macro data** | StatCan unemployment, housing price index, housing starts |

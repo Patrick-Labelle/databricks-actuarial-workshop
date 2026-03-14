@@ -86,13 +86,15 @@ if not USE_GOLD:
         "Ontario", "Quebec", "British_Columbia", "Alberta",
         "Manitoba", "Saskatchewan", "New_Brunswick", "Nova_Scotia",
         "Prince_Edward_Island", "Newfoundland",
+        "Yukon", "Northwest_Territories", "Nunavut",
     ]
     MONTHS        = pd.date_range("2019-01-01", periods=84, freq="MS")
     SEASONALITY   = {1:1.25,2:1.20,3:1.10,4:0.95,5:0.90,6:0.88,7:0.85,8:0.87,9:0.92,10:1.00,11:1.10,12:1.20}
     BASE_CLAIMS   = {"Personal_Auto":26000,"Commercial_Auto":10500,"Homeowners":18500,"Commercial_Property":5200}
     REGION_MULT   = {"Ontario":3.19,"Quebec":1.85,"British_Columbia":1.15,"Alberta":1.0,
                      "Manitoba":0.30,"Saskatchewan":0.25,"New_Brunswick":0.17,
-                     "Nova_Scotia":0.22,"Prince_Edward_Island":0.04,"Newfoundland":0.11}
+                     "Nova_Scotia":0.22,"Prince_Edward_Island":0.04,"Newfoundland":0.11,
+                     "Yukon":0.01,"Northwest_Territories":0.01,"Nunavut":0.009}
     rows = []
     for prod, region in iterproduct(PRODUCT_LINES, REGIONS):
         base = BASE_CLAIMS[prod] * REGION_MULT[region]
@@ -110,7 +112,7 @@ if not USE_GOLD:
                 "loss_ratio": round(total_incurred / earned_premium, 4),
             })
     gold_df = spark.createDataFrame(pd.DataFrame(rows))
-    print(f"Generated synthetic data: {len(rows)} rows (40 segments × 84 months)")
+    print(f"Generated synthetic data: {len(rows)} rows (52 segments × 84 months)")
 
 display(gold_df.limit(10))
 
@@ -356,7 +358,7 @@ print(f"  Result: {_count_d_large} rows")
 # MAGIC ---
 # MAGIC ## Section 2: Run Many Models — OLS Trend per Segment
 # MAGIC
-# MAGIC **Task**: Fit a simple OLS trend (`claims_count ~ time_index`) per segment (40 segments).
+# MAGIC **Task**: Fit a simple OLS trend (`claims_count ~ time_index`) per segment (52 segments).
 # MAGIC
 # MAGIC | # | Approach | Description |
 # MAGIC |---|---|---|
@@ -372,7 +374,7 @@ print(f"  Result: {_count_d_large} rows")
 
 # COMMAND ----------
 
-with timed("Approach A — Pandas for-loop OLS (40 segments)"):
+with timed("Approach A — Pandas for-loop OLS (52 segments)"):
     pdf_gold = gold_df.toPandas()
     ols_results_a = []
     for seg_id, group in pdf_gold.groupby("segment_id"):
@@ -409,7 +411,7 @@ display(spark.createDataFrame(ols_df_a).orderBy(F.col("annualized_growth_pct").d
 # Spark has built-in regression functions: regr_slope, regr_intercept, regr_r2
 # These run entirely inside the Catalyst engine — no Python serialization at all.
 
-with timed("Approach B — Spark regr_slope/regr_intercept (40 segments)"):
+with timed("Approach B — Spark regr_slope/regr_intercept (52 segments)"):
     # Create a numeric time index per segment
     seg_w = Window.partitionBy("segment_id").orderBy("month")
     gold_with_idx = gold_df.withColumn("time_idx", (F.row_number().over(seg_w) - 1).cast("double"))
@@ -473,7 +475,7 @@ def ols_per_segment(pdf: pd.DataFrame) -> pd.DataFrame:
         "annualized_growth_pct": float((slope * 12 / np.mean(y)) * 100) if np.mean(y) > 0 else 0.0,
     }])
 
-with timed("Approach C — applyInPandas OLS (40 segments)"):
+with timed("Approach C — applyInPandas OLS (52 segments)"):
     ols_result_c = (
         gold_df
         .select("segment_id", "month", "claims_count")
@@ -495,7 +497,7 @@ print(f"  Fitted {_count_ols_c} segments")
 
 # COMMAND ----------
 
-with timed("Approach D — Pandas API on Spark OLS bridge (40 segments)"):
+with timed("Approach D — Pandas API on Spark OLS bridge (52 segments)"):
     ps_ols_df = gold_df.select("segment_id", "month", "claims_count").to_pandas_on_spark()
     ols_result_d = (
         ps_ols_df.to_spark()
@@ -512,7 +514,7 @@ print(f"  Fitted {_count_ols_d} segments")
 # MAGIC %md
 # MAGIC ### Scale Test: OLS on 100K Segments (2,500×)
 # MAGIC
-# MAGIC At 40 segments, all approaches are fast. At 100,000 segments (~7.2M rows),
+# MAGIC At 52 segments, all approaches are fast. At 100,000 segments (~7.2M rows),
 # MAGIC the differences become dramatic — especially for the pandas for-loop.
 
 # COMMAND ----------
@@ -611,7 +613,7 @@ print(f"  Fitted {_count_ols_d_large} segments")
 # MAGIC %md
 # MAGIC ### Section 2 Summary
 # MAGIC
-# MAGIC | Approach | How it works | 40 segments | 100K segments | Best for |
+# MAGIC | Approach | How it works | 52 segments | 100K segments | Best for |
 # MAGIC |---|---|---|---|---|
 # MAGIC | **A. Pandas for-loop** | Sequential on driver | Fast | **Very slow** | Prototyping, <10 groups |
 # MAGIC | **B. Spark built-ins** | Pure SQL engine, no UDF | Fast | **Fastest** | Simple aggregates (`regr_slope`, window fns) |

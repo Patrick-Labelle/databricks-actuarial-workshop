@@ -65,7 +65,8 @@ SEVERITY_LEVELS = {
 }
 
 CANADIAN_PROVINCES = [
-    "Ontario", "Quebec", "British Columbia", "Alberta", "Atlantic",
+    "Ontario", "Quebec", "British Columbia", "Alberta",
     "Manitoba", "Saskatchewan", "Nova Scotia", "New Brunswick",
-    "Newfoundland", "PEI", "NWT", "Yukon",
+    "Prince Edward Island", "Newfoundland",
+    "Yukon", "Northwest Territories", "Nunavut",
 ]

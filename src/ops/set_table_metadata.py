@@ -55,7 +55,7 @@ TABLE_METADATA = [
     ),
     (
         "predictions_frequency_forecast",
-        "Per-segment SARIMAX+GARCH frequency forecasts. 40 segments x 84 months of history + 12-month forecast horizon. Use record_type to filter actuals vs forecasts.",
+        "Per-segment SARIMAX+GARCH frequency forecasts. 52 segments x 84 months of history + 12-month forecast horizon. Use record_type to filter actuals vs forecasts.",
         {
             "segment_id": "Unique segment identifier: product_line_region",
             "month": "Calendar month (date)",

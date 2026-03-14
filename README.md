@@ -111,7 +111,7 @@ Removes all deployed resources in the correct order:
 
 ## Insurance Portfolio
 
-The synthetic portfolio models a Canadian P&C insurer across **40 segments** (4 product lines x 10 provinces) over an **84-month history** (Jan 2019 - Dec 2025), generating ~42M individual claim incidents.
+The synthetic portfolio models a Canadian P&C insurer across **52 segments** (4 product lines x 13 provinces/territories) over an **84-month history** (Jan 2019 - Dec 2025), generating ~13M individual claim incidents.
 
 | Product Line | Business Context | Typical Drivers |
 |---|---|---|
@@ -120,7 +120,7 @@ The synthetic portfolio models a Canadian P&C insurer across **40 segments** (4 
 | Homeowners | Property damage + liability; weather-sensitive | HPI (rebuild costs), housing starts (exposure growth), CAT events |
 | Commercial Property | Large commercial risks; low frequency, heavy tail | Construction activity, inflation, catastrophe concentration |
 
-**Regions:** All 10 Canadian provinces, each with distinct macro conditions (unemployment, housing prices, construction activity) sourced from Statistics Canada.
+**Regions:** All 10 Canadian provinces and 3 territories, each with distinct macro conditions (unemployment, housing prices, construction activity) sourced from Statistics Canada.
 
 ---
 
@@ -191,7 +191,7 @@ Macro:         raw_macro_indicators    → bronze_macro_indicators → silver_ma
 |---|---|---|
 | `raw_reserve_development` | Landing | Synthetic reserve development CDC events (84 months x 4 products x 10 regions x 12 dev lags) |
 | `raw_claims_events` | Landing | ~42M individual claim incidents (Jan 2019 - Dec 2025) |
-| `raw_macro_indicators` | Landing | Statistics Canada unemployment, HPI, housing starts (10 provinces, 1976-2026) |
+| `raw_macro_indicators` | Landing | Statistics Canada unemployment, HPI, housing starts (13 provinces/territories, 1976-2026) |
 | `bronze_reserve_cdc` | Bronze | Append-only reserve CDC stream with data quality expectations |
 | `bronze_claims` | Bronze | Append-only claim incidents stream |
 | `bronze_macro_indicators` | Bronze | Append-only macro indicator ingestion |
@@ -199,7 +199,7 @@ Macro:         raw_macro_indicators    → bronze_macro_indicators → silver_ma
 | `silver_macro_indicators` | Silver | SCD Type 2 macro data tracking StatCan revisions |
 | `silver_rolling_features` | Silver | Rolling 3m/6m/12m statistical features per segment |
 | `gold_reserve_triangle` | Gold | Loss development triangle by segment x accident month x dev lag |
-| `gold_claims_monthly` | Gold | Monthly aggregates: claims_count, total_incurred, avg_severity, earned_premium, loss_ratio (40 segments x 84 months) |
+| `gold_claims_monthly` | Gold | Monthly aggregates: claims_count, total_incurred, avg_severity, earned_premium, loss_ratio (52 segments x 84 months) |
 | `gold_macro_features` | Gold | Pivoted macro features: unemployment_rate, hpi_index, hpi_growth, housing_starts by region x month |
 | `features_segment_monthly` | Feature Store | Point-in-time correct features with timestamp keys for leakage-free training; Online Table for real-time lookup |
 
@@ -258,7 +258,7 @@ The chatbot agent runs **in-process** within the Streamlit app (not on a separat
 
 | Experiment | Contents |
 |---|---|
-| `actuarial_workshop_frequency_forecast` | Bulk SARIMAX+GARCH modeling (40 segments) + Frequency Forecaster PyFunc registration |
+| `actuarial_workshop_frequency_forecast` | Bulk SARIMAX+GARCH modeling (52 segments) + Frequency Forecaster PyFunc registration |
 | `actuarial_workshop_bootstrap_reserves` | Bootstrap Chain Ladder (scenarios, evolution, run-off) + Bootstrap Reserve Simulator PyFunc registration |
 | `actuarial-workshop-app-traces` | Chatbot agent conversation traces |
 

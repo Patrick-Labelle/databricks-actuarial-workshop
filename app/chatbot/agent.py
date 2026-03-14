@@ -15,6 +15,8 @@ import inspect
 import re
 from typing import Generator
 
+import streamlit as st
+
 from config import CATALOG, DATA_SCHEMA, MODELS_SCHEMA, APP_SCHEMA, LLM_ENDPOINT_NAME
 from chatbot.tools import TOOL_MAP, AVAILABLE_TABLES
 
@@ -48,7 +50,7 @@ Tables are organized across three Unity Catalog schemas:
 {chr(10).join(f'- **{name}**: {desc}' for name, desc in AVAILABLE_TABLES.items())}
 
 ## Domain knowledge
-- **Segments**: 40 segments = 4 product lines (Personal Auto, Commercial Auto, Homeowners, Commercial Property) x 10 Canadian provinces. Segment IDs use the format `product_line_province` (e.g., `personal_auto_ontario`).
+- **Segments**: 52 segments = 4 product lines (Personal Auto, Commercial Auto, Homeowners, Commercial Property) x 13 Canadian provinces and territories. Segment IDs use the format `product_line_region` (e.g., `personal_auto_ontario`).
 - **SARIMAX**: Seasonal ARIMA model fitted per segment on 84 months of history (2019-2025), forecasting 12 months ahead. GARCH(1,1) on residuals captures time-varying volatility. Results in `predictions_frequency_forecast`.
 - **Chain Ladder**: Deterministic best-estimate IBNR from weighted link ratios (LDFs). Mack variance provides analytical reserve uncertainty. Fitted per product line.
 - **Bootstrap Chain Ladder**: Resamples scaled Pearson residuals from the fitted chain ladder model. Each bootstrap replicate produces a pseudo-triangle and a complete IBNR estimate. The collection of replicate IBNRs forms the predictive reserve distribution. Results in `predictions_bootstrap_reserves`.
@@ -112,6 +114,7 @@ Tables follow a stage-prefix convention:
 """
 
 
+@st.cache_resource
 def _get_openai_client():
     """Create a DatabricksOpenAI client.
 
@@ -157,6 +160,7 @@ def _get_openai_client():
         return None
 
 
+@st.cache_resource
 def _get_tool_schemas():
     """Build OpenAI-compatible tool schemas from the tool functions."""
     schemas = []
